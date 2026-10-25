@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "eu-parliament-mcp-server",
+  "version": "0.1.0",
+  "description": "Track European Parliament procedures, MEPs, votes, documents, speeches, and questions via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/eu-parliament-mcp-server",
+  "repository": "https://github.com/cyanheads/eu-parliament-mcp-server",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "ai-tools", "typescript", "cyanheads", "european-parliament", "european-union", "legislation", "roll-call-votes", "meps", "open-data"],
+  "mcpServers": {
+    "eu-parliament-mcp-server": {
+      "command": "npx",
+      "args": ["-y", "@cyanheads/eu-parliament-mcp-server"],
+      "env": {
+        "MCP_TRANSPORT_TYPE": "stdio"
+      }
+    }
+  }
+}
