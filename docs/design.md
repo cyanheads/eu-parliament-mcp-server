@@ -236,7 +236,7 @@ Verified against the public OpenAPI and bounded live GETs on 2026-10-25. Lists a
 | Observed workload | Measurement | Required field-test case |
 |:---|:---|:---|
 | Full sitting 2024-03-13, requested limit 1 | 252 decisions; 2,220,932 raw JSON-LD bytes | Traverse all decision pages, assert exact ID coverage/no duplicates |
-| Largest decision in that response | 22,414 bytes when JSON-reserialized; 626 recorded voters, largest position 618 | Traverse every recorded/intended position at limit 1 and default limit; compare counts and exact IDs |
+| Largest decision in that response | 22,414 bytes when JSON-reserialized; 626 recorded voters, largest position 618 | Traverse recorded/intended positions at default and maximum limits; check consecutive limit-1 pages and compare complete counts and IDs without repeating hundreds of whole-sitting downloads |
 | Current roster | 720 members; 163,614 response bytes | Name present beyond first page; no-match; historical scope; non-ASCII token normalization |
 | Current roster, paging omitted | 720 rows in 0.86s; term-nine roster 875 rows in 3.24s, 140,103 bytes | Complete acquisition and filtering before local paging within the shared 40s deadline |
 | Historical mandate-date roster | Omitted paging returned 500; page50 offsets 0/50 took 3.79s/3.89s; offset700 returned 5, offset750 returned 204 | Do not use this slow path for name resolution; use the explicit historical-term roster |
