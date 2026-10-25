@@ -3,21 +3,21 @@
   "version": "0.1.0",
   "description": "Track European Parliament procedures, MEPs, votes, documents, speeches, and questions via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "Casey Hand",
+    "name": "cyanheads",
     "email": "casey@caseyjhand.com",
-    "url": "https://caseyjhand.com"
+    "url": "https://github.com/cyanheads"
   },
-  "homepage": "https://github.com/cyanheads/eu-parliament-mcp-server",
+  "homepage": "https://github.com/cyanheads/eu-parliament-mcp-server#readme",
   "repository": "https://github.com/cyanheads/eu-parliament-mcp-server",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "ai-tools", "typescript", "cyanheads", "european-parliament", "european-union", "legislation", "roll-call-votes", "meps", "open-data"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "ai-tools", "typescript", "bun", "stdio", "streamable-http", "cyanheads", "european-parliament", "european-union", "legislation", "roll-call-votes", "meps", "open-data"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "eu-parliament-mcp-server",
     "shortDescription": "Track European Parliament procedures, MEPs, votes, documents, speeches, and questions via MCP. STDIO or Streamable HTTP.",
     "longDescription": "Follow legislative procedures through European Parliament records, find MEPs and their memberships, and inspect plenary roll-call votes. Search adopted texts and speeches, retrieve parliamentary documents and questions, and discover the reference codes used by the Parliament's free open-data API.",
     "developerName": "cyanheads",
-    "category": "Research & Analysis",
+    "category": "research",
     "capabilities": ["Read"],
     "websiteURL": "https://github.com/cyanheads/eu-parliament-mcp-server",
     "defaultPrompt": []
