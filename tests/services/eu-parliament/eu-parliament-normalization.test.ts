@@ -1,0 +1,196 @@
+/** @fileoverview Domain normalization, nested links, and stable local continuation. */
+import { describe, expect, it } from 'vitest';
+import {
+  canonicalId,
+  decisionVoters,
+  documentLinks,
+  localized,
+  localPage,
+  normalizeDecision,
+  normalizeDecisionSummary,
+  normalizeDocument,
+  normalizeName,
+  normalizeProcedure,
+  normalizeQuestion,
+  upstreamPage,
+} from '../../../src/services/eu-parliament/eu-parliament-normalization.js';
+import {
+  decisionSchema,
+  documentSchema,
+  procedureSchema,
+  questionSchema,
+} from '../../../src/services/eu-parliament/eu-parliament-schemas.js';
+import {
+  decisionRecord,
+  documentRecord,
+  questionRecord,
+} from '../../helpers/eu-parliament-fixtures.js';
+
+describe('Parliament normalization', () => {
+  it.each([
+    '2025/1234(COD)',
+    '2025-1234',
+    'eli/dl/proc/2025-1234',
+    'https://data.europarl.europa.eu/eli/dl/proc/2025-1234',
+  ])('canonicalizes procedure alias %s', (input) => {
+    expect(canonicalId(input, 'procedure')).toBe('2025-1234');
+  });
+  it.each(['https://evil.example/person/1', 'person/../meps', '1?text=x', '%2e%2e'])(
+    'rejects noncanonical person identifier %s',
+    (input) => {
+      expect(() => canonicalId(input, 'person')).toThrow();
+    },
+  );
+  it('selects source language deterministically and reports every fallback', () => {
+    const notices: string[] = [];
+    expect(localized({ fr: 'Français', en: 'English' }, 'fr', notices)).toEqual({
+      value: 'Français',
+      language: 'fr',
+    });
+    expect(localized({ fr: 'Français', en: 'English' }, 'pl', notices)).toEqual({
+      value: 'English',
+      language: 'en',
+    });
+    expect(localized({ fr: 'Français', de: 'Deutsch' }, 'pl', notices)).toEqual({
+      value: 'Deutsch',
+      language: 'de',
+    });
+    expect(notices).toHaveLength(2);
+    expect(localized(undefined, 'en', notices)).toBeUndefined();
+  });
+  it('preserves every selected-language nested file and falls back independently', () => {
+    const notices: string[] = [];
+    const raw = documentSchema.parse(documentRecord);
+    expect(documentLinks(raw, 'fr', notices)).toEqual([
+      {
+        url: 'https://data.europarl.europa.eu/distribution/example/opinion_fr.pdf',
+        language: 'fr',
+        media_type: 'https://www.iana.org/assignments/media-types/application/pdf',
+      },
+      {
+        url: 'https://data.europarl.europa.eu/distribution/example/opinion_fr.html',
+        language: 'fr',
+        media_type: 'https://www.iana.org/assignments/media-types/text/html',
+      },
+    ]);
+    expect(documentLinks(raw, 'pl', notices)).toEqual([
+      {
+        url: 'https://data.europarl.europa.eu/distribution/example/opinion_en.pdf',
+        language: 'en',
+      },
+    ]);
+    expect(notices).toHaveLength(1);
+    const result = normalizeDocument(raw, 'fr', []);
+    expect(result.title).toEqual({ value: 'Avis exemple', language: 'fr' });
+    expect(result).not.toHaveProperty('text');
+  });
+  it('retains nested answer metadata and all selected-language answer links', () => {
+    const result = normalizeQuestion(questionSchema.parse(questionRecord), 'fr', []);
+    expect(result.answers).toEqual([
+      {
+        document_id: 'E-10-2025-900001-ASW',
+        date: '2025-02-15',
+        links: [
+          {
+            url: 'https://data.europarl.europa.eu/distribution/example/opinion_fr.pdf',
+            language: 'fr',
+            media_type: 'https://www.iana.org/assignments/media-types/application/pdf',
+          },
+          {
+            url: 'https://data.europarl.europa.eu/distribution/example/opinion_fr.html',
+            language: 'fr',
+            media_type: 'https://www.iana.org/assignments/media-types/text/html',
+          },
+        ],
+      },
+    ]);
+  });
+  it('collects procedure documents beyond the first event and deduplicates shared relations', () => {
+    const result = normalizeProcedure(
+      procedureSchema.parse({
+        id: 'eli/dl/proc/2025-1234',
+        consists_of: [
+          {
+            id: 'eli/dl/event/EXAMPLE-1',
+            decided_on_a_realization_of: ['eli/dl/doc/A-10-2025-900001'],
+          },
+          {
+            id: 'eli/dl/event/EXAMPLE-2',
+            based_on_a_realization_of: ['eli/dl/doc/A-10-2025-900001'],
+            recorded_in_a_realization_of: ['eli/dl/doc/PV-10-2025-01-15'],
+          },
+        ],
+      }),
+      'en',
+      [],
+    );
+    expect(result.documents.map((item) => item.document_id)).toEqual([
+      'A-10-2025-900001',
+      'PV-10-2025-01-15',
+    ]);
+    expect(result.events[1]?.document_ids).toEqual(['A-10-2025-900001', 'PV-10-2025-01-15']);
+  });
+  it('separates all recorded/intended voter arrays and unavailable versus published empty', () => {
+    const raw = decisionSchema.parse(decisionRecord);
+    expect(decisionVoters(raw, 'favor')).toEqual(['900000001', '900000002']);
+    expect(decisionVoters(raw, 'against')).toEqual(['900000003']);
+    expect(decisionVoters(raw, 'abstention')).toEqual([]);
+    expect(decisionVoters(raw, 'intended_favor')).toEqual(['900000004']);
+    expect(decisionVoters(raw, 'intended_against')).toEqual(['900000005']);
+    expect(decisionVoters(raw, 'intended_abstention')).toEqual(['900000006']);
+    expect(decisionVoters(decisionSchema.parse({ id: raw.id }), 'favor')).toBeUndefined();
+    expect(normalizeDecisionSummary(raw)).toMatchObject({ favor: 2, against: 1, abstention: 0 });
+    expect(normalizeDecisionSummary(raw)).not.toHaveProperty('attendees');
+    expect(normalizeDecision(raw, 'fr', [])).toMatchObject({
+      label: { value: 'Amendement exemple', language: 'fr' },
+      reference_text: { value: 'Recital 1', language: 'en' },
+      recording_document_ids: ['PV-10-2025-01-15-RCV-ITM-001'],
+    });
+  });
+  it('hashes full normalized contents and scope before whole-item slicing', () => {
+    const items = [{ id: 'first' }, { id: 'second' }, { id: 'third' }];
+    const first = localPage(items, { limit: 1 }, { term: 10 });
+    expect(first.items).toEqual([{ id: 'first' }]);
+    expect(first.page).toMatchObject({ next_offset: 1, has_more: true, returned: 1 });
+    const snapshot = first.page.snapshot!;
+    expect(snapshot).toMatch(/^[a-f0-9]{64}$/);
+    const second = localPage(items, { offset: 1, limit: 1, snapshot }, { term: 10 });
+    expect(second.items).toEqual([{ id: 'second' }]);
+    expect(() => localPage(items, { offset: 1 }, { term: 10 })).toThrow();
+    expect(() =>
+      localPage([...items.slice(0, 2), { id: 'changed unseen third' }], { snapshot }, { term: 10 }),
+    ).toThrow();
+    expect(() => localPage(items, { snapshot }, { term: 9 })).toThrow();
+    expect(localPage(items, { offset: 20, snapshot }, { term: 10 })).toMatchObject({
+      items: [],
+      total: 3,
+      page: { returned: 0, has_more: false },
+    });
+  });
+  it('caps whole-item limits and does not invent upstream totals', () => {
+    expect(
+      localPage(
+        Array.from({ length: 101 }, (_, id) => ({ id })),
+        { limit: 1000 },
+        {},
+      ).page,
+    ).toMatchObject({ limit: 100, returned: 100, next_offset: 100 });
+    expect(upstreamPage(20, {})).toEqual({
+      offset: 0,
+      limit: 20,
+      returned: 20,
+      has_more: true,
+      next_offset: 20,
+    });
+    expect(upstreamPage(2, { offset: 20, limit: 20 }, 22)).toEqual({
+      offset: 20,
+      limit: 20,
+      returned: 2,
+      has_more: false,
+    });
+  });
+  it('normalizes non-ASCII name tokens without dropping word boundaries', () => {
+    expect(normalizeName('Élodie DEMO')).toBe('elodie demo');
+    expect(normalizeName('Alex-Example')).toBe('alex example');
+  });
+});
