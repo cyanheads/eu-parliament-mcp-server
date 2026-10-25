@@ -128,9 +128,9 @@ export const enrichmentFields = {
 };
 function quoted(value: string): string {
   const json = JSON.stringify(value);
-  const fence = '`'.repeat(
-    Math.max(0, ...[...json.matchAll(/`+/g)].map((match) => match[0].length)) + 1,
-  );
+  let longestRun = 0;
+  for (const match of json.matchAll(/`+/g)) longestRun = Math.max(longestRun, match[0].length);
+  const fence = '`'.repeat(longestRun + 1);
   return `${fence} ${json} ${fence}`;
 }
 /** Render every scalar, empty container and array entry, retaining active URL links. */

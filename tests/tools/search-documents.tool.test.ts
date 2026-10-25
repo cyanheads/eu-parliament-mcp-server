@@ -138,6 +138,24 @@ describe('euparl_search_documents contract', () => {
     });
   });
 
+  it('preserves large backtick-rich filters and published titles on both surfaces', async () => {
+    const text = '`a'.repeat(200_000);
+    const fetcher = installToolHttp(() =>
+      envelopeResponse([{ ...documentRecord, title_dcterms: { en: text } }]),
+    );
+    const search = expectSuccessTwin(await runToolContract(searchDocumentsTool, { text }));
+    expect(search.appliedFilters).toMatchObject({ text });
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('text')).toBe(text);
+
+    const detail = expectSuccessTwin(
+      await runToolContract(searchDocumentsTool, { mode: 'get', document_id: documentRecord.id }),
+    );
+    expect(detail).toMatchObject({
+      found: true,
+      document: { title: { value: text, language: 'en' } },
+    });
+  });
+
   it.each([
     'AFCO-AD-900001',
     'CRE-10-2025-01-15-ITM-001',
