@@ -618,7 +618,6 @@ export class EuParliamentService {
         if (response.next !== undefined || (total !== undefined && all.length < total)) stalled();
         break;
       }
-      if (response.data.every((row) => seen.has(row.id))) stalled();
       for (const row of response.data) {
         if (seen.has(row.id)) stalled();
         seen.add(row.id);
@@ -641,6 +640,9 @@ export class EuParliamentService {
     const country = normalizeCode(input.country, 'country');
     const political_group = normalizeCode(input.political_group, 'political_group');
     const gender = normalizeCode(input.gender, 'gender');
+    const tokens = input.name_contains
+      ? normalizeName(input.name_contains).split(/\s+/).filter(Boolean)
+      : [];
     const filters = {
       scope: input.term === undefined ? 'current' : 'parliamentary_term',
       ...(input.term === undefined
@@ -650,12 +652,7 @@ export class EuParliamentService {
       ...field('country', country),
       ...field('political_group', political_group),
       ...field('gender', gender),
-      ...field(
-        'name_contains',
-        input.name_contains
-          ? normalizeName(input.name_contains).split(/\s+/).filter(Boolean).join(' ')
-          : undefined,
-      ),
+      ...field('name_contains', input.name_contains ? tokens.join(' ') : undefined),
     };
     const all = await this.roster(
       {
@@ -667,19 +664,16 @@ export class EuParliamentService {
       input.term === undefined,
       operation,
     );
-    const tokens = input.name_contains
-      ? normalizeName(input.name_contains).split(/\s+/).filter(Boolean)
-      : [];
     const selected = all
-      .filter((raw) =>
-        tokens.every((token) =>
-          normalizeName(
-            [raw.label, raw.givenName, raw.familyName]
-              .filter((value) => value !== undefined)
-              .join(' '),
-          ).includes(token),
-        ),
-      )
+      .filter((raw) => {
+        if (!tokens.length) return true;
+        const name = normalizeName(
+          [raw.label, raw.givenName, raw.familyName]
+            .filter((value) => value !== undefined)
+            .join(' '),
+        );
+        return tokens.every((token) => name.includes(token));
+      })
       .sort(
         (a, b) =>
           (a.sortLabel ?? '').localeCompare(b.sortLabel ?? '') ||

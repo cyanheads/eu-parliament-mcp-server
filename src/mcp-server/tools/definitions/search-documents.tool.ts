@@ -102,7 +102,7 @@ export const searchDocumentsTool = tool('euparl_search_documents', {
         .optional()
         .describe('Parliamentary term 0–10; adopted_texts and committee search only.'),
       work_type: optionalString().describe(
-        'Search-only family-specific code from euparl_list_reference topic document_types; known aliases and case normalize.',
+        'Search-only family-specific code from euparl_list_reference topic document_types; case-insensitive and whitespace-trimmed.',
       ),
       sitting_date: optionalString().describe(
         'Adopted-texts-only sitting date YYYY-MM-DD; start of range when sitting_date_end is supplied.',

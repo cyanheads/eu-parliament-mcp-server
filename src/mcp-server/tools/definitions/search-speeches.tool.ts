@@ -81,7 +81,7 @@ export const searchSpeechesTool = tool('euparl_search_speeches', {
         'Search-only numeric MEP identifier, person/ prefix or exact public person URI.',
       ),
       activity_type: optionalString().describe(
-        'Search-only code from euparl_list_reference topic activity_types; known aliases and case normalize.',
+        'Search-only code from euparl_list_reference topic activity_types; case-insensitive and whitespace-trimmed.',
       ),
       sitting_date: optionalString().describe(
         'Search-only sitting date YYYY-MM-DD; start date when a range end is supplied.',
