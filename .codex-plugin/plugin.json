@@ -1,6 +1,6 @@
 {
   "name": "eu-parliament-mcp-server",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Track European Parliament procedures, MEPs, votes, documents, speeches, and questions via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
