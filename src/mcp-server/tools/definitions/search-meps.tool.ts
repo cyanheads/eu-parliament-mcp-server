@@ -35,10 +35,10 @@ export const searchMepsTool = tool('euparl_search_meps', {
         .optional()
         .describe('Parliamentary term 0–10; omitted selects members in office today.'),
       country: optionalString().describe(
-        'Supported ISO alpha-2 country code, case-insensitive; UK is historical. See euparl_list_reference topic mep_filters.',
+        'Supported ISO alpha-2 country code, case-insensitive; GB maps to historical UK and does not establish current membership. See euparl_list_reference topic mep_filters.',
       ),
       political_group: optionalString().describe(
-        'Supported political group code, case-insensitive; accepts S&D, Verts/ALE, The Left, Renew, and PfE aliases. See euparl_list_reference topic mep_filters.',
+        'Supported political group code, case-insensitive; accepts EPP, S&D, Verts/ALE, Greens/EFA, The Left, GUE/NGL, Renew, PfE, and Patriots aliases. Query aliases never rewrite historical organization identities. See euparl_list_reference topic mep_filters.',
       ),
       gender: optionalString().describe(
         'Supported gender code FEMALE, MALE, NAP, NKN, or NST, case-insensitive.',
@@ -135,7 +135,6 @@ export const searchMepsTool = tool('euparl_search_meps', {
   ],
   async handler(input, ctx) {
     const result = await getEuParliamentService().searchMeps(serviceInput(input), ctx);
-    ctx.enrich({ appliedFilters: result.enrichment.appliedFilters });
     applyEnrichment(ctx.enrich, result.enrichment, result.data.page);
     return result.data;
   },

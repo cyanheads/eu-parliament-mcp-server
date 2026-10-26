@@ -16,8 +16,6 @@ const invalidHint =
   'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
 const modeHint =
   'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.';
-const stalledHint =
-  'Retry the same euparl tool call later; do not treat an incomplete lookup as a complete result.';
 const row = (id: string) => ({ id: `eli/dl/doc/${id}`, identifier: id });
 const page = (start: number, count: number) =>
   Array.from({ length: count }, (_, i) => row(`E-10-2025-${String(start + i).padStart(6, '0')}`));
@@ -144,101 +142,73 @@ describe('euparl_list_questions contract', () => {
     expect(contractText(sparse)).not.toMatch(/unanswered|no answer exists/i);
   });
 
-  it('scans beyond a full first page and only retrieves detail after complete traversal', async () => {
-    const fetcher = installToolHttp((_url, _init, index) =>
-      envelopeResponse(
-        index === 0 ? page(1, 50) : index === 1 ? [row('E-10-2025-900001')] : [questionRecord],
-      ),
-    );
+  it('resolves ordinary-year citations directly without a catalogue scan', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([questionRecord]));
     expect(
       expectSuccessTwin(
         await runToolContract(listQuestionsTool, { mode: 'get', question_id: 'E-900001/2025' }),
       ),
     ).toMatchObject({ found: true, question: { question_id: 'E-10-2025-900001' } });
-    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(fetcher).toHaveBeenCalledTimes(1);
     const urls = fetcher.mock.calls.map((call) => new URL(String(call[0])));
-    expect(urls[0]?.searchParams.get('year')).toBe('2025');
-    expect(urls[0]?.searchParams.get('limit')).toBe('50');
-    expect(urls[1]?.searchParams.get('offset')).toBe('50');
-    expect(urls[2]?.pathname).toBe('/api/v2/parliamentary-questions/E-10-2025-900001');
+    expect(urls[0]?.searchParams.has('year')).toBe(false);
+    expect(urls[0]?.pathname).toBe('/api/v2/parliamentary-questions/E-10-2025-900001');
   });
 
-  it('follows explicit short-page continuation and finds ambiguity across terms before detail', async () => {
+  it('checks both overlapping terms and rejects ambiguous published identities', async () => {
     const fetcher = installToolHttp((_url, _init, index) =>
       index === 0
-        ? new Response(
-            JSON.stringify({
-              data: [row('E-9-2025-900001')],
-              meta: { next: '?offset=50', total: 2 },
-            }),
-          )
-        : envelopeResponse([row('E-10-2025-900001')]),
+        ? envelopeResponse([row('E-9-2024-900001')])
+        : envelopeResponse([row('E-10-2024-900001')]),
     );
     const result = await runToolContract(listQuestionsTool, {
       mode: 'get',
-      question_id: 'E-900001/2025',
+      question_id: 'E-900001/2024',
     });
     expectErrorTwin(result, 'invalid_filter', invalidHint);
     expect(contractText(result)).toContain('Supply term');
     expect(fetcher).toHaveBeenCalledTimes(2);
-    expect(new URL(String(fetcher.mock.calls[1]?.[0])).searchParams.get('offset')).toBe('50');
+    expect(new URL(String(fetcher.mock.calls[1]?.[0])).pathname).toBe(
+      '/api/v2/parliamentary-questions/E-10-2024-900001',
+    );
   });
 
-  it('returns a miss only after complete year traversal and ignores mismatched prefix and year', async () => {
-    const fetcher = installToolHttp((_url, _init, index) =>
-      envelopeResponse(
-        index === 0 ? page(1, 50) : [row('P-10-2025-900001'), row('E-10-2024-900001')],
-      ),
-    );
+  it('returns a miss only after all election-year candidates are missing', async () => {
+    const fetcher = installToolHttp(() => new Response(null, { status: 404 }));
     const data = expectSuccessTwin(
-      await runToolContract(listQuestionsTool, { mode: 'get', question_id: 'E-900001/2025' }),
+      await runToolContract(listQuestionsTool, { mode: 'get', question_id: 'E-900001/2024' }),
     );
     expect(data).toMatchObject({ mode: 'get', found: false });
     expect(data.notice).toContain('citation year');
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it.each(['repeat', 'empty', 'backwards', 'invalid'])(
-    'fails incomplete %s traversal with recovery instead of a miss',
+  it.each(['P-9-2024-900001', 'E-9-2023-900001', 'E-10-2024-900001'])(
+    'rejects mismatched candidate identity %s instead of selecting it',
     async (kind) => {
-      installToolHttp((_url, _init, index) => {
-        if (kind === 'repeat')
-          return new Response(JSON.stringify({ data: page(1, 50), meta: { total: 100 } }));
-        if (index === 0)
-          return new Response(
-            JSON.stringify({
-              data: page(1, 1),
-              meta: {
-                total: 2,
-                next:
-                  kind === 'backwards'
-                    ? 0
-                    : kind === 'invalid'
-                      ? 'https://example.org/no-offset'
-                      : 1,
-              },
-            }),
-          );
-        return envelopeResponse([]);
+      installToolHttp(() => envelopeResponse([row(kind)]));
+      const result = await runToolContract(listQuestionsTool, {
+        mode: 'get',
+        question_id: 'E-900001/2024',
       });
-      expectErrorTwin(
-        await runToolContract(listQuestionsTool, { mode: 'get', question_id: 'E-900001/2025' }),
-        'upstream_paging_stalled',
-        stalledHint,
-      );
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.SerializationError },
+      });
+      expect(contractText(result)).toContain('different question identifier');
     },
   );
 
-  it('does not turn a traversal deadline into a complete miss', async () => {
+  it('does not turn a second-candidate deadline into a miss or return the first hit', async () => {
     vi.useFakeTimers();
     const fetcher = installToolHttp(async (_url, _init, index) => {
-      if (index === 0) return envelopeResponse(page(1, 50));
+      if (index === 0) return envelopeResponse([row('E-9-2024-900001')]);
       vi.advanceTimersByTime(40_001);
       return envelopeResponse([]);
     });
     const result = await runToolContract(listQuestionsTool, {
       mode: 'get',
-      question_id: 'E-900001/2025',
+      question_id: 'E-900001/2024',
     });
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toMatchObject({ error: { code: JsonRpcErrorCode.Timeout } });

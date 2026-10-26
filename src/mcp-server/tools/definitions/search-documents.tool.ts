@@ -51,6 +51,20 @@ const documentDetailSchema = documentSummarySchema
       .describe(
         'Explicit parent documents; retrieve with this tool in get mode when a subdivision lacks files.',
       ),
+    adopted_document_ids: z
+      .array(z.string().describe('Canonical adopted document identifier.'))
+      .describe(
+        'Explicit adopted document relations in published order; targets can be retrieved with mode get but may be unavailable upstream.',
+      ),
+    based_on_document_ids: z
+      .array(z.string().describe('Canonical source document identifier.'))
+      .describe(
+        'Explicit based-on document relations in published order; no procedure relationship is inferred.',
+      ),
+    public_register_ref: z
+      .string()
+      .optional()
+      .describe('Published public-register notation, preserved verbatim; absent when unpublished.'),
     links: z
       .array(linkSchema)
       .describe('Every source-file link in the selected expression language, preserving metadata.'),
@@ -62,7 +76,7 @@ const documentDetailSchema = documentSummarySchema
 export const searchDocumentsTool = tool('euparl_search_documents', {
   title: 'Search parliamentary documents',
   description:
-    'Search adopted texts, committee documents, or plenary documents, then retrieve metadata and source-file links with mode get and document_id. Get accepts IDs from procedures, speeches, votes, questions and answers without a source family; parent_document_ids lead from subdivisions to parent files. Only adopted_texts supports text, title, sitting dates and related_process_id. Committee supports term but no year; plenary supports year but no term. Use euparl_list_reference topic document_types for family-specific work_type codes. Detail returns links, not extracted full text; continue search with page.next_offset.',
+    'Search adopted texts, committee documents, or plenary documents, then retrieve metadata and source-file links with mode get and document_id. Get accepts IDs from procedures, speeches, votes, questions and answers without a source family; parent_document_ids lead from subdivisions to parent files. Detail preserves adopted_document_ids, based_on_document_ids and public_register_ref; follow published document relations with mode get, while preserving ordinary missing-record and upstream-error outcomes for unavailable targets. Document relations never imply procedure links. Only adopted_texts supports text, title, sitting dates and related_process_id. Committee supports term but no year; plenary supports year but no term. Use euparl_list_reference topic document_types for family-specific work_type codes. Detail returns links, not extracted full text. Adopted texts expose at most 10000 search results; continue with page.next_offset when present, otherwise narrow supported filters.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -143,7 +157,7 @@ export const searchDocumentsTool = tool('euparl_search_documents', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A code, identifier, language, date range or source-specific filter is unsupported.',
+      when: 'A code, identifier, language, date range or source-specific filter is unsupported, or adopted-text offset plus effective limit exceeds the 10000-result search window.',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
       thrownBy: 'service',
@@ -175,7 +189,6 @@ export const searchDocumentsTool = tool('euparl_search_documents', {
   ],
   async handler(input, ctx) {
     const result = await getEuParliamentService().searchDocuments(serviceInput(input), ctx);
-    ctx.enrich({ appliedFilters: result.enrichment.appliedFilters });
     applyEnrichment(
       ctx.enrich,
       result.enrichment,

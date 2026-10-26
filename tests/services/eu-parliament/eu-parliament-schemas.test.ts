@@ -1,6 +1,7 @@
 /** @fileoverview Sparse and nested published shapes at the JSON-LD parsing edge. */
 import { describe, expect, it } from 'vitest';
 import {
+  bodySchema,
   decisionSchema,
   documentSchema,
   mepSchema,
@@ -16,6 +17,25 @@ import {
 } from '../../helpers/eu-parliament-fixtures.js';
 
 describe('Parliament noun schemas', () => {
+  it('retains published full body names and sparse temporal intervals', () => {
+    const body = {
+      id: 'org/5144',
+      label: 'DLAT',
+      prefLabel: { en: 'Delegation example' },
+      temporal: { startDate: '2019-07-02' },
+    };
+    expect(bodySchema.parse(body)).toEqual(body);
+    expect(bodySchema.parse({ id: 'org/2' })).toEqual({ id: 'org/2' });
+  });
+  it('retains singleton and array document adoption relations and register notation', () => {
+    const raw = {
+      id: 'eli/dl/doc/TA-9-2024-0138',
+      adopts: { id: 'eli/dl/doc/A-9-2023-0188' },
+      based_on: ['RULES-9-2023-05-08-ITM-A58'],
+      notation_publicRegister: 'P9_TA(2024)0138',
+    };
+    expect(documentSchema.parse(raw)).toEqual(raw);
+  });
   it('preserves sparse historical roster identities without inventing context', () => {
     expect(mepSchema.parse(rosterRecords[1])).toEqual({
       id: 'person/900000002',

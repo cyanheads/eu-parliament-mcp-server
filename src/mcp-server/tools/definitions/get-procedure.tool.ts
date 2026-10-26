@@ -28,7 +28,9 @@ const eventSchema = z
       .describe('Explicit event document relations, deduplicated in first-seen order.'),
     sitting_ids: z
       .array(z.string().describe('Canonical scheduled sitting identifier.'))
-      .describe('Explicit scheduled sitting relations.'),
+      .describe(
+        'Explicit scheduled sitting relations; when absent, a published vote-event date can select a sitting for euparl_get_plenary_votes decisions with document_id.',
+      ),
   })
   .strict()
   .describe('Published procedure event.');
@@ -190,7 +192,6 @@ export const getProcedureTool = tool('euparl_get_procedure', {
   ],
   async handler(input, ctx) {
     const result = await getEuParliamentService().getProcedure(serviceInput(input), ctx);
-    ctx.enrich({ appliedFilters: result.enrichment.appliedFilters });
     applyEnrichment(
       ctx.enrich,
       result.enrichment,
@@ -198,34 +199,5 @@ export const getProcedureTool = tool('euparl_get_procedure', {
     );
     return result.data;
   },
-  format: ({
-    found,
-    procedure_id,
-    reference,
-    title,
-    process_type,
-    stage,
-    source_url,
-    section,
-    available_sections,
-    events,
-    participants,
-    documents,
-    page,
-  }) =>
-    formatResult({
-      found,
-      procedure_id,
-      ...(reference !== undefined && { reference }),
-      ...(title !== undefined && { title }),
-      ...(process_type !== undefined && { process_type }),
-      ...(stage !== undefined && { stage }),
-      source_url,
-      section,
-      ...(available_sections !== undefined && { available_sections }),
-      ...(events !== undefined && { events }),
-      ...(participants !== undefined && { participants }),
-      ...(documents !== undefined && { documents }),
-      ...(page !== undefined && { page }),
-    }),
+  format: (result) => formatResult(serviceInput(result)),
 });

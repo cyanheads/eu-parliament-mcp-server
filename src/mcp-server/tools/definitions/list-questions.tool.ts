@@ -71,11 +71,11 @@ const questionSchema = questionSummarySchema
     'Question metadata and published answer links, without extracted question or answer bodies.',
   );
 
-/** List questions or resolve a citation exactly across the published year catalogue. */
+/** List questions or resolve exact citations across overlapping parliamentary terms. */
 export const listQuestionsTool = tool('euparl_list_questions', {
   title: 'List parliamentary questions',
   description:
-    'List parliamentary questions by year and work_type or retrieve metadata, source-file links and published answers with mode get and question_id. Human citations such as E-000001/2025 retain their full year; supplying term resolves directly, while omission searches the complete year catalogue and requires an unambiguous exact match. Canonical IDs bypass that scan. Use euparl_list_reference topic question_types for work_type codes. No keyword, author or addressee search is available. Empty answers means no answer relation was published in this response. Get rejects list filters and nondefault paging; continue lists with page.next_offset.',
+    'List parliamentary questions by year and work_type or retrieve metadata, source-file links and published answers with mode get and question_id. Human citations such as E-000001/2025 retain their full year; omission of term checks canonical candidates for every overlapping parliamentary term and requires one verified match. Supply term to disambiguate; canonical IDs resolve directly. Use euparl_list_reference topic question_types for work_type codes. No keyword, author or addressee search is available. Empty answers means no answer relation was published in this response. Get rejects list filters and nondefault paging; continue lists with page.next_offset.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -105,7 +105,7 @@ export const listQuestionsTool = tool('euparl_list_questions', {
         .max(10)
         .optional()
         .describe(
-          'Get-only term 0–10 to disambiguate a human citation; must agree with a canonical ID. Omit to scan the entire citation year without inferring term.',
+          'Get-only term 0–10 to disambiguate a human citation; must agree with a canonical ID. Omit to verify candidates for every term overlapping the citation year.',
         ),
       ...pagingInputFields,
     })
@@ -149,14 +149,6 @@ export const listQuestionsTool = tool('euparl_list_questions', {
       thrownBy: 'service',
     },
     {
-      reason: 'upstream_paging_stalled',
-      code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Complete citation-year traversal repeats or cannot advance before exhaustion.',
-      recovery:
-        'Retry the same euparl tool call later; do not treat an incomplete lookup as a complete result.',
-      thrownBy: 'service',
-    },
-    {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
       when: 'Parliament rejects validated request parameters.',
@@ -175,7 +167,6 @@ export const listQuestionsTool = tool('euparl_list_questions', {
   ],
   async handler(input, ctx) {
     const result = await getEuParliamentService().listQuestions(serviceInput(input), ctx);
-    ctx.enrich({ appliedFilters: result.enrichment.appliedFilters });
     applyEnrichment(
       ctx.enrich,
       result.enrichment,

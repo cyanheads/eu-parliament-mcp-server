@@ -3,9 +3,10 @@
  * @module services/eu-parliament/eu-parliament-reference
  */
 import { validationError } from '@cyanheads/mcp-ts-core/errors';
+import type { LocalizedText } from './eu-parliament-normalization.js';
 
 /** Canonical input codes copied from the public OpenAPI, plus verified group tokens. */
-export const codes = {
+const codes = {
   language: [
     'bg',
     'es',
@@ -130,9 +131,13 @@ export const codes = {
   ],
 } as const;
 const aliases = new Map([
+  ['EPP', 'PPE'],
   ['S&D', 'S-D'],
   ['VERTS/ALE', 'VERTS-ALE'],
+  ['GREENS/EFA', 'VERTS-ALE'],
   ['THE LEFT', 'THE-LEFT'],
+  ['GUE/NGL', 'THE-LEFT'],
+  ['PATRIOTS', 'PFE'],
 ]);
 /** Validates only input codes; source output remains unmodified. */
 export function normalizeCode(
@@ -142,35 +147,50 @@ export function normalizeCode(
   if (value === undefined || value.trim() === '') return undefined;
   let canonical = family === 'language' ? value.trim().toLowerCase() : value.trim().toUpperCase();
   if (family === 'political_group') canonical = aliases.get(canonical) ?? canonical;
-  if (!(codes[family] as readonly string[]).includes(canonical))
-    throw validationError(`Unsupported ${family} filter. Consult euparl_list_reference.`, {
+  if (family === 'country' && canonical === 'GB') canonical = 'UK';
+  if (!(codes[family] as readonly string[]).includes(canonical)) {
+    const guidance =
+      family === 'country' || family === 'political_group' || family === 'gender'
+        ? `Accepted codes: ${codes[family].join(', ')}.`
+        : 'Consult euparl_list_reference.';
+    throw validationError(`Unsupported ${family} filter. ${guidance}`, {
       reason: 'invalid_filter',
       field: family,
     });
+  }
   return canonical;
 }
 /** Reference topics supported by the nine-tool surface. */
-export type ReferenceTopic =
-  | 'committees'
-  | 'political_groups'
-  | 'procedure_types'
-  | 'document_types'
-  | 'question_types'
-  | 'activity_types'
-  | 'mep_filters'
-  | 'identifiers'
-  | 'coverage';
+export const referenceTopics = [
+  'committees',
+  'political_groups',
+  'organizations',
+  'procedure_types',
+  'document_types',
+  'question_types',
+  'activity_types',
+  'mep_filters',
+  'identifiers',
+  'coverage',
+] as const;
+export type ReferenceTopic = (typeof referenceTopics)[number];
 /** Flat reference record; live bodies add their published identity/classification. */
 export interface ReferenceEntry {
   classification?: string;
   code: string;
   description?: string;
+  end_date?: string;
+  found?: boolean;
   id?: string;
-  label?: { language: string; value: string };
+  label?: LocalizedText;
+  name?: LocalizedText;
+  organization_id?: string;
+  source_url?: string;
+  start_date?: string;
 }
 /** Static tables have no upstream totals or snapshot requirement. */
 export function referenceEntries(
-  topic: Exclude<ReferenceTopic, 'committees' | 'political_groups'>,
+  topic: Exclude<ReferenceTopic, 'committees' | 'political_groups' | 'organizations'>,
 ): ReferenceEntry[] {
   const rows = (values: readonly string[], description: string) =>
     values.map((code) => ({ code, description }));
@@ -188,14 +208,17 @@ export function referenceEntries(
     case 'activity_types':
       return rows(
         codes.activity_type,
-        'Speech activity type; case-insensitive input; tenth term only.',
+        'Speech activity type; case-insensitive input; search supports terms 9 and 10 without guaranteeing every activity type is published in both.',
       );
     case 'mep_filters':
       return [
-        ...rows(codes.country, 'country; ISO alpha-2; case-insensitive input; UK is historical.'),
+        ...rows(
+          codes.country,
+          'country; ISO alpha-2; case-insensitive input; GB→UK; UK is historical.',
+        ),
         ...codes.political_group.map((code) => ({
           code,
-          description: `political_group; ${['PFE', 'ESN'].includes(code) ? 'observed in live API' : 'documented by OpenAPI'}; case-insensitive; aliases S&D→S-D, Verts/ALE→VERTS-ALE, The Left→THE-LEFT, Renew→RENEW, PfE→PFE.`,
+          description: `political_group; ${['PFE', 'ESN'].includes(code) ? 'observed in live API' : 'documented by OpenAPI'}; case-insensitive; aliases EPP→PPE, S&D→S-D, Verts/ALE and Greens/EFA→VERTS-ALE, The Left and GUE/NGL→THE-LEFT, Renew→RENEW, PfE and Patriots→PFE. Query aliases never rewrite historical organization identities.`,
         })),
         ...rows(codes.gender, 'gender; case-insensitive input.'),
       ];
@@ -216,6 +239,11 @@ export function referenceEntries(
           description: 'Decimal person ID, person/ prefix, or exact public person URI.',
         },
         {
+          code: 'organization',
+          description:
+            'Decimal organization ID, org/ prefix, or exact https://data.europarl.europa.eu/org/ URI; resolve supported membership organization IDs with topic organizations and organization_ids.',
+        },
+        {
           code: 'activity',
           description:
             'Canonical activity ID, eli/dl/event/ prefix, or exact public event URI; sitting accepts YYYY-MM-DD.',
@@ -223,7 +251,7 @@ export function referenceEntries(
         {
           code: 'question',
           description:
-            'E-term-year-six-digit-sequence (also P/O), or E-six-digit-sequence/year citation; term avoids a full year lookup.',
+            'E-term-year-six-digit-sequence (also P/O), or E-six-digit-sequence/year citation; omitted term verifies canonical candidates for all overlapping terms, including both adjacent terms in election years.',
         },
         ...rows(
           codes.language,
@@ -245,7 +273,7 @@ export function referenceEntries(
         {
           code: 'speeches',
           description:
-            'Tenth-term speech metadata and source links; published labels are not transcripts.',
+            'Ninth- and tenth-term speech metadata and source links; search defaults to term 10. Published labels are not transcripts; coverage is not guaranteed for other terms.',
         },
         {
           code: 'votes',
@@ -255,12 +283,12 @@ export function referenceEntries(
         {
           code: 'paging',
           description:
-            'Effective limit 100. Local continuation requires returned snapshot; collection is reacquired and drift causes snapshot_changed. No retained cache.',
+            'Effective limit 100, except organization lookup pages at most 20 supplied IDs without a snapshot. Speeches, procedures and adopted texts expose a 10000-result search window; offset plus effective limit cannot exceed 10000. Capped totals are lower bounds. At the window boundary has_more may remain true without next_offset; narrow supported filters. Local continuation requires returned snapshot; collection is reacquired and drift causes snapshot_changed. No retained cache.',
         },
         {
           code: 'questions',
           description:
-            'Human question citations without term require complete year traversal; election years may be ambiguous. Missing answer links do not prove unanswered status.',
+            'Human question citations without term verify direct canonical candidates for overlapping terms: term 0 before 1979, five-year elected terms from 1979, and latest supported term 10 for later years. Election years check both adjacent terms and may be ambiguous; supply term to disambiguate. Missing answer links do not prove unanswered status.',
         },
       ];
   }

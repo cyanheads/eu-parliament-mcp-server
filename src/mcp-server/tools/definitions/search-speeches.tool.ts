@@ -1,5 +1,5 @@
 /**
- * @fileoverview Tenth-term speech metadata discovery and detail retrieval.
+ * @fileoverview Ninth- and tenth-term speech metadata discovery and detail retrieval.
  * @module mcp-server/tools/definitions/search-speeches.tool
  */
 import { tool, z } from '@cyanheads/mcp-ts-core';
@@ -54,11 +54,11 @@ const speechSchema = z
     'Speech activity metadata and source-document references, without extracted spoken text.',
   );
 
-/** Find tenth-term speech activities and follow their published document IDs. */
+/** Find ninth- and tenth-term speech activities and follow published document IDs. */
 export const searchSpeechesTool = tool('euparl_search_speeches', {
   title: 'Search parliamentary speeches',
   description:
-    'Search speech activities in the tenth parliamentary term or retrieve one with mode get and speech_id. Text and title search return activity metadata, not transcripts. Follow document_ids with euparl_search_documents mode get and any returned parent_document_ids to source files. Use euparl_list_reference topic activity_types for activity_type codes; older-term search is unavailable. Get rejects search filters and nondefault paging; continue search with page.next_offset.',
+    'Search speech activities in parliamentary term 9 or 10, default 10, or retrieve one with mode get and speech_id. Text and title search return activity metadata, not transcripts. Follow document_ids with euparl_search_documents mode get and any returned parent_document_ids to source files. Use euparl_list_reference topic activity_types for activity_type codes. Get rejects search filters and nondefault paging. Search exposes at most 10000 results; continue with page.next_offset when present, otherwise narrow text, title, person_id, activity_type or sitting dates.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -71,6 +71,12 @@ export const searchSpeechesTool = tool('euparl_search_speeches', {
       speech_id: optionalString().describe(
         'Get-only canonical activity ID, eli/dl/event/ prefix or exact public URI.',
       ),
+      term: z
+        .union([z.literal(9), z.literal(10)])
+        .optional()
+        .describe(
+          'Search-only parliamentary term 9 or 10; omitted search defaults to 10. Omit in get mode.',
+        ),
       text: optionalString().describe(
         'Search-only keywords in the selected language; matching does not guarantee transcript output.',
       ),
@@ -113,7 +119,7 @@ export const searchSpeechesTool = tool('euparl_search_speeches', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'An activity code, identifier, language or date range is unsupported.',
+      when: 'An activity code, identifier, language or date range is unsupported, or offset plus effective limit exceeds the 10000-result search window.',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
       thrownBy: 'service',
@@ -145,7 +151,6 @@ export const searchSpeechesTool = tool('euparl_search_speeches', {
   ],
   async handler(input, ctx) {
     const result = await getEuParliamentService().searchSpeeches(serviceInput(input), ctx);
-    ctx.enrich({ appliedFilters: result.enrichment.appliedFilters });
     applyEnrichment(
       ctx.enrich,
       result.enrichment,

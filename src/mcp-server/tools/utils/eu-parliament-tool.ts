@@ -5,7 +5,6 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { z } from '@cyanheads/mcp-ts-core';
-import type { Page } from '@/services/eu-parliament/eu-parliament-normalization.js';
 import type { Enrichment } from '@/services/eu-parliament/eu-parliament-service.js';
 
 /** Accept form-client blank values without changing nonblank source text. */
@@ -36,13 +35,17 @@ export const pageSchema = z
     returned: z.number().int().nonnegative().describe('Number of complete items on this page.'),
     has_more: z
       .boolean()
-      .describe('Whether continuation is known or another upstream page is necessary.'),
+      .describe(
+        'Whether more matches are known or cannot be ruled out; a search window may prevent continuation.',
+      ),
     next_offset: z
       .number()
       .int()
       .nonnegative()
       .optional()
-      .describe('Next offset, present exactly when continuation is necessary.'),
+      .describe(
+        'Usable next offset when continuation is accessible; absent at a search-window boundary even if has_more is true.',
+      ),
     snapshot: z
       .string()
       .optional()
@@ -134,7 +137,7 @@ function quoted(value: string): string {
   return `${fence} ${json} ${fence}`;
 }
 /** Render every scalar, empty container and array entry, retaining active URL links. */
-export function renderValue(value: unknown, path = 'result'): string {
+function renderValue(value: unknown, path = 'result'): string {
   if (Array.isArray(value))
     return value.length
       ? value.map((item, index) => renderValue(item, `${path}[${index}]`)).join('\n')
@@ -162,22 +165,25 @@ export const enrichmentTrailer = {
   },
   notice: { render: (value: unknown) => renderValue(value, 'notice') },
 };
-/** Apply notices, exact totals and explicit page-cap disclosure without replacing notices. */
+/** Apply filters, availability, notices, exact totals and page-cap disclosure; notices survive truncation. */
 export function applyEnrichment(
-  enrich: Pick<Context['enrich'], 'truncated' | 'notice' | 'total'>,
+  enrich: Context['enrich'],
   metadata: Enrichment,
-  page?: Pick<Page, 'has_more' | 'returned' | 'limit'> & {
-    next_offset?: number | undefined;
-    snapshot?: string | undefined;
-  },
+  page?: z.infer<typeof pageSchema>,
 ): void {
+  enrich({
+    appliedFilters: metadata.appliedFilters,
+    ...(metadata.available !== undefined && { available: metadata.available }),
+  });
   if (page?.has_more)
     enrich.truncated({
       shown: page.returned,
       cap: page.limit,
       guidance: [
         metadata.notice,
-        `Continue with offset ${page.next_offset}${page.snapshot ? ' and the returned snapshot' : ''}.`,
+        page.next_offset !== undefined
+          ? `Continue with offset ${page.next_offset}${page.snapshot ? ' and the returned snapshot' : ''}.`
+          : undefined,
       ]
         .filter(Boolean)
         .join(' '),

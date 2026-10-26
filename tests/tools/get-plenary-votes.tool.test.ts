@@ -35,6 +35,217 @@ const snapshotOf = (data: Record<string, unknown>) =>
 afterEach(() => vi.useRealTimers());
 
 describe('euparl_get_plenary_votes contract', () => {
+  it.each([
+    { sitting_id: '2025-01-15', document_id: '../unsafe' },
+    { ...selected, mode: 'decision', mep_id: 'https://evil.example/person/1' },
+  ] as const)('rejects invalid added identifier filters %j before HTTP', async (input) => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    expectErrorTwin(
+      await runToolContract(getPlenaryVotesTool, input),
+      'invalid_filter',
+      invalidHint,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+  it.each(['900000001', 'person/900000001', 'https://data.europarl.europa.eu/person/900000001'])(
+    'returns independent recorded and intended membership for %s without a roster request',
+    async (mep_id) => {
+      const fetcher = installToolHttp(() =>
+        envelopeResponse([
+          {
+            ...decisionRecord,
+            had_voter_against: ['person/900000001'],
+            had_voter_intended_favor: undefined,
+            had_voter_intended_against: [],
+            had_voter_intended_abstention: ['person/900000001'],
+          },
+        ]),
+      );
+      const data = expectSuccessTwin(
+        await runToolContract(getPlenaryVotesTool, { ...selected, mode: 'decision', mep_id }),
+      );
+      expect(data).toMatchObject({
+        appliedFilters: { mep_id: '900000001' },
+        decision: {
+          mep_position: {
+            recorded: {
+              positions: ['favor', 'against'],
+              unavailable_positions: [],
+              availability: 'published',
+            },
+            intended: {
+              positions: ['abstention'],
+              unavailable_positions: ['favor'],
+              availability: 'partial',
+            },
+          },
+        },
+      });
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    },
+  );
+  it('preserves unpublished member positions and published empty arrays', async () => {
+    installToolHttp(() =>
+      envelopeResponse([
+        {
+          id: decisionRecord.id,
+          had_voter_favor: [],
+          had_voter_against: [],
+          had_voter_abstention: [],
+        },
+      ]),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        ...selected,
+        mode: 'decision',
+        mep_id: '999999999',
+      }),
+    );
+    expect(data).toMatchObject({
+      decision: {
+        mep_position: {
+          recorded: { positions: [], unavailable_positions: [], availability: 'published' },
+          intended: {
+            positions: [],
+            unavailable_positions: ['favor', 'against', 'abstention'],
+            availability: 'unavailable',
+          },
+        },
+      },
+    });
+    installToolHttp(() => envelopeResponse([{ id: decisionRecord.id }]));
+    expect(
+      expectSuccessTwin(
+        await runToolContract(getPlenaryVotesTool, {
+          ...selected,
+          mode: 'decision',
+          mep_id: '999999999',
+        }),
+      ),
+    ).toMatchObject({
+      decision: {
+        mep_position: {
+          recorded: {
+            positions: [],
+            unavailable_positions: ['favor', 'against', 'abstention'],
+            availability: 'unavailable',
+          },
+        },
+      },
+    });
+    expect(
+      expectSuccessTwin(
+        await runToolContract(getPlenaryVotesTool, { ...selected, mode: 'decision', mep_id: ' ' }),
+      ).decision,
+    ).not.toHaveProperty('mep_position');
+    installToolHttp(() => envelopeResponse([decisionRecord]));
+    expect(
+      expectSuccessTwin(
+        await runToolContract(getPlenaryVotesTool, {
+          ...selected,
+          mode: 'decision',
+          mep_id: '999999999',
+        }),
+      ),
+    ).toMatchObject({
+      decision: {
+        mep_position: {
+          recorded: { positions: [], availability: 'published' },
+          intended: { positions: [], availability: 'published' },
+        },
+      },
+    });
+  });
+  it('filters the complete sitting by exact or hyphen-boundary document relations before paging', async () => {
+    const fetcher = installToolHttp(() =>
+      envelopeResponse([
+        { ...decisionRecord, decided_on_a_realization_of: 'eli/dl/doc/OTHER' },
+        {
+          ...decisionRecord,
+          id: 'eli/dl/event/DEC-2',
+          activity_id: 'DEC-2',
+          decided_on_a_realization_of: { id: 'eli/dl/doc/A-9-2023-0188-AM-808' },
+        },
+        {
+          ...decisionRecord,
+          id: 'eli/dl/event/DEC-3',
+          activity_id: 'DEC-3',
+          decided_on_a_realization_of: [],
+          recorded_in_a_realization_of: ['eli/dl/doc/A-9-2023-0188'],
+        },
+      ]),
+    );
+    const first = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        sitting_id: selected.sitting_id,
+        document_id: 'https://data.europarl.europa.eu/eli/dl/doc/A-9-2023-0188',
+        limit: 1,
+        language: 'pl',
+      }),
+    );
+    expect(first).toMatchObject({
+      totalCount: 2,
+      appliedFilters: { document_id: 'A-9-2023-0188' },
+      decisions: [
+        {
+          decision_id: 'DEC-2',
+          label: { language: 'en', value: 'Example amendment' },
+          document_ids: ['A-9-2023-0188-AM-808'],
+          recording_document_ids: ['PV-10-2025-01-15-RCV-ITM-001'],
+        },
+      ],
+      page: { returned: 1, next_offset: 1 },
+    });
+    expect(first.notice).toContain('Requested language pl unavailable');
+    const snapshot = snapshotOf(first);
+    const second = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        sitting_id: selected.sitting_id,
+        document_id: 'A-9-2023-0188',
+        language: 'pl',
+        offset: 1,
+        limit: 1,
+        snapshot,
+      }),
+    );
+    expect(second).toMatchObject({
+      decisions: [
+        { decision_id: 'DEC-3', document_ids: [], recording_document_ids: ['A-9-2023-0188'] },
+      ],
+      page: { has_more: false },
+    });
+    expect(
+      expectSuccessTwin(
+        await runToolContract(getPlenaryVotesTool, {
+          sitting_id: selected.sitting_id,
+          document_id: 'A-9-2023-0188',
+          language: 'pl',
+          offset: 20,
+          snapshot,
+        }),
+      ),
+    ).toMatchObject({ decisions: [], totalCount: 2, page: { has_more: false } });
+    expectErrorTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        sitting_id: selected.sitting_id,
+        document_id: 'A-9-2023-018',
+        language: 'pl',
+        snapshot,
+      }),
+      'snapshot_changed',
+      snapshotHint,
+    );
+    const empty = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        sitting_id: selected.sitting_id,
+        document_id: 'A-9-2023-018',
+      }),
+    );
+    expect(empty).toMatchObject({ decisions: [], totalCount: 0 });
+    expect(empty.notice).toContain('No decisions matched document_id');
+    expect(fetcher).toHaveBeenCalledTimes(5);
+  });
   it('discovers sittings and forwards only year and page parameters', async () => {
     const fetcher = installToolHttp(() =>
       Response.json({
@@ -91,6 +302,9 @@ describe('euparl_get_plenary_votes contract', () => {
     expect(data.decisions).toEqual([
       {
         decision_id: 'MTG-PL-2025-01-15-DEC-900001',
+        label: { value: 'Example amendment', language: 'en' },
+        document_ids: ['A-10-2025-900001'],
+        recording_document_ids: ['PV-10-2025-01-15-RCV-ITM-001'],
         date: '2025-01-15',
         order: '1.0',
         method: 'def/ep-decision-methods/VOTE_ELECTRONIC_ROLLCALL',
@@ -183,9 +397,9 @@ describe('euparl_get_plenary_votes contract', () => {
     expect(missing).toMatchObject({
       voters: [],
       available: false,
-      totalCount: 0,
       notice: 'This voter position array was not published in the response.',
     });
+    expect(missing).not.toHaveProperty('totalCount');
     const empty = expectSuccessTwin(
       await runToolContract(getPlenaryVotesTool, {
         ...selected,
@@ -281,6 +495,8 @@ describe('euparl_get_plenary_votes contract', () => {
           ? [
               {
                 decision_id: 'EXAMPLE-SECOND',
+                document_ids: [],
+                recording_document_ids: [],
                 voter_counts: [],
                 source_url: 'https://data.europarl.europa.eu/eli/dl/event/EXAMPLE-SECOND',
               },
@@ -495,6 +711,8 @@ describe('euparl_get_plenary_votes contract', () => {
           ? [
               {
                 decision_id: 'EXAMPLE-100',
+                document_ids: [],
+                recording_document_ids: [],
                 voter_counts: [],
                 source_url: 'https://data.europarl.europa.eu/eli/dl/event/EXAMPLE-100',
               },
@@ -547,6 +765,12 @@ describe('euparl_get_plenary_votes contract', () => {
   it.each([
     {},
     { mode: 'sittings' },
+    { mode: 'sittings', year: 2025, document_id: 'A-1' },
+    { mode: 'sittings', year: 2025, mep_id: '1' },
+    { sitting_id: '2025-01-15', mep_id: '1' },
+    { ...selected, mode: 'voters', position: 'favor', mep_id: '1' },
+    { ...selected, mode: 'decision', document_id: 'A-1' },
+    { ...selected, mode: 'voters', position: 'favor', document_id: 'A-1' },
     { mode: 'sittings', year: 2025, sitting_id: '2025-01-15' },
     { sitting_id: '2025-01-15', year: 2025 },
     { ...selected },

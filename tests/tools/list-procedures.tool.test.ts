@@ -19,6 +19,26 @@ const rateHint = 'Wait for the reported retry interval, then repeat the same eup
 afterEach(() => vi.useRealTimers());
 
 describe('euparl_list_procedures contract', () => {
+  it('renders the search wall and rejects inaccessible continuation', async () => {
+    const fetcher = installToolHttp(
+      () =>
+        new Response(
+          JSON.stringify({ data: [{ id: 'eli/dl/proc/2025-9001' }], meta: { total: 10000 } }),
+        ),
+    );
+    const result = await runToolContract(listProceduresTool, { offset: 9999, limit: 1 });
+    const data = expectSuccessTwin(result);
+    expect(data).toMatchObject({ truncated: true, page: { has_more: true, returned: 1 } });
+    expect(data.page).not.toHaveProperty('next_offset');
+    expect(data).not.toHaveProperty('totalCount');
+    expect(contractText(result)).not.toContain('Continue with offset');
+    expectErrorTwin(
+      await runToolContract(listProceduresTool, { offset: 10000, limit: 1 }),
+      'invalid_filter',
+      invalidHint,
+    );
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
   it('normalizes type aliases and renders exact sparse records plus active source links', async () => {
     const reference = '2025/9001(COD) `quoted`\n**literal markdown**';
     const fetcher = installToolHttp(

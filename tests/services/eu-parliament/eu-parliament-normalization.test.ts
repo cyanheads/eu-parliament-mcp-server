@@ -27,6 +27,63 @@ import {
 } from '../../helpers/eu-parliament-fixtures.js';
 
 describe('Parliament normalization', () => {
+  it.each(['5144', 'org/5144', 'https://data.europarl.europa.eu/org/5144', ' 5144 '])(
+    'canonicalizes supported organization identity %s',
+    (id) => {
+      expect(canonicalId(id, 'organization')).toBe('5144');
+    },
+  );
+  it.each([
+    'org/ep-10',
+    'https://evil.example/org/5144',
+    '5144?x=y',
+    'org/../5144',
+    'https://data.europarl.europa.eu.evil/org/5144',
+    '%35',
+    '5144\n1',
+  ])('rejects unsupported organization identity %s', (id) => {
+    expect(() => canonicalId(id, 'organization')).toThrow();
+  });
+  it('preserves sparse decision identity without inferring tallies or text', () => {
+    const result = normalizeDecision(decisionSchema.parse({ id: 'eli/dl/event/DEC-1' }), 'en', []);
+    expect(result).toEqual({
+      decision_id: 'DEC-1',
+      voter_counts: [],
+      document_ids: [],
+      recording_document_ids: [],
+      source_url: 'https://data.europarl.europa.eu/eli/dl/event/DEC-1',
+    });
+  });
+  it('keeps sparse documents free of inferred procedure links, titles and files', () => {
+    const document = normalizeDocument(documentSchema.parse({ id: 'eli/dl/doc/TA-1' }), 'en', []);
+    expect(document).toMatchObject({
+      document_id: 'TA-1',
+      procedure_ids: [],
+      parent_document_ids: [],
+      links: [],
+    });
+    expect(document).not.toHaveProperty('title');
+    expect(document).not.toHaveProperty('public_register_ref');
+  });
+  it('canonicalizes document relation shapes in published order without implying procedure links', () => {
+    const document = normalizeDocument(
+      documentSchema.parse({
+        ...documentRecord,
+        adopts: ['A-1', { id: 'eli/dl/doc/A-2' }, 'https://data.europarl.europa.eu/eli/dl/doc/A-3'],
+        based_on: { id: 'RULES-9-2023-05-08-ITM-A58' },
+        notation_publicRegister: 'P9_A(2023)0188',
+      }),
+      'fr',
+      [],
+    );
+    expect(document).toMatchObject({
+      adopted_document_ids: ['A-1', 'A-2', 'A-3'],
+      based_on_document_ids: ['RULES-9-2023-05-08-ITM-A58'],
+      public_register_ref: 'P9_A(2023)0188',
+      procedure_ids: [],
+      title: { value: 'Avis exemple', language: 'fr' },
+    });
+  });
   it.each([
     '2025/1234(COD)',
     '2025-1234',

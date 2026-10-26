@@ -11,6 +11,50 @@ const instantWait = async () => {};
 afterEach(() => vi.useRealTimers());
 
 describe('EuParliamentClient', () => {
+  it.each([204, 404])(
+    'checks cancellation before accepting an HTTP %i empty response',
+    async (status) => {
+      const controller = new AbortController();
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => {
+        controller.abort(new DOMException('Caller stopped', 'AbortError'));
+        return new Response(null, { status });
+      });
+      const client = new EuParliamentClient({ fetch: fetcher, wait: instantWait });
+      await expect(
+        client.get('meps', {}, record, client.operation(controller.signal)),
+      ).rejects.toMatchObject({ name: 'AbortError' });
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    },
+  );
+  it('checks the shared deadline before accepting a missing candidate', async () => {
+    let now = 0;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => {
+      now = 40001;
+      return new Response(null, { status: 404 });
+    });
+    const client = new EuParliamentClient({ fetch: fetcher, wait: instantWait, now: () => now });
+    await expect(
+      client.get(
+        'parliamentary-questions/E-10-2025-900001',
+        {},
+        record,
+        client.operation(signal()),
+      ),
+    ).rejects.toThrow(/deadline/);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it('classifies HTTP 403 as a permanent upstream rejection without retry-later guidance', async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => new Response('private trace', { status: 403 }));
+    const client = new EuParliamentClient({ fetch: fetcher, wait: instantWait });
+    const pending = client.get('speeches', { text: 'blocked' }, record, client.operation(signal()));
+    await expect(pending).rejects.toMatchObject({
+      data: { reason: 'upstream_rejected', retryable: false },
+    });
+    await expect(pending).rejects.not.toThrow(/Retry later/i);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
   it('uses fixed origin, explicit negotiation, and encoded query values', async () => {
     const fetcher = vi
       .fn<typeof fetch>()

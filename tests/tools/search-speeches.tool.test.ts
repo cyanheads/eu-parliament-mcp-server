@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { searchDocumentsTool } from '../../src/mcp-server/tools/definitions/search-documents.tool.js';
 import { searchSpeechesTool } from '../../src/mcp-server/tools/definitions/search-speeches.tool.js';
 import {
+  contractText,
   expectErrorTwin,
   expectSuccessTwin,
   installToolHttp,
@@ -34,6 +35,99 @@ const speech = {
 };
 
 describe('euparl_search_speeches contract', () => {
+  it.each([8, 11])('rejects unsupported speech term %i at the schema boundary', async (term) => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    const result = await runToolContract<Parameters<typeof runToolContract>[0]>(
+      searchSpeechesTool,
+      { term },
+    );
+    expect(result.isError).toBe(true);
+    expect(contractText(result)).toContain('term');
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+  it('preserves operational failure and bounded retries for ninth-term search', async () => {
+    const fetcher = installToolHttp(() => new Response(null, { status: 500 }));
+    const result = await runToolContract(searchSpeechesTool, { term: 9, person_id: '1' });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { data: { retryable: true } } });
+    expect(contractText(result)).not.toMatch(/unsupported|unavailable coverage/);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+  it('renders an empty ninth-term date result with scope intact', async () => {
+    installToolHttp(() => new Response(null, { status: 204 }));
+    expect(
+      expectSuccessTwin(
+        await runToolContract(searchSpeechesTool, { term: 9, sitting_date: '2025-01-01' }),
+      ),
+    ).toMatchObject({
+      items: [],
+      appliedFilters: { term: 9, sitting_date: '2025-01-01' },
+      page: { returned: 0, has_more: false },
+    });
+  });
+  it('routes ninth-term text, date and person search while preserving source references on both surfaces', async () => {
+    const fetcher = installToolHttp(() =>
+      envelopeResponse([{ ...speech, id: 'eli/dl/event/CRE-9-2024-03-12-S1' }]),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, {
+        term: 9,
+        text: 'artificial intelligence',
+        person_id: '1',
+        language: 'fr',
+        sitting_date: '2024-03-12',
+        sitting_date_end: '2024-03-12',
+      }),
+    );
+    expect(data).toMatchObject({
+      appliedFilters: { term: 9, text: 'artificial intelligence', person_id: '1', language: 'fr' },
+      items: [
+        {
+          speech_id: 'CRE-9-2024-03-12-S1',
+          participants: [{ person_ids: ['1', '2'] }, { person_ids: [] }],
+          document_ids: ['SUBDIVISION-1'],
+        },
+      ],
+    });
+    expect(
+      Object.fromEntries(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams),
+    ).toMatchObject({
+      'parliamentary-term': '9',
+      text: 'artificial intelligence',
+      'person-id': '1',
+      'sitting-date': '2024-03-12',
+      'sitting-date-end': '2024-03-12',
+      'search-language': 'fr',
+    });
+  });
+  it('keeps ninth-term detail free of an injected search term', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([{ id: 'eli/dl/event/CRE-9-2024-S1' }]));
+    expect(
+      expectSuccessTwin(
+        await runToolContract(searchSpeechesTool, { mode: 'get', speech_id: 'CRE-9-2024-S1' }),
+      ),
+    ).toMatchObject({ found: true, speech: { speech_id: 'CRE-9-2024-S1' } });
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.has('parliamentary-term')).toBe(
+      false,
+    );
+  });
+  it('renders window uncertainty without inaccessible continuation or an exact capped total', async () => {
+    installToolHttp(() => new Response(JSON.stringify({ data: [speech], meta: { total: 10000 } })));
+    const result = await runToolContract(searchSpeechesTool, { offset: 9999, limit: 1 });
+    const data = expectSuccessTwin(result);
+    expect(data).toMatchObject({ page: { has_more: true, returned: 1 }, truncated: true });
+    expect(data.page).not.toHaveProperty('next_offset');
+    expect(data).not.toHaveProperty('totalCount');
+    expect(data.notice).toContain('Narrow');
+    expect(contractText(result)).not.toMatch(/Continue with offset|undefined/);
+  });
+  it('returns window-crossing recovery before HTTP', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    const result = await runToolContract(searchSpeechesTool, { offset: 9990, limit: 20 });
+    expectErrorTwin(result, 'invalid_filter', invalidHint);
+    expect(contractText(result)).toContain('Narrow text');
+    expect(fetcher).not.toHaveBeenCalled();
+  });
   it('maps every search filter and preserves all participant and activity metadata', async () => {
     const fetcher = installToolHttp(
       () => new Response(JSON.stringify({ data: [speech], meta: { total: 2, next: null } })),
@@ -230,6 +324,7 @@ describe('euparl_search_speeches contract', () => {
     { mode: 'get' },
     { mode: 'get', speech_id: 'S', text: 'x' },
     { mode: 'get', speech_id: 'S', person_id: '1' },
+    { mode: 'get', speech_id: 'S', term: 9 },
     { mode: 'get', speech_id: 'S', offset: 1 },
     { mode: 'get', speech_id: 'S', limit: 1 },
     { speech_id: 'S' },
@@ -243,16 +338,21 @@ describe('euparl_search_speeches contract', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it.each([400, 429])('renders HTTP %i recovery', async (status) => {
+  it.each([400, 403, 429])('renders HTTP %i recovery', async (status) => {
     const fetcher = installToolHttp(() => new Response(null, { status }));
+    const result = await runToolContract(searchSpeechesTool, {});
     expectErrorTwin(
-      await runToolContract(searchSpeechesTool, {}),
+      result,
       status === 429 ? 'upstream_rate_limited' : 'upstream_rejected',
       status === 429
         ? 'Wait for the reported retry interval, then repeat the same euparl tool call.'
         : 'Call euparl_list_reference for supported filters and identifiers, then retry with a narrower supported request.',
     );
     expect(fetcher).toHaveBeenCalledTimes(status === 429 ? 3 : 1);
+    if (status === 403) {
+      expect(result.structuredContent).toMatchObject({ error: { data: { retryable: false } } });
+      expect(contractText(result)).not.toMatch(/retry later/i);
+    }
   });
 
   it('rejects unsupported snapshot input before acquisition', async () => {
@@ -261,7 +361,7 @@ describe('euparl_search_speeches contract', () => {
     expectErrorTwin(
       await runToolContract(searchSpeechesTool, input),
       'invalid_arguments',
-      'Unknown key snapshot. This tool accepts: mode, speech_id, text, title, person_id, activity_type, sitting_date, sitting_date_end, offset, limit, language.',
+      'Unknown key snapshot. This tool accepts: mode, speech_id, term, text, title, person_id, activity_type, sitting_date, sitting_date_end, offset, limit, language.',
     );
     expect(fetcher).not.toHaveBeenCalled();
   });

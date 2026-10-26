@@ -12,6 +12,10 @@ describe('Parliament reference codes', () => {
     ['The Left', 'THE-LEFT'],
     [' PfE ', 'PFE'],
     ['Renew', 'RENEW'],
+    [' epp ', 'PPE'],
+    [' greens/efa ', 'VERTS-ALE'],
+    [' Gue/Ngl ', 'THE-LEFT'],
+    [' patriots ', 'PFE'],
   ])('normalizes political group alias %s', (input, expected) => {
     expect(normalizeCode(input, 'political_group')).toBe(expected);
   });
@@ -26,10 +30,29 @@ describe('Parliament reference codes', () => {
     expect(normalizeCode(undefined, 'gender')).toBeUndefined();
     expect(normalizeCode('  ', 'gender')).toBeUndefined();
   });
+  it('normalizes the historical country alias without conflating filter families', () => {
+    expect(normalizeCode(' gb ', 'country')).toBe('UK');
+    expect(() => normalizeCode('GB', 'political_group')).toThrow();
+    expect(() => normalizeCode('EPP', 'country')).toThrow();
+  });
+  it.each(['PPE-DE', 'PSE', 'ALDE', '__proto__', 'constructor'])(
+    'keeps unsupported historical or arbitrary group %s invalid',
+    (value) => expect(() => normalizeCode(value, 'political_group')).toThrow(),
+  );
+  it.each([
+    [
+      'country',
+      'BE, BG, CZ, DK, DE, EE, IE, GR, ES, FR, HR, IT, CY, LV, LT, LU, HU, MT, NL, AT, PL, PT, RO, SI, SK, FI, SE, UK',
+    ],
+    ['political_group', 'PPE, NI, S-D, VERTS-ALE, ECR, RENEW, THE-LEFT, ID, PFE, ESN'],
+    ['gender', 'FEMALE, MALE, NAP, NKN, NST'],
+  ] as const)('lists every canonical %s code in invalid-filter guidance', (family, expected) => {
+    expect(() => normalizeCode('invalid', family)).toThrow(`Accepted codes: ${expected}.`);
+  });
   it('exposes actual identifiers and operational coverage rather than unsupported search promises', () => {
     expect(
       referenceEntries('identifiers').find((item) => item.code === 'question')?.description,
-    ).toContain('term avoids a full year lookup');
+    ).toContain('omitted term verifies canonical candidates for all overlapping terms');
     expect(
       referenceEntries('coverage').find((item) => item.code === 'speeches')?.description,
     ).toContain('not transcripts');

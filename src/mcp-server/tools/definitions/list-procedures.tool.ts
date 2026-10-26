@@ -30,7 +30,7 @@ const procedureSchema = z
 export const listProceduresTool = tool('euparl_list_procedures', {
   title: 'List parliamentary procedures',
   description:
-    'List procedure references by procedure type. Titles, stages, and participants require euparl_get_procedure with a returned procedure_id. Use euparl_list_reference topic procedure_types for supported process_type codes. No keyword, year, committee, or stage filter is available; continue with page.next_offset.',
+    'List procedure references by procedure type. Titles, stages, and participants require euparl_get_procedure with a returned procedure_id. Use euparl_list_reference topic procedure_types for supported process_type codes. No keyword, year, committee, or stage filter is available. Search exposes at most 10000 results; continue with page.next_offset when present, otherwise narrow process_type.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -52,7 +52,7 @@ export const listProceduresTool = tool('euparl_list_procedures', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A nonblank procedure type or language is unsupported.',
+      when: 'A nonblank procedure type or language is unsupported, or offset plus effective limit exceeds the 10000-result search window.',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
       thrownBy: 'service',
@@ -76,7 +76,6 @@ export const listProceduresTool = tool('euparl_list_procedures', {
   ],
   async handler(input, ctx) {
     const result = await getEuParliamentService().listProcedures(serviceInput(input), ctx);
-    ctx.enrich({ appliedFilters: result.enrichment.appliedFilters });
     applyEnrichment(ctx.enrich, result.enrichment, result.data.page);
     return result.data;
   },

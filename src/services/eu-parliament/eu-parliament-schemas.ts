@@ -5,11 +5,11 @@
 import { z } from 'zod';
 
 /** Published language maps are source text, never translated. */
-export const localizedSchema = z.record(z.string(), z.string());
+const localizedSchema = z.record(z.string(), z.string());
 const referenceSchema = z.union([z.string(), z.object({ id: z.string() })]);
 const referencesSchema = z.union([referenceSchema, z.array(referenceSchema)]).optional();
 /** Participation may be a singleton object on speech records. */
-export const participationSchema = z.object({
+const participationSchema = z.object({
   id: z.string(),
   had_participant_person: referencesSchema,
   had_participant_organization: referencesSchema,
@@ -24,7 +24,7 @@ const participationsSchema = z
   .union([participationSchema, z.array(participationSchema)])
   .optional();
 /** Source files are linked rather than fetched. */
-export const manifestationSchema = z.object({
+const manifestationSchema = z.object({
   id: z.string(),
   is_exemplified_by: referencesSchema,
   media_type: z.string().optional(),
@@ -32,7 +32,7 @@ export const manifestationSchema = z.object({
   byteSize: z.string().optional(),
 });
 /** Every manifestation in the selected published language is preserved. */
-export const expressionSchema = z.object({
+const expressionSchema = z.object({
   id: z.string(),
   language: z.string().optional(),
   title: localizedSchema.optional(),
@@ -51,6 +51,9 @@ const documentFields = {
   is_realized_by: z.array(expressionSchema).optional(),
   refers_to: referencesSchema,
   is_about: referencesSchema,
+  adopts: referencesSchema,
+  based_on: referencesSchema,
+  notation_publicRegister: z.string().optional(),
 };
 /** Generic works include sparse speech subdivisions and embedded answers. */
 export const documentSchema = z.object(documentFields);
@@ -60,7 +63,7 @@ export const questionSchema = z.object({
   inverse_answers_to: z.array(z.union([z.string(), documentSchema])).optional(),
 });
 /** Event relationships vary by activity type. */
-export const eventSchema = z.object({
+const eventSchema = z.object({
   id: z.string(),
   activity_id: z.string().optional(),
   activity_date: z.string().optional(),
@@ -86,7 +89,7 @@ export const procedureSchema = z.object({
   created_a_realization_of: referencesSchema,
 });
 /** Memberships deliberately omit contact details. */
-export const membershipSchema = z.object({
+const membershipSchema = z.object({
   id: z.string(),
   organization: z.string().optional(),
   membershipClassification: z.string().optional(),
@@ -153,6 +156,10 @@ export const bodySchema = z.object({
   identifier: z.string().optional(),
   label: z.union([z.string(), localizedSchema]).optional(),
   classification: z.string().optional(),
+  prefLabel: localizedSchema.optional(),
+  temporal: z
+    .object({ startDate: z.string().optional(), endDate: z.string().optional() })
+    .optional(),
 });
 
 /** Parsed upstream record types. */
@@ -163,3 +170,4 @@ export type RawMep = z.infer<typeof mepSchema>;
 export type RawSpeech = z.infer<typeof speechSchema>;
 export type RawDecision = z.infer<typeof decisionSchema>;
 export type RawParticipation = z.infer<typeof participationSchema>;
+export type RawBody = z.infer<typeof bodySchema>;

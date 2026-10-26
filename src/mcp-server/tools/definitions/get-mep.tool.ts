@@ -76,7 +76,12 @@ export const getMepTool = tool('euparl_get_mep', {
           z
             .object({
               id: z.string().describe('Published membership identity.'),
-              organization_id: z.string().optional().describe('Published organization identity.'),
+              organization_id: z
+                .string()
+                .optional()
+                .describe(
+                  'Published organization identity; resolve supported decimal organization IDs with euparl_list_reference topic organizations and organization_ids.',
+                ),
               classification: z
                 .string()
                 .optional()
@@ -151,7 +156,6 @@ export const getMepTool = tool('euparl_get_mep', {
   ],
   async handler(input, ctx) {
     const result = await getEuParliamentService().getMep(serviceInput(input), ctx);
-    ctx.enrich({ appliedFilters: result.enrichment.appliedFilters });
     applyEnrichment(
       ctx.enrich,
       result.enrichment,
@@ -159,32 +163,7 @@ export const getMepTool = tool('euparl_get_mep', {
     );
     return result.data;
   },
-  format: ({
-    found,
-    mep_id,
-    source_url,
-    name,
-    given_name,
-    family_name,
-    citizenship,
-    place_of_birth,
-    section,
-    membership_count,
-    memberships,
-    page,
-  }) =>
-    formatResult({
-      found,
-      mep_id,
-      source_url,
-      section,
-      ...(name !== undefined && { name }),
-      ...(given_name !== undefined && { given_name }),
-      ...(family_name !== undefined && { family_name }),
-      ...(citizenship !== undefined && { citizenship }),
-      ...(place_of_birth !== undefined && { place_of_birth }),
-      ...(membership_count !== undefined && { membership_count }),
-      ...(memberships !== undefined && { memberships }),
-      ...(page !== undefined && { page }),
-    }),
+  // Renders section beside the identity keys, ahead of the optional name fields.
+  format: ({ found, mep_id, source_url, section, ...rest }) =>
+    formatResult(serviceInput({ found, mep_id, source_url, section, ...rest })),
 });

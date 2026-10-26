@@ -4,6 +4,7 @@ import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { getMepTool } from '../../src/mcp-server/tools/definitions/get-mep.tool.js';
+import { listReferenceTool } from '../../src/mcp-server/tools/definitions/list-reference.tool.js';
 import {
   contractText,
   expectErrorTwin,
@@ -40,6 +41,36 @@ const snapshotOf = (data: Record<string, unknown>) =>
   z.object({ snapshot: z.string() }).parse(data.page).snapshot;
 
 describe('euparl_get_mep contract', () => {
+  it('keeps membership reads cheap and resolves a supported organization in a separate reference call', async () => {
+    const fetcher = installToolHttp((url) =>
+      url.pathname.includes('/meps/')
+        ? envelopeResponse([
+            { id: 'person/1', hasMembership: [{ id: 'membership/1', organization: 'org/5144' }] },
+          ])
+        : envelopeResponse([
+            { id: 'org/5144', label: 'DLAT', prefLabel: { en: 'Delegation example' } },
+          ]),
+    );
+    const member = expectSuccessTwin(
+      await runToolContract(getMepTool, { mep_id: '1', section: 'memberships' }),
+    );
+    expect(member.memberships).toEqual([{ id: 'membership/1', organization_id: 'org/5144' }]);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const organization = expectSuccessTwin(
+      await runToolContract(listReferenceTool, {
+        topic: 'organizations',
+        organization_ids: ['org/5144'],
+      }),
+    );
+    expect(organization.items).toMatchObject([
+      {
+        found: true,
+        organization_id: '5144',
+        name: { value: 'Delegation example', language: 'en' },
+      },
+    ]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
   it.each(['900000001', 'person/900000001', 'https://data.europarl.europa.eu/person/900000001'])(
     'reads canonical identity for %s',
     async (mep_id) => {

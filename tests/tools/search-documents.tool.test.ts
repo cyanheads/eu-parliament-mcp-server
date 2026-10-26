@@ -1,8 +1,10 @@
 /** @fileoverview Document discovery and nested source-file wire contracts. */
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it } from 'vitest';
 import { searchDocumentsTool } from '../../src/mcp-server/tools/definitions/search-documents.tool.js';
 import {
+  contractText,
   expectErrorTwin,
   expectSuccessTwin,
   installToolHttp,
@@ -15,6 +17,96 @@ const modeHint =
   'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.';
 
 describe('euparl_search_documents contract', () => {
+  it('follows published adoption identities and preserves unavailable based-on targets as errors', async () => {
+    const responses = new Map([
+      [
+        'TA-9-2024-0138',
+        {
+          id: 'eli/dl/doc/TA-9-2024-0138',
+          adopts: { id: 'https://data.europarl.europa.eu/eli/dl/doc/A-9-2023-0188' },
+          notation_publicRegister: 'P9_TA(2024)0138',
+        },
+      ],
+      [
+        'A-9-2023-0188',
+        {
+          id: 'eli/dl/doc/A-9-2023-0188',
+          adopts: ['CJ40-PR-731563'],
+          based_on: { id: 'eli/dl/doc/RULES-9-2023-05-08-ITM-A58' },
+          notation_publicRegister: 'P9_A(2023)0188',
+        },
+      ],
+      ['CJ40-PR-731563', { id: 'eli/dl/doc/CJ40-PR-731563' }],
+    ]);
+    const fetcher = installToolHttp((url) => {
+      const id = url.pathname.split('/').at(-1)!;
+      if (id === 'RULES-9-2023-05-08-ITM-A58') return new Response(null, { status: 500 });
+      const raw = responses.get(id);
+      return raw ? envelopeResponse([raw]) : new Response(null, { status: 404 });
+    });
+    for (const [id, adopted, basedOn, register] of [
+      ['TA-9-2024-0138', ['A-9-2023-0188'], [], 'P9_TA(2024)0138'],
+      ['A-9-2023-0188', ['CJ40-PR-731563'], ['RULES-9-2023-05-08-ITM-A58'], 'P9_A(2023)0188'],
+      ['CJ40-PR-731563', [], [], undefined],
+    ] as const) {
+      const data = expectSuccessTwin(
+        await runToolContract(searchDocumentsTool, { mode: 'get', document_id: id }),
+      );
+      expect(data).toMatchObject({
+        found: true,
+        document: {
+          document_id: id,
+          adopted_document_ids: adopted,
+          based_on_document_ids: basedOn,
+          procedure_ids: [],
+        },
+      });
+      if (register) expect(data.document).toHaveProperty('public_register_ref', register);
+      else expect(data.document).not.toHaveProperty('public_register_ref');
+    }
+    const failure = await runToolContract(searchDocumentsTool, {
+      mode: 'get',
+      document_id: 'RULES-9-2023-05-08-ITM-A58',
+    });
+    expect(failure).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: JsonRpcErrorCode.ServiceUnavailable } },
+    });
+    expect(contractText(failure)).toContain('Parliament could not serve the request. Retry later.');
+    expect(
+      expectSuccessTwin(
+        await runToolContract(searchDocumentsTool, { mode: 'get', document_id: 'MISSING' }),
+      ),
+    ).toMatchObject({ found: false });
+    expect(fetcher).toHaveBeenCalledTimes(7);
+  });
+  it('limits adopted-text search windows while retaining deep plenary search', async () => {
+    const fetcher = installToolHttp(
+      () =>
+        new Response(JSON.stringify({ data: [{ id: 'eli/dl/doc/LAST' }], meta: { total: 10000 } })),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(searchDocumentsTool, {
+        source: 'adopted_texts',
+        offset: 9999,
+        limit: 1,
+      }),
+    );
+    expect(data).toMatchObject({ truncated: true, page: { has_more: true } });
+    expect(data).not.toHaveProperty('totalCount');
+    expect(data.page).not.toHaveProperty('next_offset');
+    expectErrorTwin(
+      await runToolContract(searchDocumentsTool, { offset: 9990, limit: 20 }),
+      'invalid_filter',
+      invalidHint,
+    );
+    expect(
+      expectSuccessTwin(
+        await runToolContract(searchDocumentsTool, { source: 'plenary', offset: 9990, limit: 20 }),
+      ),
+    ).toMatchObject({ items: [{ document_id: 'LAST' }], totalCount: 10000 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
   it.each([
     ['adopted_texts', 'adopted-texts', 'text_adopted', { year: 2025, term: 10 }],
     ['committee', 'committee-documents', 'opinion_parliamentary_committee', { term: 10 }],

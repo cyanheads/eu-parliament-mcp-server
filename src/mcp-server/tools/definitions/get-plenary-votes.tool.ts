@@ -30,6 +30,17 @@ const positionSchema = z
   );
 const decisionFields = {
   decision_id: z.string().describe('Canonical decision activity identifier.'),
+  label: localizedTextSchema
+    .optional()
+    .describe('Whole published decision label in its actual selected language.'),
+  document_ids: z
+    .array(z.string().describe('Canonical document identifier accepted by document get.'))
+    .describe('Explicit documents decided on, in published order; absent relations are empty.'),
+  recording_document_ids: z
+    .array(z.string().describe('Canonical recording document identifier accepted by document get.'))
+    .describe(
+      'Explicit documents recording this decision, in published order; absent relations are empty.',
+    ),
   date: z.string().optional().describe('Published decision date.'),
   start_time: z.string().optional().describe('Published activity start timestamp.'),
   order: z.string().optional().describe('Published decision order, preserved as a string.'),
@@ -82,38 +93,53 @@ const decisionSummarySchema = z
   .object(decisionFields)
   .strict()
   .describe(
-    'Compact decision identity, method, outcome, published tallies and voter-array counts; use mode decision for rich text and document references.',
+    'Compact decision identity, label, separate document relations, published tallies and voter-array counts; use mode decision for reference text and comment.',
   );
+const memberPositionSchema = z
+  .object({
+    positions: z
+      .array(
+        z
+          .enum(['favor', 'against', 'abstention'])
+          .describe('Published position containing this member.'),
+      )
+      .describe(
+        'All matching published positions, preserving conflicts; empty does not prove absence from the vote.',
+      ),
+    unavailable_positions: z
+      .array(
+        z
+          .enum(['favor', 'against', 'abstention'])
+          .describe('Position whose voter array was omitted.'),
+      )
+      .describe('Unpublished positions; published empty arrays remain available.'),
+    availability: z
+      .enum(['published', 'partial', 'unavailable'])
+      .describe(
+        'Published when all three arrays exist, unavailable when none exist, otherwise partial.',
+      ),
+  })
+  .strict()
+  .describe('Membership in one independent recorded or intended set of voter arrays.');
 const decisionSchema = z
   .object({
     ...decisionFields,
-    label: localizedTextSchema
+    mep_position: z
+      .object({
+        recorded: memberPositionSchema,
+        intended: memberPositionSchema,
+      })
+      .strict()
       .optional()
-      .describe('Whole published decision label in its actual selected language.'),
+      .describe(
+        'Requested member lookup from the complete decision; intended corrections never replace recorded positions.',
+      ),
     reference_text: localizedTextSchema
       .optional()
       .describe('Whole published reference text in its actual selected language.'),
     comment: localizedTextSchema
       .optional()
       .describe('Whole published commentary in its actual selected language.'),
-    document_ids: z
-      .array(
-        z
-          .string()
-          .describe('Canonical related document identifier for euparl_search_documents mode get.'),
-      )
-      .describe('Explicit documents decided on; absent relations normalize to an empty array.'),
-    recording_document_ids: z
-      .array(
-        z
-          .string()
-          .describe(
-            'Canonical recording document identifier for euparl_search_documents mode get.',
-          ),
-      )
-      .describe(
-        'Explicit documents recording this decision; absent relations normalize to an empty array.',
-      ),
   })
   .strict()
   .describe('One rich decision with complete selected text and explicit document relationships.');
@@ -122,7 +148,7 @@ const decisionSchema = z
 export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
   title: 'Explore plenary sittings, decisions, and voters',
   description:
-    'Discover sittings with mode sittings and year; default decisions pages compact summaries for sitting_id. Mode decision requires decision_id and returns one rich record with whole labels, reference text, commentary, and document references; it rejects nondefault paging and snapshot. Mode voters requires decision_id and one position, paging recorded and intended voters independently. Missing arrays succeed with available false; published empty arrays have available true. Optional resolve_names requires explicit roster_term and joins only published names from that complete term roster, never voting-date affiliations or current-roster substitutes. Some IDs may remain unresolved. Continue local decisions or voters with page.next_offset and snapshot; restart at offset 0 without snapshot after snapshot_changed. Missing sitting decisions succeed empty; absent selected decision fails decision_not_found.',
+    'Discover sittings with mode sittings and year; default decisions pages compact summaries with labels and separate decided-on and recording document relations for sitting_id. Optional document_id filters decisions before paging by exact document identity or hyphen-boundary descendant. Mode decision requires decision_id and returns one rich record with reference text and commentary; it rejects nondefault paging and snapshot. Optional decision-only mep_id returns independent recorded and intended positions with publication availability, without a roster lookup; empty positions do not prove absence from the vote. Mode voters requires decision_id and one position, paging recorded and intended voters independently. Missing arrays succeed with available false; published empty arrays have available true. Optional resolve_names requires explicit roster_term and joins only published names from that complete term roster, never voting-date affiliations or current-roster substitutes. Some IDs may remain unresolved. Continue local decisions or voters with page.next_offset and snapshot; restart at offset 0 without snapshot after snapshot_changed. Missing sitting decisions succeed empty; absent selected decision fails decision_not_found.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -138,6 +164,12 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
         .max(9999)
         .optional()
         .describe('Four-digit year, required only for sittings and forbidden in other modes.'),
+      document_id: optionalString().describe(
+        'Decisions-only document filter: canonical ID, eli/dl/doc/ prefix or exact public URI. Matches decided-on or recording relations by exact ID or hyphen-boundary descendant before paging.',
+      ),
+      mep_id: optionalString().describe(
+        'Decision-only member lookup: canonical numeric ID, person/ prefix or exact public person URI. Uses published arrays without a roster join; empty positions do not prove absence from the vote.',
+      ),
       sitting_id: optionalString(
         z
           .string()
@@ -221,7 +253,7 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
         .array(decisionSummarySchema)
         .optional()
         .describe(
-          'Compact whole-decision page; rich text and document references require mode decision.',
+          'Compact whole-decision page with selected-language labels and separate decided-on and recording document relations.',
         ),
       decision: decisionSchema
         .optional()
@@ -353,39 +385,12 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
   ],
   async handler(input, ctx) {
     const result = await getEuParliamentService().getPlenaryVotes(serviceInput(input), ctx);
-    ctx.enrich({
-      appliedFilters: result.enrichment.appliedFilters,
-      ...(result.enrichment.available !== undefined && { available: result.enrichment.available }),
-    });
     applyEnrichment(
       ctx.enrich,
       result.enrichment,
-      'page' in result.data ? pageSchema.parse(result.data.page) : undefined,
+      'page' in result.data ? result.data.page : undefined,
     );
     return result.data;
   },
-  format: ({
-    mode,
-    sitting_id,
-    decision_id,
-    position,
-    sittings,
-    decisions,
-    decision,
-    voters,
-    page,
-    voter_resolution,
-  }) =>
-    formatResult({
-      mode,
-      ...(sitting_id !== undefined && { sitting_id }),
-      ...(decision_id !== undefined && { decision_id }),
-      ...(position !== undefined && { position }),
-      ...(sittings !== undefined && { sittings }),
-      ...(decisions !== undefined && { decisions }),
-      ...(decision !== undefined && { decision }),
-      ...(voters !== undefined && { voters }),
-      ...(page !== undefined && { page }),
-      ...(voter_resolution !== undefined && { voter_resolution }),
-    }),
+  format: (result) => formatResult(serviceInput(result)),
 });

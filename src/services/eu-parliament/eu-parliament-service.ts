@@ -16,6 +16,7 @@ import {
   type Operation,
 } from './eu-parliament-client.js';
 import {
+  activityId,
   canonicalId,
   decisionVoters,
   field,
@@ -31,11 +32,17 @@ import {
   normalizeQuestion,
   normalizeSpeech,
   type Paging,
+  pageWindow,
   sourceUrl,
   upstreamPage,
   type VoterPosition,
 } from './eu-parliament-normalization.js';
-import { normalizeCode, type ReferenceTopic, referenceEntries } from './eu-parliament-reference.js';
+import {
+  normalizeCode,
+  type ReferenceEntry,
+  type ReferenceTopic,
+  referenceEntries,
+} from './eu-parliament-reference.js';
 import {
   bodySchema,
   decisionSchema,
@@ -43,7 +50,9 @@ import {
   mepSchema,
   procedureSchema,
   questionSchema,
+  type RawBody,
   type RawMep,
+  type RawQuestion,
   sittingSchema,
   speechSchema,
 } from './eu-parliament-schemas.js';
@@ -64,6 +73,7 @@ export interface ServiceResult<T> {
 }
 /** Reference input. */
 export interface ReferenceInput extends Paging {
+  organization_ids?: string[];
   topic: ReferenceTopic;
 }
 /** Procedure catalogue input. */
@@ -97,6 +107,7 @@ export interface SpeechesInput extends Paging {
   sitting_date?: string;
   sitting_date_end?: string;
   speech_id?: string;
+  term?: 9 | 10;
   text?: string;
   title?: string;
 }
@@ -116,6 +127,8 @@ export interface MepInput extends Paging {
 /** Sitting discovery, compact decisions, rich decision or one voter position. */
 export interface VotesInput extends Paging {
   decision_id?: string;
+  document_id?: string;
+  mep_id?: string;
   mode?: 'sittings' | 'decisions' | 'decision' | 'voters';
   position?: VoterPosition;
   resolve_names?: boolean;
@@ -123,7 +136,7 @@ export interface VotesInput extends Paging {
   sitting_id?: string;
   year?: number;
 }
-/** Questions can resolve an exact citation across all terms represented in a year. */
+/** Questions resolve exact citations across every term overlapping the citation year. */
 export interface QuestionsInput extends Paging {
   mode?: 'list' | 'get';
   question_id?: string;
@@ -143,10 +156,9 @@ function meaningful(value: unknown): boolean {
     value !== undefined && value !== false && !(typeof value === 'string' && value.trim() === '')
   );
 }
-function forbid(input: object, keys: string[]): void {
+function forbid<T extends Paging>(input: T, keys: (keyof T & string)[]): void {
   for (const key of keys)
-    if (Object.hasOwn(input, key) && meaningful(Reflect.get(input, key)))
-      invalidMode(`${key} is not supported in this mode.`);
+    if (meaningful(input[key])) invalidMode(`${key} is not supported in this mode.`);
 }
 function required(value: string | undefined, key: string): string {
   if (!value?.trim()) invalidMode(`${key} is required in this mode.`);
@@ -159,14 +171,6 @@ function detailPaging(input: Paging): void {
 function localPaging(input: Paging): void {
   if ((input.offset ?? 0) > 0 && !input.snapshot)
     invalidMode('Local continuation requires the previous page snapshot.');
-}
-function term(value: number | undefined): void {
-  if (value !== undefined && (!Number.isInteger(value) || value < 0 || value > 10))
-    invalidFilter('term must be an integer from 0 through 10.');
-}
-function year(value: number | undefined): void {
-  if (value !== undefined && (!Number.isInteger(value) || value < 1000 || value > 9999))
-    invalidFilter('year must be a four-digit integer.');
 }
 function date(value: string): string {
   if (
@@ -185,12 +189,9 @@ function dates(input: { sitting_date?: string; sitting_date_end?: string }): voi
       invalidFilter('sitting_date_end requires an ordered sitting_date range.');
   }
 }
-function queryPage(input: Paging) {
-  return { offset: input.offset ?? 0, limit: Math.min(input.limit ?? 20, 100) };
-}
 function scopePage(input: Paging) {
   const language = normalizeCode(input.language, 'language') ?? 'en';
-  return { ...queryPage(input), language, ...field('snapshot', input.snapshot) };
+  return { ...pageWindow(input), language, ...field('snapshot', input.snapshot) };
 }
 function result<T>(
   data: T,
@@ -214,6 +215,37 @@ function noticesFor(input: Paging): string[] {
     ? ['Requested limit normalized to the effective maximum of 100.']
     : [];
 }
+const searchResultWindow = 10_000;
+function searchWindow(input: Paging, narrowing: string): void {
+  const { offset, limit } = pageWindow(input);
+  if (offset + limit > searchResultWindow)
+    invalidFilter(
+      `This search exposes at most 10000 results; offset plus effective limit must not exceed 10000. ${narrowing}`,
+    );
+}
+function searchPage(
+  returned: number,
+  input: Paging,
+  total: number | undefined,
+  notices: string[],
+  narrowing: string,
+) {
+  const page = upstreamPage(returned, input, total, searchResultWindow);
+  if (total !== undefined && total >= searchResultWindow)
+    notices.push(
+      'The upstream total is capped: at least 10000 results match; the exact total is unknown.',
+    );
+  if (page.has_more && page.next_offset === undefined)
+    notices.push(
+      `The 10000-result search window is exhausted; further matches cannot be ruled out. ${narrowing}`,
+    );
+  return { page, total: total !== undefined && total < searchResultWindow ? total : undefined };
+}
+const documentEndpoints = {
+  adopted_texts: 'adopted-texts',
+  committee: 'committee-documents',
+  plenary: 'plenary-documents',
+} as const;
 function stalled(): never {
   throw serviceUnavailable(
     'Parliament pagination did not establish a complete collection. Retry later.',
@@ -232,27 +264,81 @@ export class EuParliamentService {
   async listReference(input: ReferenceInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
     const paging = scopePage(input);
-    const notices = noticesFor(input);
+    const notices = input.topic === 'organizations' ? [] : noticesFor(input);
+    const normalizeBody = (raw: RawBody) => ({
+      code: raw.identifier ?? raw.id,
+      id: raw.id,
+      ...field('classification', raw.classification),
+      ...field(
+        'label',
+        typeof raw.label === 'string'
+          ? { value: raw.label, language: 'mul' }
+          : localized(raw.label, paging.language, notices),
+      ),
+      ...field('name', localized(raw.prefLabel, paging.language, notices)),
+      ...field('start_date', raw.temporal?.startDate),
+      ...field('end_date', raw.temporal?.endDate),
+    });
+    if (input.topic === 'organizations') {
+      if (!input.organization_ids?.length)
+        invalidMode('organizations requires nonempty organization_ids.');
+      const ids = input.organization_ids.map((id) => canonicalId(id, 'organization'));
+      const selectedPaging = { ...paging, limit: Math.min(paging.limit, 20) };
+      if ((input.limit ?? 20) > 20)
+        notices.push(
+          'Requested limit normalized to the effective maximum of 20 organization lookups.',
+        );
+      const items: ReferenceEntry[] = [];
+      for (const organization_id of ids.slice(
+        paging.offset,
+        paging.offset + selectedPaging.limit,
+      )) {
+        const response = await this.client.get(
+          `corporate-bodies/${organization_id}`,
+          {},
+          bodySchema,
+          operation,
+        );
+        const identity = { organization_id, source_url: sourceUrl(`org/${organization_id}`) };
+        if (response.status === 'empty' || response.status === 'missing') {
+          items.push({ code: organization_id, found: false, ...identity });
+          continue;
+        }
+        const raw = response.data[0];
+        if (
+          response.data.length !== 1 ||
+          !raw ||
+          (raw.id !== `org/${organization_id}` && raw.id !== sourceUrl(`org/${organization_id}`))
+        )
+          throw serializationError(
+            'Parliament returned an unexpected organization detail identity or record count.',
+            { retryable: false },
+          );
+        items.push({ ...normalizeBody(raw), found: true, ...identity });
+      }
+      if (!items.length)
+        notices.push(
+          'No organization IDs remain at this offset. Restart at offset 0 or supply another organization_ids list.',
+        );
+      return result(
+        { topic: input.topic, items, page: upstreamPage(items.length, selectedPaging, ids.length) },
+        { topic: input.topic, language: paging.language, organization_ids: ids },
+        notices,
+        ids.length,
+      );
+    }
+    if (input.organization_ids !== undefined)
+      invalidMode('organization_ids is supported only with topic organizations.');
     if (input.topic === 'committees' || input.topic === 'political_groups') {
       const classification =
         input.topic === 'committees' ? 'COMMITTEE_PARLIAMENTARY_STANDING' : 'EU_POLITICAL_GROUP';
       const response = await this.client.get(
         'corporate-bodies',
-        { ...queryPage(paging), 'body-classification': classification },
+        { ...pageWindow(paging), 'body-classification': classification },
         bodySchema,
         operation,
       );
-      const items = response.data.map((raw) => ({
-        code: raw.identifier ?? raw.id,
-        id: raw.id,
-        ...field('classification', raw.classification),
-        ...field(
-          'label',
-          typeof raw.label === 'string'
-            ? { value: raw.label, language: 'mul' }
-            : localized(raw.label, paging.language, notices),
-        ),
-      }));
+      const items = response.data.map(normalizeBody);
       if (!items.length)
         notices.push(
           'No reference entries matched. Call euparl_list_reference with topic identifiers to inspect accepted identifiers.',
@@ -266,19 +352,8 @@ export class EuParliamentService {
     }
     const all = referenceEntries(input.topic);
     const items = all.slice(paging.offset, paging.offset + paging.limit);
-    const has_more = paging.offset + items.length < all.length;
     return result(
-      {
-        topic: input.topic,
-        items,
-        page: {
-          offset: paging.offset,
-          limit: paging.limit,
-          returned: items.length,
-          has_more,
-          ...(has_more && { next_offset: paging.offset + items.length }),
-        },
-      },
+      { topic: input.topic, items, page: upstreamPage(items.length, paging, all.length) },
       { topic: input.topic, language: paging.language },
       notices,
       all.length,
@@ -291,9 +366,11 @@ export class EuParliamentService {
     const paging = scopePage(input);
     const process_type = normalizeCode(input.process_type, 'process_type');
     const notices = noticesFor(input);
+    const narrowing = 'Narrow process_type to retrieve a smaller procedure set.';
+    searchWindow(paging, narrowing);
     const response = await this.client.get(
       'procedures',
-      { ...queryPage(paging), 'process-type': process_type },
+      { ...pageWindow(paging), 'process-type': process_type },
       procedureSchema,
       operation,
     );
@@ -307,11 +384,12 @@ export class EuParliamentService {
       notices.push(
         'No procedures matched. Remove process_type or call euparl_list_reference with topic procedure_types.',
       );
+    const paged = searchPage(items.length, paging, response.total, notices, narrowing);
     return result(
-      { items, page: upstreamPage(items.length, paging, response.total) },
+      { items, page: paged.page },
       { ...field('process_type', process_type) },
       notices,
-      response.total,
+      paged.total,
     );
   }
 
@@ -332,6 +410,7 @@ export class EuParliamentService {
       operation,
     );
     const raw = response.data[0];
+    const filters = { procedure_id, section, language: paging.language };
     if (!raw) {
       notices.push(
         'No procedure detail was published. Call euparl_list_procedures to discover references.',
@@ -343,16 +422,18 @@ export class EuParliamentService {
           source_url: sourceUrl(`eli/dl/proc/${procedure_id}`),
           section,
         },
-        { procedure_id, section, language: paging.language },
+        filters,
         notices,
       );
     }
     const requestedType = /\(([A-Z]+)\)$/.exec(input.procedure_id)?.[1];
     if (requestedType && raw.process_type?.split('/').at(-1) !== requestedType)
       invalidFilter('Procedure citation type conflicts with the published procedure type.');
-    const normalized = normalizeProcedure(raw, paging.language, notices);
-    const { events, participants, documents, ...overview } = normalized;
-    const filters = { procedure_id, section, language: paging.language };
+    const { events, participants, documents, ...overview } = normalizeProcedure(
+      raw,
+      paging.language,
+      notices,
+    );
     if (section === 'overview')
       return result(
         {
@@ -438,8 +519,9 @@ export class EuParliamentService {
     }
     forbid(input, ['document_id', 'snapshot']);
     const source = input.source ?? 'adopted_texts';
-    year(input.year);
-    term(input.term);
+    const narrowing =
+      'Narrow text, title, year, term, work_type, sitting dates or related_process_id.';
+    if (source === 'adopted_texts') searchWindow(paging, narrowing);
     dates(input);
     if (
       source !== 'adopted_texts' &&
@@ -475,7 +557,7 @@ export class EuParliamentService {
       ...field('related_process_id', related_process_id),
     };
     const query = {
-      ...queryPage(paging),
+      ...pageWindow(paging),
       'work-type': work_type,
       ...(source !== 'committee' && { year: input.year }),
       ...(source !== 'plenary' && { 'parliamentary-term': input.term }),
@@ -489,24 +571,22 @@ export class EuParliamentService {
         view: 'list',
       }),
     };
-    const endpoint =
-      source === 'adopted_texts'
-        ? 'adopted-texts'
-        : source === 'committee'
-          ? 'committee-documents'
-          : 'plenary-documents';
-    const response = await this.client.get(endpoint, query, documentSchema, operation);
+    const response = await this.client.get(
+      documentEndpoints[source],
+      query,
+      documentSchema,
+      operation,
+    );
     const items = response.data.map(normalizeDocumentSummary);
     if (!items.length)
       notices.push(
         'No documents matched. Remove a named filter, or call euparl_list_reference with topic document_types; keyword search is available only for adopted_texts.',
       );
-    return result(
-      { mode, source, items, page: upstreamPage(items.length, paging, response.total) },
-      filters,
-      notices,
-      response.total,
-    );
+    const paged =
+      source === 'adopted_texts'
+        ? searchPage(items.length, paging, response.total, notices, narrowing)
+        : { page: upstreamPage(items.length, paging, response.total), total: response.total };
+    return result({ mode, source, items, page: paged.page }, filters, notices, paged.total);
   }
 
   /** Speech results preserve metadata rather than manufacturing transcripts. */
@@ -521,6 +601,7 @@ export class EuParliamentService {
         'title',
         'person_id',
         'activity_type',
+        'term',
         'sitting_date',
         'sitting_date_end',
       ]);
@@ -541,19 +622,22 @@ export class EuParliamentService {
       );
     }
     forbid(input, ['speech_id', 'snapshot']);
+    const term = input.term ?? 10;
+    const narrowing = 'Narrow text, title, person_id, activity_type or sitting dates.';
+    searchWindow(paging, narrowing);
     dates(input);
     const activity_type = normalizeCode(input.activity_type, 'activity_type');
     const person_id = input.person_id ? canonicalId(input.person_id, 'person') : undefined;
     const response = await this.client.get(
       'speeches',
       {
-        ...queryPage(paging),
+        ...pageWindow(paging),
         text: input.text,
         title: input.title,
         'person-id': person_id,
         'activity-type': activity_type,
         'search-language': paging.language,
-        'parliamentary-term': 10,
+        'parliamentary-term': term,
         'sitting-date': input.sitting_date,
         'sitting-date-end': input.sitting_date_end,
       },
@@ -563,14 +647,15 @@ export class EuParliamentService {
     const items = response.data.map((raw) => normalizeSpeech(raw, paging.language, notices));
     if (!items.length)
       notices.push(
-        'No speech records matched. Broaden sitting_date or remove person_id; call euparl_list_reference with topic activity_types. Speech coverage is limited to the tenth term.',
+        'No speech records matched. Broaden sitting_date or remove person_id; call euparl_list_reference with topic activity_types. Speech search supports terms 9 and 10.',
       );
+    const paged = searchPage(items.length, paging, response.total, notices, narrowing);
     return result(
-      { mode, items, page: upstreamPage(items.length, paging, response.total) },
+      { mode, items, page: paged.page },
       {
         mode,
         language: paging.language,
-        term: 10,
+        term,
         ...field('text', input.text),
         ...field('title', input.title),
         ...field('person_id', person_id),
@@ -579,7 +664,7 @@ export class EuParliamentService {
         ...field('sitting_date_end', input.sitting_date_end),
       },
       notices,
-      response.total,
+      paged.total,
     );
   }
 
@@ -625,7 +710,6 @@ export class EuParliamentService {
       }
       offset += response.data.length;
       if (response.next === undefined && total === undefined && response.data.length < 50) break;
-      if (response.next === undefined && total !== undefined && all.length >= total) break;
     }
     return all;
   }
@@ -635,7 +719,6 @@ export class EuParliamentService {
     const operation = this.client.operation(ctx.signal);
     const paging = scopePage(input);
     const notices = noticesFor(input);
-    term(input.term);
     localPaging(input);
     const country = normalizeCode(input.country, 'country');
     const political_group = normalizeCode(input.political_group, 'political_group');
@@ -746,28 +829,25 @@ export class EuParliamentService {
     const paging = scopePage(input);
     const notices = noticesFor(input);
     const mode = input.mode ?? 'decisions';
-    year(input.year);
-    term(input.roster_term);
+    if (mode !== 'decisions') forbid(input, ['document_id']);
+    if (mode !== 'decision') forbid(input, ['mep_id']);
+    const document_id = input.document_id?.trim()
+      ? canonicalId(input.document_id, 'document')
+      : undefined;
+    const mep_id = input.mep_id?.trim() ? canonicalId(input.mep_id, 'person') : undefined;
     if (mode !== 'voters' && (input.resolve_names || input.roster_term !== undefined))
       invalidMode('Name resolution fields are supported only in voters mode.');
     if (mode === 'sittings') {
-      forbid(input, [
-        'sitting_id',
-        'decision_id',
-        'position',
-        'resolve_names',
-        'roster_term',
-        'snapshot',
-      ]);
+      forbid(input, ['sitting_id', 'decision_id', 'position', 'snapshot']);
       if (input.year === undefined) invalidMode('year is required for sittings mode.');
       const response = await this.client.get(
         'meetings',
-        { ...queryPage(paging), year: input.year },
+        { ...pageWindow(paging), year: input.year },
         sittingSchema,
         operation,
       );
       const sittings = response.data.map((raw) => ({
-        sitting_id: raw.activity_id ?? canonicalId(raw.id, 'activity'),
+        sitting_id: activityId(raw),
         ...field('date', raw.activity_date),
         ...field('label', localized(raw.activity_label, paging.language, notices)),
         source_url: sourceUrl(raw.id),
@@ -782,7 +862,7 @@ export class EuParliamentService {
     }
     forbid(input, ['year']);
     let sitting_id = canonicalId(required(input.sitting_id, 'sitting_id'), 'activity');
-    if (/^\d{4}-\d{2}-\d{2}$/.test(sitting_id)) sitting_id = `MTG-PL-${date(sitting_id)}`;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(sitting_id)) sitting_id = `MTG-PL-${sitting_id}`;
     if (!/^MTG-PL-\d{4}-\d{2}-\d{2}$/.test(sitting_id))
       invalidFilter('Use a sitting date or exact MTG-PL-YYYY-MM-DD identifier.');
     date(sitting_id.slice(7));
@@ -814,6 +894,8 @@ export class EuParliamentService {
       sitting_id,
       language: paging.language,
       ...field('decision_id', decision_id),
+      ...field('document_id', document_id),
+      ...field('mep_id', mep_id),
       ...field('position', input.position),
       ...(mode === 'voters' && {
         resolve_names: input.resolve_names ?? false,
@@ -821,10 +903,23 @@ export class EuParliamentService {
       }),
     };
     if (mode === 'decisions') {
-      const page = localPage(response.data.map(normalizeDecisionSummary), paging, filters);
+      const decisions = response.data.map((raw) =>
+        normalizeDecisionSummary(raw, paging.language, notices),
+      );
+      const selected =
+        document_id === undefined
+          ? decisions
+          : decisions.filter((decision) =>
+              [...decision.document_ids, ...decision.recording_document_ids].some(
+                (id) => id === document_id || id.startsWith(`${document_id}-`),
+              ),
+            );
+      const page = localPage(selected, paging, filters);
       if (!page.total)
         notices.push(
-          'No decision data was published for this sitting. Call euparl_get_plenary_votes with mode sittings and year to discover available sittings.',
+          document_id === undefined
+            ? 'No decision data was published for this sitting. Call euparl_get_plenary_votes with mode sittings and year to discover available sittings.'
+            : 'No decisions matched document_id in the complete sitting. Remove document_id to inspect all published decisions.',
         );
       return result(
         { mode, sitting_id, decisions: page.items, page: page.page },
@@ -833,9 +928,7 @@ export class EuParliamentService {
         page.total,
       );
     }
-    const raw = response.data.find(
-      (row) => (row.activity_id ?? canonicalId(row.id, 'activity')) === decision_id,
-    );
+    const raw = response.data.find((row) => activityId(row) === decision_id);
     if (!raw)
       throw notFound('Decision is absent from the complete sitting collection.', {
         reason: 'decision_not_found',
@@ -848,7 +941,7 @@ export class EuParliamentService {
           mode,
           sitting_id,
           decision_id,
-          decision: normalizeDecision(raw, paging.language, notices),
+          decision: normalizeDecision(raw, paging.language, notices, mep_id),
         },
         filters,
         notices,
@@ -900,25 +993,23 @@ export class EuParliamentService {
       },
       filters,
       notices,
-      page.total,
+      ids === undefined ? undefined : page.total,
       ids !== undefined,
     );
   }
 
-  /** Resolves human citations only after exhausting the published year catalogue. */
+  /** Resolve every overlapping term candidate before choosing a human citation. */
   async listQuestions(input: QuestionsInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
     const paging = scopePage(input);
     const notices = noticesFor(input);
     const mode = input.mode ?? 'list';
-    year(input.year);
-    term(input.term);
     if (mode === 'list') {
       forbid(input, ['question_id', 'term', 'snapshot']);
       const work_type = normalizeCode(input.work_type, 'question');
       const response = await this.client.get(
         'parliamentary-questions',
-        { ...queryPage(paging), year: input.year, 'work-type': work_type },
+        { ...pageWindow(paging), year: input.year, 'work-type': work_type },
         questionSchema,
         operation,
       );
@@ -947,65 +1038,41 @@ export class EuParliamentService {
     detailPaging(input);
     const citation = required(input.question_id, 'question_id').trim();
     let question_id: string | undefined;
+    let resolved: Envelope<RawQuestion> | undefined;
     const human = /^([EPO])-(\d{6})\/(\d{4})$/.exec(citation);
     if (human) {
       if (input.term !== undefined)
         question_id = `${human[1]}-${input.term}-${human[3]}-${human[2]}`;
       else {
-        let offset = 0;
-        let advertisedTotal: number | undefined;
-        const matches = new Set<string>();
-        const seenPages = new Set<string>();
-        while (true) {
+        const year = Number(human[3]);
+        // Elected terms span five years from 1979; election years overlap adjacent terms.
+        const latestTerm = 10;
+        const term = Math.min(latestTerm, Math.max(0, Math.floor((year - 1979) / 5) + 1));
+        const terms =
+          year >= 1979 && year <= 2024 && (year - 1979) % 5 === 0 ? [term - 1, term] : [term];
+        const matches: { id: string; response: Envelope<RawQuestion> }[] = [];
+        for (const candidateTerm of terms) {
           operation.signal.throwIfAborted();
+          const id = `${human[1]}-${candidateTerm}-${human[3]}-${human[2]}`;
           const response = await this.client.get(
-            'parliamentary-questions',
-            { year: human[3], offset, limit: 50 },
+            `parliamentary-questions/${id}`,
+            {},
             questionSchema,
             operation,
           );
-          if (response.total !== undefined)
-            advertisedTotal = Math.max(advertisedTotal ?? 0, response.total);
-          const ids = response.data.map((row) => canonicalId(row.identifier ?? row.id, 'document'));
-          const fingerprint = JSON.stringify(ids);
-          if (ids.length && seenPages.has(fingerprint)) stalled();
-          seenPages.add(fingerprint);
-          for (const id of ids) {
-            const match = /^([EPO])-(\d+)-(\d{4})-(\d{6})$/.exec(id);
-            if (match && match[1] === human[1] && match[3] === human[3] && match[4] === human[2])
-              matches.add(id);
-          }
-          offset += ids.length;
-          if (response.next !== undefined) {
-            const marker = String(response.next);
-            let candidate: number;
-            if (/^\d+$/.test(marker)) candidate = Number(marker);
-            else {
-              let next: URL;
-              try {
-                next = new URL(marker, 'https://data.europarl.europa.eu/');
-              } catch {
-                stalled();
-              }
-              const parameter = next.searchParams.get('offset');
-              if (parameter === null || !/^\d+$/.test(parameter)) stalled();
-              candidate = Number(parameter);
-            }
-            if (!ids.length || !Number.isSafeInteger(candidate) || candidate < offset) stalled();
-            offset = candidate;
-            continue;
-          }
-          if (!ids.length) {
-            if (advertisedTotal !== undefined && offset < advertisedTotal) stalled();
-            break;
-          }
-          if (advertisedTotal !== undefined ? offset >= advertisedTotal : ids.length < 50) break;
+          const raw = response.data[0];
+          if (raw && canonicalId(raw.identifier ?? raw.id, 'document') !== id)
+            throw serializationError(
+              'Parliament returned a different question identifier than requested.',
+            );
+          if (raw) matches.push({ id, response });
         }
-        if (matches.size > 1)
+        if (matches.length > 1)
           invalidFilter(
             'Question citation matches multiple terms. Supply term or use a returned canonical question identifier.',
           );
-        question_id = [...matches][0];
+        question_id = matches[0]?.id;
+        resolved = matches[0]?.response;
       }
     } else {
       question_id = canonicalId(citation, 'document');
@@ -1027,12 +1094,14 @@ export class EuParliamentService {
       );
       return result({ mode, found: false }, filters, notices);
     }
-    const response = await this.client.get(
-      `parliamentary-questions/${question_id}`,
-      {},
-      questionSchema,
-      operation,
-    );
+    const response =
+      resolved ??
+      (await this.client.get(
+        `parliamentary-questions/${question_id}`,
+        {},
+        questionSchema,
+        operation,
+      ));
     const raw = response.data[0];
     if (raw && canonicalId(raw.identifier ?? raw.id, 'document') !== question_id)
       throw serializationError(

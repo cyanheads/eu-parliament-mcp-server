@@ -165,6 +165,43 @@ describe('euparl_search_meps contract', () => {
     });
   });
 
+  it('routes equivalent filters while preserving historical published group identities', async () => {
+    const fetcher = installToolHttp(() =>
+      envelopeResponse([
+        {
+          id: 'person/900000003',
+          label: 'Historical member',
+          'api:country-of-representation': 'UK',
+          'api:political-group': 'PPE-DE',
+        },
+      ]),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(searchMepsTool, {
+        country: ' gb ',
+        political_group: ' epp ',
+        term: 6,
+      }),
+    );
+    expect(data).toMatchObject({
+      appliedFilters: { country: 'UK', political_group: 'PPE', term: 6 },
+      items: [{ mep_id: '900000003', country: 'UK', political_group: 'PPE-DE' }],
+    });
+    const url = new URL(String(fetcher.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('country-of-representation')).toBe('UK');
+    expect(url.searchParams.get('political-group')).toBe('PPE');
+  });
+
+  it('renders the canonical code list on both invalid-filter surfaces before HTTP', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    const result = await runToolContract(searchMepsTool, { gender: 'invalid' });
+    expectErrorTwin(result, 'invalid_filter', invalidHint, JsonRpcErrorCode.ValidationError);
+    const message = 'Unsupported gender filter. Accepted codes: FEMALE, MALE, NAP, NKN, NST.';
+    expect(result.structuredContent).toMatchObject({ error: { message } });
+    expect(contractText(result)).toContain(message);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it('detects changed roster content beyond the current page and changed scope', async () => {
     let changed = false;
     installToolHttp(() =>

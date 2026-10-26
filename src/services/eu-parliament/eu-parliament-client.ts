@@ -5,6 +5,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   invalidParams,
+  JsonRpcErrorCode,
   McpError,
   rateLimited,
   serializationError,
@@ -59,6 +60,9 @@ const allowlists = new Map<string, readonly string[]>([
   ['meetings', [...lists, 'year']],
   ['parliamentary-questions', [...lists, 'year', 'work-type']],
 ]);
+/** Single-record and sitting-decision routes accept no query parameters. */
+const detailRoute =
+  /^(?:procedures|documents|speeches|meps|parliamentary-questions|corporate-bodies)\/[^/]+$|^meetings\/[^/]+\/decisions$/;
 
 /** One budget shared by every request in a domain operation. */
 export interface Operation {
@@ -96,11 +100,7 @@ export class EuParliamentClient {
   constructor(options: ClientOptions) {
     this.fetcher = options.fetch;
     this.now = options.now ?? Date.now;
-    this.wait =
-      options.wait ??
-      (async (ms, signal) => {
-        await delay(ms, undefined, { signal });
-      });
+    this.wait = options.wait ?? ((ms, signal) => delay(ms, undefined, { signal }));
   }
   /** Starts the 40-second deadline before acquisition or queueing. */
   operation(callerSignal: AbortSignal): Operation {
@@ -127,14 +127,20 @@ export class EuParliamentClient {
     this.nextStart = start + 700;
     this.pending++;
     try {
-      if (start > this.now()) await this.wait(start - this.now(), operation.signal);
-    } catch (cause) {
-      this.check(operation);
-      throw cause;
+      if (start > this.now()) await this.sleep(start - this.now(), operation);
     } finally {
       this.pending--;
     }
     this.check(operation);
+  }
+  /** A rejected wait surfaces as the classified deadline or caller abort when one applies. */
+  private async sleep(ms: number, operation: Operation): Promise<void> {
+    try {
+      await this.wait(ms, operation.signal);
+    } catch (cause) {
+      this.check(operation);
+      throw cause;
+    }
   }
   /** Parses a fully read JSON-LD envelope against the noun schema. */
   async get<T>(
@@ -144,13 +150,7 @@ export class EuParliamentClient {
     operation: Operation,
   ): Promise<Envelope<T>> {
     if (!/^[A-Za-z0-9_/-]+$/.test(path)) throw new Error('Unsupported Parliament endpoint');
-    const allowed =
-      allowlists.get(path) ??
-      (/^(?:procedures|documents|speeches|meps|parliamentary-questions)\/[^/]+$|^meetings\/[^/]+\/decisions$/.test(
-        path,
-      )
-        ? []
-        : undefined);
+    const allowed = allowlists.get(path) ?? (detailRoute.test(path) ? [] : undefined);
     if (!allowed) throw new Error('Unsupported Parliament endpoint');
     const url = new URL(`api/v2/${path}`, origin);
     for (const [key, value] of Object.entries(query)) {
@@ -158,8 +158,7 @@ export class EuParliamentClient {
       if (value !== undefined) url.searchParams.set(key, String(value));
     }
     url.searchParams.set('format', 'application/ld+json');
-    for (let attempt = 0; attempt < 3; attempt++) {
-      this.check(operation);
+    for (let attempt = 0; ; attempt++) {
       await this.pace(operation);
       const attemptSignal = AbortSignal.any([
         operation.signal,
@@ -176,14 +175,16 @@ export class EuParliamentClient {
         });
         if (response.status === 204 || response.status === 404) {
           await response.body?.cancel();
+          this.check(operation);
+          attemptSignal.throwIfAborted();
           return { status: response.status === 204 ? 'empty' : 'missing', data: [] };
         }
         if (!response.ok) {
           await response.body?.cancel();
-          if (response.status === 400 || response.status === 422)
+          if (response.status === 400 || response.status === 403 || response.status === 422)
             throw invalidParams(
               'Parliament rejected the validated request. Use supported identifiers and filters.',
-              { reason: 'upstream_rejected', status: response.status },
+              { reason: 'upstream_rejected', status: response.status, retryable: false },
             );
           const transient = [408, 429, 500, 502, 503, 504].includes(response.status);
           const header = response.headers.get('retry-after');
@@ -242,7 +243,8 @@ export class EuParliamentClient {
         const transient =
           cause instanceof McpError
             ? cause.data?.retryable === true ||
-              (cause.data?.retryable !== false && cause.code === -32000)
+              (cause.data?.retryable !== false &&
+                cause.code === JsonRpcErrorCode.ServiceUnavailable)
             : cause instanceof TypeError ||
               (cause instanceof Error && (cause.name === 'TimeoutError' || attemptSignal.aborted));
         if (!transient || attempt === 2) {
@@ -259,14 +261,8 @@ export class EuParliamentClient {
             );
           throw cause;
         }
-        try {
-          await this.wait(retryAfterMs ?? 1000 * 2 ** attempt, operation.signal);
-        } catch (waitError) {
-          this.check(operation);
-          throw waitError;
-        }
+        await this.sleep(retryAfterMs ?? 1000 * 2 ** attempt, operation);
       }
     }
-    throw new Error('Unreachable retry state');
   }
 }
