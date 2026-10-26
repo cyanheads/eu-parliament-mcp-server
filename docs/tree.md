@@ -1,6 +1,6 @@
 # eu-parliament-mcp-server - Directory Structure
 
-Generated on: 2026-10-25 12:17:21
+Generated on: 2026-10-26 03:39:22
 
 ```text
 eu-parliament-mcp-server/
@@ -36,6 +36,8 @@ eu-parliament-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -168,6 +170,8 @@ eu-parliament-mcp-server/
 │   ├── integration/
 │   ├── prompts/
 │   ├── resources/
+│   ├── scripts/
+│   │   └── clean-mcpb.test.ts
 │   ├── services/
 │   │   └── eu-parliament/
 │   │       ├── eu-parliament-client.test.ts
@@ -201,7 +205,9 @@ eu-parliament-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
