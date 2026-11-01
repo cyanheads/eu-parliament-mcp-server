@@ -40,10 +40,14 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 | `euparl_get_procedure` | Read procedure identity, stage, events, participants, and document references |
 | `euparl_search_documents` | Search adopted texts, list committee/plenary documents, or retrieve any canonical document |
 | `euparl_search_speeches` | Search ninth- or tenth-term speech activities and retrieve metadata and recording-document links |
-| `euparl_search_meps` | Find MEPs across a complete current or selected-term roster |
+| `euparl_search_meps` | Find MEPs across a complete current, dated, or selected-term roster |
 | `euparl_get_mep` | Read member identity and published membership history |
 | `euparl_get_plenary_votes` | Discover sittings, inspect decisions, and page recorded or intended voters |
 | `euparl_list_questions` | List questions by year/type or retrieve a question and answer references |
+
+### Agent skill
+
+[`skills/eu-parliament-guide`](skills/eu-parliament-guide/SKILL.md) is served over MCP as `skill://eu-parliament-guide/SKILL.md` and ships in the npm package, Docker image, and `.mcpb` bundle. It covers identifier chains from procedure to vote and debate, the term calendar, choosing a file's final vote, a voter's country on the vote date, and conclusions missing data cannot support.
 
 ## Capability reference
 
@@ -65,7 +69,7 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 ### `euparl_get_procedure` <sub>tool</sub>
 
 - Required `procedure_id` accepts `YYYY-NNNN`, `YYYY/NNNN(TYPE)`, an optional letter suffix, the known path prefix, or the exact public procedure URI
-- `section: "overview"` returns scalar metadata and collection counts; `events`, `participants`, and `documents` page one collection using snapshots
+- `section: "overview"` returns scalar metadata and collection counts; `events`, `participants`, and `documents` page one collection using snapshots. Events and participants come in date order (undated last), documents in ID order
 - Historical participant groups stay historical. Follow document IDs with `euparl_search_documents` in get mode
 
 ---
@@ -88,10 +92,11 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 
 ### `euparl_search_meps` <sub>tool</sub>
 
-- Omitted `term` selects members in office today; explicit `term` selects a published roster from terms 0–10. Optional country, political-group, and gender codes come from `mep_filters`
-- Equivalent query spellings include `EPP`, `Greens/EFA`, `GUE/NGL`, `Patriots`, and historical country `GB` → `UK`; published historical group identities remain intact
-- `name_contains` matches every normalized token across the complete roster before paging, ignoring case, diacritics, and punctuation
-- Results use snapshot continuation. Country/group describe the selected roster context, not voting-date affiliation
+- Omitting `term` and `mandate_date` selects members in office today; `term` selects a published roster from terms 0–10; `mandate_date` (`YYYY-MM-DD`, not after today, exclusive with `term`) selects members seated on that date. Optional country, political-group, and gender codes come from `mep_filters`
+- On a `mandate_date` roster, country and group are matched and returned as published on that date, so `political_group` matches only the code in force then; for earlier groups omit it and read each member's published group. A term's first sitting day can return an incomplete roster or an upstream error; use the following day
+- Equivalent query spellings include `EPP`, `Greens/EFA`, `GUE/NGL`, `Patriots`, and country `UK` → `GB`, the code Parliament publishes for United Kingdom members on historical rosters; published historical group identities remain intact
+- `name_contains` matches every normalized token across the complete roster before paging, ignoring case, diacritics, and punctuation; a value with no letter or digit is rejected
+- Results use snapshot continuation. Country/group describe the selected roster context, never inferred for another date
 
 ---
 
@@ -116,7 +121,7 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 ### `euparl_list_questions` <sub>tool</sub>
 
 - Default `mode: "list"` accepts `year` and `work_type`; no keyword, author, or addressee search
-- `mode: "get"` requires `question_id`: a canonical work ID, known document prefix/public URI, or human citation such as `E-000001/2025` (also P/O prefixes). Optional `term` resolves a citation directly; omission checks the corresponding mandate, including both candidates in election years, and requires one exact match
+- `mode: "get"` requires `question_id`: a canonical work ID, known document prefix/public URI, or human citation such as `E-000001/2025` (also P, O, and the G/K interpellation prefixes). Optional `term` resolves a citation directly; omission checks the corresponding mandate, including both candidates in election years, and requires one exact match
 - Get rejects list filters and nondefault paging. Detail returns metadata, source files, and published answer references; empty `answers` does not prove the question is unanswered
 
 ## Features
@@ -127,8 +132,21 @@ European Parliament-specific:
 
 - Keyless access to Parliament's public JSON-LD records, with canonical identifiers linking discovery, detail, and source evidence
 - Shared request pacing, bounded retries, and one 40-second deadline per call covering every upstream request and queue wait
-- Shared paging on every list tool: `offset`, `limit` (default 20, effective maximum 100; larger requests up to 1000 are normalized with a notice), and `language` (default `en`, any of the 24 EU languages). Rosters, procedure sections, memberships, decisions, and voters are acquired whole, then paged locally with a `page.snapshot` that continuation must pass back; `snapshot_changed` means restart at offset 0
-- Procedure, speech, and adopted-text searches expose a 10,000-result window. Narrow supported filters when the window ends; a capped upstream total is disclosed as a lower bound, and `has_more` can remain true without a reachable `next_offset`
+- Shared paging on every list tool: `offset`, `limit` (default 20), and `language` (default `en`, any of the 24 EU languages). Rosters, procedure sections, memberships, decisions, and voters are acquired whole, then paged locally with a `page.snapshot` that continuation must pass back; `snapshot_changed` means restart at offset 0
+- Each collection has its own page cap, sized from measured row bytes so a full page and its continuation fit inside the 100,000 characters Claude Code keeps of a tool result (decision rows vary too widely for any count to bound). A larger `limit` returns the cap with a notice (`EUPARL_CLAMP_LIMITS=false` rejects a `limit` above the tool's largest cap instead):
+
+  | Collection | Cap |
+  |:---|---:|
+  | Procedures, questions, MEP roster | 300 |
+  | Documents (all three sources), MEP memberships | 225 |
+  | Procedure events, participants, documents | 125 |
+  | Sittings, decisions | 100 |
+  | Speeches | 80 |
+  | Voters in one position | 1,000 |
+  | Committees, political groups, static reference topics | 350 |
+  | Organization lookups (one paced request each) | 20 |
+
+- Procedure, speech, and adopted-text searches expose a 10,000-result window. A page reaching past it narrows to the results left, with a notice; an offset of 10,000 or more is rejected. Narrow supported filters when the window ends; a capped upstream total is disclosed as a lower bound, and `has_more` can remain true without a reachable `next_offset`
 
 Agent-friendly output:
 
@@ -180,8 +198,9 @@ For Docker or a source build, see [Running the server](#running-the-server).
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<app-root>/logs` |
 | `STORAGE_PROVIDER_TYPE` | Storage backend: `in-memory`, `filesystem`, `supabase`, `cloudflare-kv/r2/d1`. | `in-memory` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
+| `EUPARL_CLAMP_LIMITS` | Clamp a `limit` above its collection's page cap with a notice; `false` rejects a `limit` above the tool's largest cap (smaller mode caps still clamp). | `true` |
 
-No server-specific environment variables are required. See [`.env.example`](./.env.example) for common framework overrides.
+No variables are required; `EUPARL_CLAMP_LIMITS` is the one optional server-specific variable. See [`.env.example`](./.env.example) for common framework overrides.
 
 ## Running the server
 
@@ -227,6 +246,7 @@ The image defaults to HTTP transport, stateless sessions, and logs to `/var/log/
 |:---|:---|
 | `src/mcp-server/tools/definitions` | Nine read-only tool definitions (`*.tool.ts`). |
 | `src/mcp-server/tools/utils` | Shared schemas, lossless rendering, and enrichment. |
+| `src/config` | Server environment: the `limit` clamp switch. |
 | `src/services/eu-parliament` | JSON-LD client, edge schemas, reference codes, normalization, and domain workflows. |
 | `tests/` | Unit and integration tests, mirroring the `src/` structure. |
 | `docs/` | Design contracts and generated project tree. |

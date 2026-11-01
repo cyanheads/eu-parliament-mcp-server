@@ -16,7 +16,8 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
-        "NODE_ENV": "production"
+        "NODE_ENV": "production",
+        "EUPARL_CLAMP_LIMITS": "${user_config.EUPARL_CLAMP_LIMITS}"
       }
     }
   },
@@ -25,5 +26,13 @@
   },
   "tools_generated": true,
   "prompts_generated": true,
-  "user_config": {}
+  "user_config": {
+    "EUPARL_CLAMP_LIMITS": {
+      "type": "string",
+      "title": "Clamp limit inputs",
+      "description": "Clamp a limit above its collection's page cap to that cap with a notice (default when blank). Set false to reject a limit above the tool's largest cap instead.",
+      "default": "",
+      "required": false
+    }
+  }
 }

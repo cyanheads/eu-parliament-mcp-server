@@ -22,6 +22,13 @@
       "version": "0.1.2",
       "environmentVariables": [
         {
+          "name": "EUPARL_CLAMP_LIMITS",
+          "description": "Clamp a limit above its collection's page cap to that cap with a notice. Set false to reject a limit above the tool's largest cap instead.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
+        },
+        {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
           "format": "string",
@@ -73,6 +80,13 @@
           "format": "string",
           "isRequired": false,
           "default": "none"
+        },
+        {
+          "name": "EUPARL_CLAMP_LIMITS",
+          "description": "Clamp a limit above its collection's page cap to that cap with a notice. Set false to reject a limit above the tool's largest cap instead.",
+          "format": "string",
+          "isRequired": false,
+          "default": "true"
         },
         {
           "name": "MCP_LOG_LEVEL",

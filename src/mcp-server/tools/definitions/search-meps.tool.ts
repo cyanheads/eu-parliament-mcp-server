@@ -16,16 +16,16 @@ import {
 } from '@/mcp-server/tools/utils/eu-parliament-tool.js';
 import { getEuParliamentService } from '@/services/eu-parliament/eu-parliament-service.js';
 
-/** Find members across the complete current or selected parliamentary-term roster. */
+/** Find members across the complete current, dated, or selected parliamentary-term roster. */
 export const searchMepsTool = tool('euparl_search_meps', {
   title: 'Find members of the European Parliament',
   description:
-    'Find MEPs by name, country, political group, gender, or parliamentary term. Omitted term selects members in office today; explicit term selects that published term roster. Name matching requires every normalized token after case, diacritic, and punctuation normalization over the complete roster before paging. Country and group describe roster context, never voting-date affiliation. Continue with page.next_offset and snapshot; restart at offset 0 without snapshot after snapshot_changed. Read identity and membership history with euparl_get_mep. Empty matches succeed with guidance.',
+    'Find MEPs by name, country, political group, gender, parliamentary term, or mandate date. Omitting term and mandate_date selects members in office today; term selects that published term roster; mandate_date selects members seated on that date. Name matching requires every normalized token after case, diacritic, and punctuation normalization over the complete roster before paging. Country and group are published for the selected roster, never inferred for another date. Continue with page.next_offset and snapshot; restart at offset 0 without snapshot after snapshot_changed. Read identity and membership history with euparl_get_mep. Empty matches succeed with guidance.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
       name_contains: optionalString().describe(
-        'All-token name filter over the complete selected roster; case, diacritics, and punctuation are normalized, without fuzzy scoring.',
+        'All-token name filter over the complete selected roster; case, diacritics, and punctuation are normalized, without fuzzy scoring. Must keep at least one letter or digit.',
       ),
       term: z
         .number()
@@ -33,17 +33,22 @@ export const searchMepsTool = tool('euparl_search_meps', {
         .min(0)
         .max(10)
         .optional()
-        .describe('Parliamentary term 0–10; omitted selects members in office today.'),
+        .describe(
+          'Parliamentary term 0–10, exclusive with mandate_date; omitting both selects members in office today.',
+        ),
+      mandate_date: optionalString().describe(
+        "Members holding a seat on this YYYY-MM-DD date, not after today (UTC); exclusive with term. Country and group are matched and returned as published on that date. A term's first sitting day can return an incomplete roster or an upstream error; use the following day.",
+      ),
       country: optionalString().describe(
-        'Supported ISO alpha-2 country code, case-insensitive; GB maps to historical UK and does not establish current membership. See euparl_list_reference topic mep_filters.',
+        'Supported ISO alpha-2 country code, case-insensitive. United Kingdom members are published as GB (UK accepted), on historical rosters only. See euparl_list_reference topic mep_filters.',
       ),
       political_group: optionalString().describe(
-        'Supported political group code, case-insensitive; accepts EPP, S&D, Verts/ALE, Greens/EFA, The Left, GUE/NGL, Renew, PfE, and Patriots aliases. Query aliases never rewrite historical organization identities. See euparl_list_reference topic mep_filters.',
+        "Supported political group code, case-insensitive; accepts EPP, S&D, Verts/ALE, Greens/EFA, The Left, GUE/NGL, Renew, PfE, and Patriots aliases. Query aliases never rewrite historical organization identities. With mandate_date it matches only the code in force on that date; for earlier groups omit it and read each member's published political_group. See euparl_list_reference topic mep_filters.",
       ),
       gender: optionalString().describe(
         'Supported gender code FEMALE, MALE, NAP, NKN, or NST, case-insensitive.',
       ),
-      ...pagingInputFields,
+      ...pagingInputFields('meps'),
       snapshot: optionalString().describe(
         'Returned roster snapshot; required for offset above 0, optional at offset 0.',
       ),
@@ -87,7 +92,7 @@ export const searchMepsTool = tool('euparl_search_meps', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A code, term, or language is unsupported.',
+      when: 'A code, term, or language is unsupported; name_contains has no letter or digit; or mandate_date is not a real date or is after today (UTC).',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
       thrownBy: 'service',
@@ -95,7 +100,7 @@ export const searchMepsTool = tool('euparl_search_meps', {
     {
       reason: 'invalid_mode_fields',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A nonzero local offset lacks a snapshot.',
+      when: 'A nonzero local offset lacks a snapshot, or mandate_date is combined with term.',
       recovery:
         'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.',
       thrownBy: 'service',

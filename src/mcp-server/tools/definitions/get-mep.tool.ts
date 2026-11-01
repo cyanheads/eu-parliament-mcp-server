@@ -40,7 +40,7 @@ export const getMepTool = tool('euparl_get_mep', {
         .describe(
           'Default overview returns identity and membership count; memberships returns the selected history page.',
         ),
-      ...pagingInputFields,
+      ...pagingInputFields('memberships'),
       snapshot: optionalString().describe(
         'Returned membership snapshot; required for membership offset above 0, optional at offset 0.',
       ),

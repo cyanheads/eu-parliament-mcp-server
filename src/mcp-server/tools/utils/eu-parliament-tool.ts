@@ -5,6 +5,11 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { z } from '@cyanheads/mcp-ts-core';
+import { clampLimits } from '@/config/server-config.js';
+import {
+  type PagedCollection,
+  pageCaps,
+} from '@/services/eu-parliament/eu-parliament-normalization.js';
 import type { Enrichment } from '@/services/eu-parliament/eu-parliament-service.js';
 
 /** Accept form-client blank values without changing nonblank source text. */
@@ -31,7 +36,13 @@ export const pageSchema = z
       .int()
       .nonnegative()
       .describe('Zero-based position in the selected collection.'),
-    limit: z.number().int().positive().describe('Effective whole-item page size, at most 100.'),
+    limit: z
+      .number()
+      .int()
+      .positive()
+      .describe(
+        "Effective whole-item page size: the requested limit, clamped to the collection's page cap and, on a 10000-result search, to the results left in the window.",
+      ),
     returned: z.number().int().nonnegative().describe('Number of complete items on this page.'),
     has_more: z
       .boolean()
@@ -74,25 +85,67 @@ export const linkSchema = z
   })
   .strict()
   .describe('Published source-file link.');
-/** Paging fields shared by upstream and complete local collections. */
-export const pagingInputFields = {
-  offset: z
+const wholeNumber = 'limit must be a whole number.';
+const capList = (collections: readonly PagedCollection[]) =>
+  new Intl.ListFormat('en', { type: 'disjunction' }).format(
+    collections.map((collection) => `${pageCaps[collection].maximum} ${pageCaps[collection].noun}`),
+  );
+/**
+ * Whole-item `limit` for a tool paging `collections`. With clamping on (the default) a larger
+ * value is accepted and the service clamps it to the collection cap, so the schema advertises no
+ * `maximum`: `multipleOf(1)` stands in for `.int()`, which Zod 4 emits with
+ * `maximum: 9007199254740991`, and the integer refinement catches float noise `multipleOf`
+ * tolerates. With EUPARL_CLAMP_LIMITS=false the tool's largest cap is enforced and advertised.
+ * The mode is read per call and per `tools/list` emission (the `.meta()` getters), never when
+ * the definition module is imported, which happens before `setup()` parses the environment.
+ */
+function limitInput(collections: readonly [PagedCollection, ...PagedCollection[]]) {
+  const maximum = Math.max(...collections.map((collection) => pageCaps[collection].maximum));
+  const smaller = collections.filter((collection) => pageCaps[collection].maximum < maximum);
+  const clampText = (capped: readonly PagedCollection[]) =>
+    `Pages hold at most ${capList(capped)}; a larger limit returns that many with a notice.`;
+  return z
     .number()
-    .int()
-    .nonnegative()
-    .default(0)
-    .describe('Zero-based collection offset; default 0.'),
-  limit: z
-    .number()
-    .int()
+    .multipleOf(1, wholeNumber)
     .min(1)
-    .max(1000)
+    .refine(Number.isInteger, { message: wholeNumber, when: ({ issues }) => issues.length === 0 })
+    .check((payload) => {
+      if (!clampLimits() && payload.value > maximum)
+        payload.issues.push({
+          code: 'too_big',
+          origin: 'number',
+          maximum,
+          inclusive: true,
+          input: payload.value,
+        });
+    })
     .default(20)
-    .describe('Whole items requested; default 20, effective maximum 100 with notice.'),
-  language: optionalString().describe(
-    'Supported EU ISO-639-1 language, case-insensitive; default en; source text is never translated.',
-  ),
-};
+    .meta({
+      get maximum() {
+        return clampLimits() ? undefined : maximum;
+      },
+      get description() {
+        return clampLimits()
+          ? `Whole items requested; default 20. ${clampText(collections)}`
+          : `Whole items requested; default 20, at most ${maximum}.${smaller.length ? ` ${clampText(smaller)}` : ''}`;
+      },
+    });
+}
+/** Paging fields for a tool whose pages draw from `collections`; `limit` states their caps. */
+export function pagingInputFields(...collections: [PagedCollection, ...PagedCollection[]]) {
+  return {
+    offset: z
+      .number()
+      .int()
+      .nonnegative()
+      .default(0)
+      .describe('Zero-based collection offset; default 0.'),
+    limit: limitInput(collections),
+    language: optionalString().describe(
+      'Supported EU ISO-639-1 language, case-insensitive; default en; source text is never translated.',
+    ),
+  };
+}
 /** Common result-set context, rendered completely on both surfaces. */
 export const enrichmentFields = {
   appliedFilters: z

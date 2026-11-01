@@ -127,7 +127,7 @@ export const searchDocumentsTool = tool('euparl_search_documents', {
       related_process_id: optionalString().describe(
         'Adopted-texts-only procedure reference YYYY-NNNN, YYYY/NNNN(TYPE), known prefix or public URI.',
       ),
-      ...pagingInputFields,
+      ...pagingInputFields('documents'),
     })
     .strict(),
   output: z
@@ -157,7 +157,7 @@ export const searchDocumentsTool = tool('euparl_search_documents', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A code, identifier, language, date range or source-specific filter is unsupported, or adopted-text offset plus effective limit exceeds the 10000-result search window.',
+      when: 'A code, identifier, language, date range or source-specific filter is unsupported, or an adopted-text offset is 10000 or more, past the 10000-result search window.',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
       thrownBy: 'service',

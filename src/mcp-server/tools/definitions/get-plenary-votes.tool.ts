@@ -213,7 +213,7 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
         .describe(
           'Explicit parliamentary term 0–10 containing the sitting; required with resolve_names true, forbidden otherwise. No term is inferred from dates.',
         ),
-      ...pagingInputFields,
+      ...pagingInputFields('sittings', 'decisions', 'voters'),
       snapshot: optionalString().describe(
         'Returned decisions or voter-position snapshot; required for local offset above 0, optional at offset 0; forbidden for sittings and decision.',
       ),

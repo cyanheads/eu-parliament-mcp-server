@@ -12,6 +12,7 @@ import {
   normalizeName,
   normalizeProcedure,
   normalizeQuestion,
+  pageWindow,
   upstreamPage,
 } from '../../../src/services/eu-parliament/eu-parliament-normalization.js';
 import {
@@ -187,6 +188,106 @@ describe('Parliament normalization', () => {
     ]);
     expect(result.events[1]?.document_ids).toEqual(['A-10-2025-900001', 'PV-10-2025-01-15']);
   });
+  it('orders procedure sections and nested identifier arrays identically for every upstream order', () => {
+    const reorder = <T>(items: T[], reverse: boolean) => (reverse ? items.toReversed() : items);
+    const normalize = (reverse: boolean) =>
+      normalizeProcedure(
+        procedureSchema.parse({
+          id: 'eli/dl/proc/2025-1234',
+          created_a_realization_of: reorder(['eli/dl/doc/DOC-9', 'eli/dl/doc/DOC-0'], reverse),
+          consists_of: reorder(
+            [
+              { id: 'eli/dl/event/EV-UNDATED-B' },
+              {
+                id: 'eli/dl/event/EV-LATE',
+                activity_date: '2025-03-01',
+                decided_on_a_realization_of: ['eli/dl/doc/DOC-2'],
+                based_on_a_realization_of: reorder(
+                  ['eli/dl/doc/DOC-3', 'eli/dl/doc/DOC-2', 'eli/dl/doc/DOC-1'],
+                  reverse,
+                ),
+                was_scheduled_in: reorder(['eli/dl/event/MTG-2', 'eli/dl/event/MTG-1'], reverse),
+              },
+              { id: 'eli/dl/event/EV-UNDATED-A' },
+              { id: 'eli/dl/event/EV-EARLY-B', activity_date: '2024-12-01' },
+              { id: 'eli/dl/event/EV-EARLY-A', activity_date: '2024-12-01' },
+            ],
+            reverse,
+          ),
+          had_participation: reorder(
+            [
+              {
+                id: 'eli/dl/participation/P-TIE',
+                activity_date: '2024-05-01',
+                participation_role: 'def/ep-roles/B',
+              },
+              {
+                id: 'eli/dl/participation/P-UNDATED',
+                had_participant_person: reorder(['person/3', 'person/1', 'person/2'], reverse),
+                had_participant_organization: reorder(['org/B', 'org/A'], reverse),
+              },
+              {
+                id: 'eli/dl/participation/P-TIE',
+                activity_date: '2024-05-01',
+                participation_role: 'def/ep-roles/A',
+              },
+              { id: 'eli/dl/participation/P-EARLY', activity_date: '2023-01-01' },
+            ],
+            reverse,
+          ),
+        }),
+        'en',
+        [],
+      );
+    const result = normalize(false);
+    expect(normalize(true)).toEqual(result);
+    expect(result.events).toEqual([
+      { id: 'EV-EARLY-A', date: '2024-12-01', document_ids: [], sitting_ids: [] },
+      { id: 'EV-EARLY-B', date: '2024-12-01', document_ids: [], sitting_ids: [] },
+      {
+        id: 'EV-LATE',
+        date: '2025-03-01',
+        document_ids: ['DOC-1', 'DOC-2', 'DOC-3'],
+        sitting_ids: ['MTG-1', 'MTG-2'],
+      },
+      { id: 'EV-UNDATED-A', document_ids: [], sitting_ids: [] },
+      { id: 'EV-UNDATED-B', document_ids: [], sitting_ids: [] },
+    ]);
+    expect(result.participants).toEqual([
+      {
+        id: 'eli/dl/participation/P-EARLY',
+        date: '2023-01-01',
+        person_ids: [],
+        organization_ids: [],
+      },
+      {
+        id: 'eli/dl/participation/P-TIE',
+        date: '2024-05-01',
+        role: 'def/ep-roles/A',
+        person_ids: [],
+        organization_ids: [],
+      },
+      {
+        id: 'eli/dl/participation/P-TIE',
+        date: '2024-05-01',
+        role: 'def/ep-roles/B',
+        person_ids: [],
+        organization_ids: [],
+      },
+      {
+        id: 'eli/dl/participation/P-UNDATED',
+        person_ids: ['1', '2', '3'],
+        organization_ids: ['org/A', 'org/B'],
+      },
+    ]);
+    expect(result.documents.map((item) => item.document_id)).toEqual([
+      'DOC-0',
+      'DOC-1',
+      'DOC-2',
+      'DOC-3',
+      'DOC-9',
+    ]);
+  });
   it('separates all recorded/intended voter arrays and unavailable versus published empty', () => {
     const raw = decisionSchema.parse(decisionRecord);
     expect(decisionVoters(raw, 'favor')).toEqual(['900000001', '900000002']);
@@ -206,33 +307,69 @@ describe('Parliament normalization', () => {
   });
   it('hashes full normalized contents and scope before whole-item slicing', () => {
     const items = [{ id: 'first' }, { id: 'second' }, { id: 'third' }];
-    const first = localPage(items, { limit: 1 }, { term: 10 });
+    const first = localPage(items, { offset: 0, limit: 1 }, { term: 10 });
     expect(first.items).toEqual([{ id: 'first' }]);
     expect(first.page).toMatchObject({ next_offset: 1, has_more: true, returned: 1 });
     const snapshot = first.page.snapshot!;
     expect(snapshot).toMatch(/^[a-f0-9]{64}$/);
     const second = localPage(items, { offset: 1, limit: 1, snapshot }, { term: 10 });
     expect(second.items).toEqual([{ id: 'second' }]);
-    expect(() => localPage(items, { offset: 1 }, { term: 10 })).toThrow();
+    expect(() => localPage(items, { offset: 1, limit: 20 }, { term: 10 })).toThrow();
     expect(() =>
-      localPage([...items.slice(0, 2), { id: 'changed unseen third' }], { snapshot }, { term: 10 }),
+      localPage(
+        [...items.slice(0, 2), { id: 'changed unseen third' }],
+        { offset: 0, limit: 20, snapshot },
+        { term: 10 },
+      ),
     ).toThrow();
-    expect(() => localPage(items, { snapshot }, { term: 9 })).toThrow();
-    expect(localPage(items, { offset: 20, snapshot }, { term: 10 })).toMatchObject({
+    expect(() => localPage(items, { offset: 0, limit: 20, snapshot }, { term: 9 })).toThrow();
+    expect(localPage(items, { offset: 20, limit: 20, snapshot }, { term: 10 })).toMatchObject({
       items: [],
       total: 3,
       page: { returned: 0, has_more: false },
     });
   });
-  it('caps whole-item limits and does not invent upstream totals', () => {
+  it.each([
+    ['procedures', 300],
+    ['questions', 300],
+    ['documents', 225],
+    ['speeches', 80],
+    ['meps', 300],
+    ['memberships', 225],
+    ['procedure_sections', 125],
+    ['voters', 1000],
+    ['sittings', 100],
+    ['decisions', 100],
+    ['reference', 350],
+    ['organizations', 20],
+  ] as const)('caps a %s page at %i whole items', (collection, cap) => {
+    expect(pageWindow({ limit: 5000 }, collection)).toEqual({ offset: 0, limit: cap });
+    expect(pageWindow({ offset: 7, limit: cap }, collection)).toEqual({ offset: 7, limit: cap });
+    expect(pageWindow({}, collection)).toEqual({ offset: 0, limit: 20 });
+  });
+  it.each([
+    [{ offset: 9900, limit: 1000 }, 100, 300],
+    [{ offset: 9950, limit: 1000 }, 50, 300],
+    [{ offset: 9990, limit: 20 }, 10, 20],
+    [{ offset: 9700, limit: 1000 }, 300, 300],
+    [{ offset: 9000, limit: 250 }, 250, 250],
+    [{ offset: 10000, limit: 1000 }, 300, 300],
+  ])('narrows %j to %i inside a 10000-result window and %i without one', (input, inside, open) => {
+    expect(pageWindow(input, 'procedures', 10_000)).toEqual({
+      offset: input.offset,
+      limit: inside,
+    });
+    expect(pageWindow(input, 'procedures')).toEqual({ offset: input.offset, limit: open });
+  });
+  it('pages a local collection at the effective window and does not invent upstream totals', () => {
     expect(
       localPage(
-        Array.from({ length: 101 }, (_, id) => ({ id })),
-        { limit: 1000 },
+        Array.from({ length: 1001 }, (_, id) => ({ id })),
+        { offset: 0, limit: 1000 },
         {},
       ).page,
-    ).toMatchObject({ limit: 100, returned: 100, next_offset: 100 });
-    expect(upstreamPage(20, {})).toEqual({
+    ).toMatchObject({ limit: 1000, returned: 1000, next_offset: 1000 });
+    expect(upstreamPage(20, { offset: 0, limit: 20 })).toEqual({
       offset: 0,
       limit: 20,
       returned: 20,

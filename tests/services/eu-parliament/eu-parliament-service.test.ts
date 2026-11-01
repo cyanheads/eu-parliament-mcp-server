@@ -6,10 +6,21 @@ import { EuParliamentService } from '../../../src/services/eu-parliament/eu-parl
 import {
   decisionRecord,
   envelopeResponse,
+  maltaOn20240313,
   mepRecord,
   questionRecord,
   rosterRecords,
 } from '../../helpers/eu-parliament-fixtures.js';
+
+/** Records limit-clamp counter increments; the rest of the framework utils module is real. */
+const telemetry = vi.hoisted(() => {
+  const add = vi.fn();
+  return { add, createCounter: vi.fn(() => ({ add })) };
+});
+vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>()),
+  createCounter: telemetry.createCounter,
+}));
 
 const context = () => ({ signal: new AbortController().signal });
 const makeService = (fetcher: typeof fetch, now?: () => number) =>
@@ -108,8 +119,11 @@ describe('Parliament domain workflows', () => {
       { offset: 9900, limit: 1000 },
       context(),
     );
-    expect(result.data).toMatchObject({ page: { limit: 100 } });
-    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('100');
+    expect(result.data).toMatchObject({ page: { limit: 80 } });
+    expect(result.enrichment.notice).toContain(
+      'Requested limit normalized to the effective maximum of 80 speeches.',
+    );
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('80');
   });
   it('preserves deep question paging without imposing a search window', async () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => envelopeResponse([]));
@@ -117,29 +131,174 @@ describe('Parliament domain workflows', () => {
     expect(result.data).toMatchObject({ items: [], page: { offset: 9990, limit: 20 } });
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
-  it('rejects an offset beyond the accessible search window before HTTP', async () => {
-    const fetcher = vi.fn<typeof fetch>();
-    await expect(
-      makeService(fetcher).listProcedures({ offset: 10000, limit: 1 }, context()),
-    ).rejects.toMatchObject({ data: { reason: 'invalid_filter' } });
-    expect(fetcher).not.toHaveBeenCalled();
-  });
-  it.each(['speeches', 'procedures', 'adopted_texts'] as const)(
-    'rejects crossing the %s search window before HTTP',
-    async (source) => {
-      const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => envelopeResponse([]));
+  it.each([
+    ['speeches', 10000, 'Narrow text, title, person_id, activity_type or sitting dates.'],
+    ['procedures', 10000, 'Narrow process_type to retrieve a smaller procedure set.'],
+    [
+      'adopted_texts',
+      12000,
+      'Narrow text, title, year, term, work_type, sitting dates or related_process_id.',
+    ],
+  ] as const)(
+    'rejects a %s offset of %i past the search window with a narrowing hint before HTTP',
+    async (source, offset, narrowing) => {
+      const fetcher = vi.fn<typeof fetch>();
       const service = makeService(fetcher);
-      const input = { offset: 9990, limit: 20 };
+      const input = { offset, limit: 1 };
       const pending =
         source === 'speeches'
           ? service.searchSpeeches(input, context())
           : source === 'procedures'
             ? service.listProcedures(input, context())
             : service.searchDocuments({ ...input, source }, context());
-      await expect(pending).rejects.toMatchObject({ data: { reason: 'invalid_filter' } });
+      await expect(pending).rejects.toMatchObject({
+        data: {
+          reason: 'invalid_filter',
+          recovery: { hint: `${narrowing} Restart paging at offset 0 after narrowing.` },
+        },
+      });
       expect(fetcher).not.toHaveBeenCalled();
     },
   );
+  it.each([
+    ['speeches', 9990, 20, 10],
+    ['procedures', 9990, 20, 10],
+    ['adopted_texts', 9990, 20, 10],
+    ['procedures', 9900, 1000, 100],
+    ['procedures', 9950, 1000, 50],
+    ['adopted_texts', 9950, 1000, 50],
+  ] as const)(
+    'narrows a %s page at offset %i and limit %i to the %i results left in the window',
+    async (source, offset, limit, effective) => {
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => envelopeResponse([]));
+      const service = makeService(fetcher);
+      const input = { offset, limit };
+      const result = await (source === 'speeches'
+        ? service.searchSpeeches(input, context())
+        : source === 'procedures'
+          ? service.listProcedures(input, context())
+          : service.searchDocuments({ ...input, source }, context()));
+      expect(result.data).toMatchObject({ page: { offset, limit: effective } });
+      expect(result.enrichment.notice).toContain(
+        `Requested limit normalized to ${effective}: offset plus limit cannot pass the 10000-result search window.`,
+      );
+      const url = new URL(String(fetcher.mock.calls[0]?.[0]));
+      expect(url.searchParams.get('offset')).toBe(String(offset));
+      expect(url.searchParams.get('limit')).toBe(String(effective));
+    },
+  );
+  type Call = (service: EuParliamentService) => Promise<unknown>;
+  it.each<[string, Call]>([
+    ['documents sitting_date', (s) => s.searchDocuments({ sitting_date: '2024-02-30' }, context())],
+    [
+      'documents sitting_date_end',
+      (s) =>
+        s.searchDocuments(
+          { sitting_date: '2024-02-01', sitting_date_end: '2023-02-29' },
+          context(),
+        ),
+    ],
+    ['speeches sitting_date', (s) => s.searchSpeeches({ sitting_date: '2024-13-01' }, context())],
+    [
+      'speeches sitting_date_end',
+      (s) =>
+        s.searchSpeeches({ sitting_date: '2024-02-01', sitting_date_end: '2024-2-3' }, context()),
+    ],
+    ['votes sitting_id', (s) => s.getPlenaryVotes({ sitting_id: 'MTG-PL-2024-04-31' }, context())],
+    ['meps mandate_date', (s) => s.searchMeps({ mandate_date: '2024-02-30' }, context())],
+  ])('rejects a nonexistent or malformed %s with the date hint before HTTP', async (_, call) => {
+    const fetcher = vi.fn<typeof fetch>();
+    await expect(call(makeService(fetcher))).rejects.toMatchObject({
+      message: 'Use a real calendar date in YYYY-MM-DD form.',
+      data: {
+        reason: 'invalid_filter',
+        recovery: { hint: 'Pass an existing calendar day as YYYY-MM-DD.' },
+      },
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+  it.each<[string, Call, (url: URL) => string | null]>([
+    [
+      'documents',
+      (s) =>
+        s.searchDocuments(
+          { sitting_date: '2024-02-01', sitting_date_end: '2024-02-29' },
+          context(),
+        ),
+      (url) => url.searchParams.get('sitting-date-end'),
+    ],
+    [
+      'speeches',
+      (s) => s.searchSpeeches({ sitting_date: '2024-02-29' }, context()),
+      (url) => url.searchParams.get('sitting-date'),
+    ],
+    [
+      'votes',
+      (s) => s.getPlenaryVotes({ sitting_id: '2024-02-29' }, context()),
+      (url) => /MTG-PL-(\d{4}-\d{2}-\d{2})/.exec(url.pathname)?.[1] ?? null,
+    ],
+    [
+      'meps',
+      (s) => s.searchMeps({ mandate_date: '2024-02-29' }, context()),
+      (url) => url.searchParams.get('mandate-date'),
+    ],
+  ])('accepts the leap day in %s and sends it upstream', async (_, call, sent) => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => envelopeResponse([]));
+    await call(makeService(fetcher));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(sent(new URL(String(fetcher.mock.calls[0]?.[0])))).toBe('2024-02-29');
+  });
+  it.each<[string, Call]>([
+    ['documents', (s) => s.searchDocuments({ sitting_date_end: '2024-02-01' }, context())],
+    [
+      'speeches',
+      (s) =>
+        s.searchSpeeches({ sitting_date: '2024-02-29', sitting_date_end: '2024-02-28' }, context()),
+    ],
+  ])(
+    'rejects an incomplete or reversed sitting range in %s with the range hint before HTTP',
+    async (_, call) => {
+      const fetcher = vi.fn<typeof fetch>();
+      await expect(call(makeService(fetcher))).rejects.toMatchObject({
+        data: {
+          reason: 'invalid_filter',
+          recovery: { hint: 'Pass sitting_date with sitting_date_end, on or before it.' },
+        },
+      });
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
+  it('logs the first clamp per collection once per process and counts every clamp', async () => {
+    vi.resetModules();
+    const { logger } = await import('@cyanheads/mcp-ts-core/utils');
+    const { EuParliamentService: FreshService } = await import(
+      '../../../src/services/eu-parliament/eu-parliament-service.js'
+    );
+    const info = vi.spyOn(logger, 'info');
+    telemetry.add.mockClear();
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => envelopeResponse([]));
+    const service = new FreshService({ fetch: fetcher, wait: async () => {} });
+    await service.listProcedures({ limit: 5000 }, context());
+    await service.listProcedures({ offset: 9950, limit: 200 }, context());
+    await service.listQuestions({ limit: 301 }, context());
+    await service.listQuestions({ limit: 300 }, context());
+    const clampLogs = info.mock.calls.filter(([message]) => message.startsWith('Limit clamped'));
+    expect(clampLogs.map(([message]) => message)).toEqual([
+      'Limit clamped on procedures: requested 5000, effective 300; later clamps on this collection are counted, not logged.',
+      'Limit clamped on questions: requested 301, effective 300; later clamps on this collection are counted, not logged.',
+    ]);
+    expect(telemetry.createCounter).toHaveBeenCalledWith(
+      'euparl.limit.clamps',
+      expect.any(String),
+      '{calls}',
+    );
+    expect(telemetry.add.mock.calls).toEqual([
+      [1, { 'euparl.collection': 'procedures', 'euparl.limit.bound': 'collection_cap' }],
+      [1, { 'euparl.collection': 'procedures', 'euparl.limit.bound': 'search_window' }],
+      [1, { 'euparl.collection': 'questions', 'euparl.limit.bound': 'collection_cap' }],
+    ]);
+    info.mockRestore();
+  });
   it.each([10000, undefined])(
     'retains uncertainty at the speech window with total %s',
     async (total) => {
@@ -410,6 +569,406 @@ describe('Parliament domain workflows', () => {
     expect(result.data.items).toEqual([]);
     expect(result.enrichment.totalCount).toBe(0);
     expect(result.enrichment.notice).toContain('No MEPs matched');
+  });
+
+  describe('searchMeps name, country, and mandate-date selectors', () => {
+    const maltaToday = [
+      {
+        id: 'person/113523',
+        type: 'Person',
+        identifier: '113523',
+        label: 'Peter AGIUS',
+        familyName: 'Agius',
+        givenName: 'Peter',
+        sortLabel: 'AGIUSP',
+        'api:country-of-representation': 'MT',
+        'api:political-group': 'PPE',
+      },
+      maltaOn20240313[0]!,
+      maltaOn20240313[3]!,
+      {
+        id: 'person/256934',
+        type: 'Person',
+        identifier: '256934',
+        label: 'Daniel ATTARD',
+        familyName: 'Attard',
+        givenName: 'Daniel',
+        sortLabel: 'ATTARDD',
+        'api:country-of-representation': 'MT',
+        'api:political-group': 'S&D',
+      },
+      {
+        id: 'person/256936',
+        type: 'Person',
+        identifier: '256936',
+        label: 'Thomas BAJADA',
+        familyName: 'Bajada',
+        givenName: 'Thomas',
+        sortLabel: 'BAJADAT',
+        'api:country-of-representation': 'MT',
+        'api:political-group': 'S&D',
+      },
+      maltaOn20240313[5]!,
+    ];
+    /** First two rows of meps/show-current?mandate-date=2016-03-09&country-of-representation=GB (73 rows). */
+    const britainOn20160309 = [
+      {
+        id: 'person/102931',
+        type: 'Person',
+        identifier: '102931',
+        label: 'Keith TAYLOR',
+        familyName: 'Taylor',
+        givenName: 'Keith',
+        sortLabel: 'TAYLOR KEITH',
+        'api:country-of-representation': 'GB',
+        'api:political-group': 'Verts/ALE',
+      },
+      {
+        id: 'person/106202',
+        type: 'Person',
+        identifier: '106202',
+        label: 'Julia REID',
+        familyName: 'Reid',
+        givenName: 'Julia',
+        sortLabel: 'REID J',
+        'api:country-of-representation': 'GB',
+        'api:political-group': 'EFDD',
+      },
+    ];
+    /** The same two members from meps?parliamentary-term=8&country-of-representation=GB (83 rows); term rows publish no country or group. */
+    const britainTerm8 = britainOn20160309.map(
+      ({ 'api:country-of-representation': _country, 'api:political-group': _group, ...identity }) =>
+        identity,
+    );
+    /** One current-roster row captured on 2026-11-01. */
+    const aaltola = {
+      id: 'person/256810',
+      type: 'Person',
+      identifier: '256810',
+      label: 'Mika AALTOLA',
+      familyName: 'Aaltola',
+      givenName: 'Mika',
+      sortLabel: 'AALTOLAM',
+      'api:country-of-representation': 'FI',
+      'api:political-group': 'PPE',
+    };
+    const now = () => Date.parse('2026-11-01T12:00:00Z');
+    const urlOf = (fetcher: ReturnType<typeof vi.fn<typeof fetch>>, call = 0) =>
+      new URL(String(fetcher.mock.calls[call]?.[0]));
+    const namesOf = (items: { name?: string }[]) => items.map((item) => item.name);
+    const noMatch =
+      'No MEPs matched. Remove name_contains to browse, relax country or political_group, or call euparl_list_reference with topic mep_filters.';
+    const datedGroup =
+      "On a mandate_date roster, political_group matches only the group code in force on that date; omit political_group and read each member's published political_group.";
+
+    it.each(['!!!', '.,;:-/', '🙂', '́̈', ' ! ? '])(
+      'rejects name_contains %j without a letter or digit before HTTP',
+      async (name_contains) => {
+        const fetcher = vi.fn<typeof fetch>();
+        await expect(
+          makeService(fetcher).searchMeps({ name_contains }, context()),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          message:
+            'name_contains has no letter or digit after case, diacritic, and punctuation normalization.',
+          data: {
+            reason: 'invalid_filter',
+            recovery: {
+              hint: 'Include at least one letter or digit in name_contains, or omit name_contains to browse the roster.',
+            },
+          },
+        });
+        expect(fetcher).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['', '   ', '\t\n'])(
+      'treats blank name_contains %j as unset',
+      async (name_contains) => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse(rosterRecords));
+        const result = await makeService(fetcher).searchMeps({ name_contains }, context());
+        expect(result.enrichment.totalCount).toBe(2);
+        expect(result.enrichment.appliedFilters).not.toHaveProperty('name_contains');
+        expect(fetcher).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('keeps punctuation inside a real name as a separator', async () => {
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(envelopeResponse([aaltola, ...rosterRecords]));
+      const result = await makeService(fetcher).searchMeps(
+        { name_contains: 'Aaltola!' },
+        context(),
+      );
+      expect(result.data.items.map((item) => item.mep_id)).toEqual(['256810']);
+      expect(result.enrichment.appliedFilters).toMatchObject({ name_contains: 'aaltola' });
+    });
+
+    it.each(['GB', ' uk '])(
+      'sends United Kingdom input %j as the published GB code on the term route',
+      async (country) => {
+        const fetcher = vi
+          .fn<typeof fetch>()
+          .mockImplementation(async (input) =>
+            new URL(String(input)).searchParams.get('country-of-representation') === 'GB'
+              ? envelopeResponse(britainTerm8)
+              : new Response(null, { status: 204 }),
+          );
+        const result = await makeService(fetcher).searchMeps({ term: 8, country }, context());
+        expect(urlOf(fetcher).pathname).toBe('/api/v2/meps');
+        expect(urlOf(fetcher).searchParams.get('parliamentary-term')).toBe('8');
+        expect(urlOf(fetcher).searchParams.get('country-of-representation')).toBe('GB');
+        expect(result.enrichment.appliedFilters).toMatchObject({
+          scope: 'parliamentary_term',
+          term: 8,
+          country: 'GB',
+        });
+        expect(namesOf(result.data.items)).toEqual(['Julia REID', 'Keith TAYLOR']);
+      },
+    );
+
+    it('selects a dated roster on meps/show-current and keeps the current roster without mandate_date', async () => {
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockImplementation(async (input) =>
+          envelopeResponse(
+            new URL(String(input)).searchParams.get('mandate-date') === '2024-03-13'
+              ? maltaOn20240313
+              : maltaToday,
+          ),
+        );
+      const service = makeService(fetcher, now);
+      const dated = await service.searchMeps(
+        { mandate_date: '2024-03-13', country: 'mt' },
+        context(),
+      );
+      expect(namesOf(dated.data.items)).toEqual([
+        'Alex AGIUS SALIBA',
+        'David CASA',
+        'Josianne CUTAJAR',
+        'Cyrus ENGERER',
+        'Roberta METSOLA',
+        'Alfred SANT',
+      ]);
+      expect(dated.data.items[0]).toEqual({
+        mep_id: '197403',
+        name: 'Alex AGIUS SALIBA',
+        given_name: 'Alex',
+        family_name: 'Agius Saliba',
+        country: 'MT',
+        political_group: 'S&D',
+      });
+      expect(dated.enrichment).toMatchObject({
+        totalCount: 6,
+        appliedFilters: {
+          scope: 'mandate_date',
+          mandate_date: '2024-03-13',
+          language: 'en',
+          country: 'MT',
+        },
+      });
+      expect(dated.enrichment.appliedFilters).not.toHaveProperty('as_of');
+      expect(urlOf(fetcher).pathname).toBe('/api/v2/meps/show-current');
+      expect(urlOf(fetcher).searchParams.get('mandate-date')).toBe('2024-03-13');
+      expect(urlOf(fetcher).searchParams.get('country-of-representation')).toBe('MT');
+      expect(urlOf(fetcher).searchParams.has('parliamentary-term')).toBe(false);
+      expect(urlOf(fetcher).searchParams.has('limit')).toBe(false);
+      const current = await service.searchMeps({ country: 'MT' }, context());
+      expect(namesOf(current.data.items)).toEqual([
+        'Peter AGIUS',
+        'Alex AGIUS SALIBA',
+        'Daniel ATTARD',
+        'Thomas BAJADA',
+        'David CASA',
+        'Roberta METSOLA',
+      ]);
+      expect(current.enrichment.appliedFilters).toEqual({
+        scope: 'current',
+        as_of: '2026-11-01',
+        language: 'en',
+        country: 'MT',
+      });
+      expect(urlOf(fetcher, 1).searchParams.has('mandate-date')).toBe(false);
+    });
+
+    it('sends UK input on the dated route as GB and keeps the date-published country and group', async () => {
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockImplementation(async (input) =>
+          new URL(String(input)).searchParams.get('country-of-representation') === 'GB'
+            ? envelopeResponse(britainOn20160309)
+            : new Response(null, { status: 204 }),
+        );
+      const result = await makeService(fetcher, now).searchMeps(
+        { mandate_date: '2016-03-09', country: 'UK' },
+        context(),
+      );
+      expect(urlOf(fetcher).searchParams.get('mandate-date')).toBe('2016-03-09');
+      expect(urlOf(fetcher).searchParams.get('country-of-representation')).toBe('GB');
+      expect(result.data.items).toEqual([
+        {
+          mep_id: '106202',
+          name: 'Julia REID',
+          given_name: 'Julia',
+          family_name: 'Reid',
+          country: 'GB',
+          political_group: 'EFDD',
+        },
+        {
+          mep_id: '102931',
+          name: 'Keith TAYLOR',
+          given_name: 'Keith',
+          family_name: 'Taylor',
+          country: 'GB',
+          political_group: 'Verts/ALE',
+        },
+      ]);
+      expect(result.enrichment.appliedFilters).toMatchObject({
+        scope: 'mandate_date',
+        mandate_date: '2016-03-09',
+        country: 'GB',
+      });
+    });
+
+    it('acquires every continuation page of a dated roster before name matching', async () => {
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({ data: maltaOn20240313.slice(0, 1), meta: { total: 6, next: 1 } }),
+          ),
+        )
+        .mockResolvedValueOnce(envelopeResponse(maltaOn20240313.slice(1)));
+      const result = await makeService(fetcher, now).searchMeps(
+        { mandate_date: '2024-03-13', name_contains: 'Sant' },
+        context(),
+      );
+      expect(namesOf(result.data.items)).toEqual(['Alfred SANT']);
+      expect(fetcher).toHaveBeenCalledTimes(2);
+      expect(urlOf(fetcher, 1).pathname).toBe('/api/v2/meps/show-current');
+      expect(urlOf(fetcher, 1).searchParams.get('mandate-date')).toBe('2024-03-13');
+      expect(urlOf(fetcher, 1).searchParams.get('offset')).toBe('1');
+      expect(urlOf(fetcher, 1).searchParams.get('limit')).toBe('50');
+    });
+
+    it.each([
+      [{ term: 9, mandate_date: '2024-03-13' }, 'invalid_mode_fields'],
+      [{ term: 0, mandate_date: '2024-03-13' }, 'invalid_mode_fields'],
+      [{ mandate_date: '2024-02-30' }, 'invalid_filter'],
+      [{ mandate_date: '2024-3-13' }, 'invalid_filter'],
+      [{ mandate_date: '2026-11-02' }, 'invalid_filter'],
+    ] as const)('rejects %j with %s before HTTP', async (input, reason) => {
+      const fetcher = vi.fn<typeof fetch>();
+      await expect(makeService(fetcher, now).searchMeps(input, context())).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason },
+      });
+      expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it('rejects a mandate_date after the client UTC date with a date hint and accepts that date', async () => {
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse(maltaToday));
+      const service = makeService(fetcher, () => Date.parse('2026-11-01T23:59:59Z'));
+      await expect(
+        service.searchMeps({ mandate_date: '2026-11-02' }, context()),
+      ).rejects.toMatchObject({
+        message: 'mandate_date 2026-11-02 is after the current UTC date 2026-11-01.',
+        data: {
+          reason: 'invalid_filter',
+          recovery: {
+            hint: 'Use a mandate_date on or before 2026-11-01, or omit mandate_date for members in office today.',
+          },
+        },
+      });
+      expect(fetcher).not.toHaveBeenCalled();
+      const today = await service.searchMeps({ mandate_date: '2026-11-01' }, context());
+      expect(today.enrichment.appliedFilters).toMatchObject({
+        scope: 'mandate_date',
+        mandate_date: '2026-11-01',
+      });
+      expect(urlOf(fetcher).searchParams.get('mandate-date')).toBe('2026-11-01');
+    });
+
+    it.each([
+      [{ mandate_date: '' }, 'current'],
+      [{ mandate_date: '  ', term: 9 }, 'parliamentary_term'],
+    ] as const)('treats blank mandate_date in %j as unset', async (input, scope) => {
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse(maltaToday));
+      const result = await makeService(fetcher, now).searchMeps(input, context());
+      expect(result.enrichment.appliedFilters).toMatchObject({ scope });
+      expect(result.enrichment.appliedFilters).not.toHaveProperty('mandate_date');
+      expect(urlOf(fetcher).searchParams.has('mandate-date')).toBe(false);
+    });
+
+    it('binds the snapshot to the mandate date and roster scope', async () => {
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockImplementation(async () => envelopeResponse(maltaOn20240313));
+      const service = makeService(fetcher, now);
+      const first = await service.searchMeps({ mandate_date: '2024-03-13', limit: 1 }, context());
+      const snapshot = first.data.page.snapshot!;
+      const next = await service.searchMeps(
+        { mandate_date: '2024-03-13', limit: 1, offset: 1, snapshot },
+        context(),
+      );
+      expect(namesOf(next.data.items)).toEqual(['David CASA']);
+      for (const scope of [{ mandate_date: '2016-03-09' }, {}, { term: 10 }])
+        await expect(
+          service.searchMeps({ ...scope, limit: 1, offset: 1, snapshot }, context()),
+        ).rejects.toMatchObject({ data: { reason: 'snapshot_changed' } });
+    });
+
+    it.each([
+      [{ mandate_date: '2016-03-09', political_group: 'GUE/NGL' }, `${noMatch} ${datedGroup}`],
+      [{ political_group: 'GUE/NGL' }, noMatch],
+      [{ mandate_date: '2016-03-09', name_contains: 'nobody' }, noMatch],
+    ] as const)(
+      'explains date-bound group codes only for an empty dated group search %j',
+      async (input, notice) => {
+        const fetcher = vi
+          .fn<typeof fetch>()
+          .mockResolvedValue(new Response(null, { status: 204 }));
+        const result = await makeService(fetcher, now).searchMeps(input, context());
+        expect(result.data.items).toEqual([]);
+        expect(result.enrichment.notice).toBe(notice);
+        if ('political_group' in input)
+          expect(urlOf(fetcher).searchParams.get('political-group')).toBe('THE-LEFT');
+      },
+    );
+
+    it('omits the date-bound group explanation when the dated group roster matched but no name did', async () => {
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse(maltaOn20240313));
+      const result = await makeService(fetcher, now).searchMeps(
+        { mandate_date: '2024-03-13', political_group: 'S&D', name_contains: 'nobody' },
+        context(),
+      );
+      expect(result.data.items).toEqual([]);
+      expect(result.enrichment.notice).toBe(noMatch);
+      expect(urlOf(fetcher).searchParams.get('political-group')).toBe('S-D');
+    });
+
+    it('surfaces an upstream 500 on a dated roster as an operational error, never an empty roster', async () => {
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({
+              path: '/api/v2/meps-show-current',
+              status: 500,
+              error: 'Internal Server Error',
+            }),
+            { status: 500 },
+          ),
+      );
+      await expect(
+        makeService(fetcher, now).searchMeps({ mandate_date: '2024-07-16' }, context()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { status: 500, retryable: true },
+      });
+      expect(fetcher).toHaveBeenCalledTimes(3);
+      expect(urlOf(fetcher).searchParams.get('mandate-date')).toBe('2024-07-16');
+    });
   });
 
   it('normalizes membership history without requiring contact or birth fields', async () => {

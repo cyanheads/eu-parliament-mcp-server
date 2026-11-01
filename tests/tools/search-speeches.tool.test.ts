@@ -121,12 +121,23 @@ describe('euparl_search_speeches contract', () => {
     expect(data.notice).toContain('Narrow');
     expect(contractText(result)).not.toMatch(/Continue with offset|undefined/);
   });
-  it('returns window-crossing recovery before HTTP', async () => {
+  it('narrows a window-crossing page and returns past-window recovery before HTTP', async () => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
-    const result = await runToolContract(searchSpeechesTool, { offset: 9990, limit: 20 });
-    expectErrorTwin(result, 'invalid_filter', invalidHint);
-    expect(contractText(result)).toContain('Narrow text');
-    expect(fetcher).not.toHaveBeenCalled();
+    const narrowed = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, { offset: 9990, limit: 20 }),
+    );
+    expect(narrowed).toMatchObject({ page: { offset: 9990, limit: 10 } });
+    expect(narrowed.notice).toContain(
+      'Requested limit normalized to 10: offset plus limit cannot pass the 10000-result search window.',
+    );
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('10');
+    const result = await runToolContract(searchSpeechesTool, { offset: 10000, limit: 20 });
+    expectErrorTwin(
+      result,
+      'invalid_filter',
+      'Narrow text, title, person_id, activity_type or sitting dates. Restart paging at offset 0 after narrowing.',
+    );
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
   it('maps every search filter and preserves all participant and activity metadata', async () => {
     const fetcher = installToolHttp(
@@ -267,25 +278,28 @@ describe('euparl_search_speeches contract', () => {
   });
 
   it('preserves cap notice through continuation and renders the terminal page', async () => {
-    installToolHttp((url) =>
-      envelopeResponse(
-        url.searchParams.get('offset') === '100'
-          ? [{ id: 'eli/dl/event/LAST' }]
-          : Array.from({ length: 100 }, (_, i) => ({ id: `eli/dl/event/S-${i}` })),
-      ),
-    );
+    // One row more than the cap, sliced by the requested window as the upstream does.
+    const pool = [
+      ...Array.from({ length: 80 }, (_, i) => ({ id: `eli/dl/event/S-${i}` })),
+      { id: 'eli/dl/event/LAST' },
+    ];
+    const fetcher = installToolHttp((url) => {
+      const offset = Number(url.searchParams.get('offset'));
+      return envelopeResponse(pool.slice(offset, offset + Number(url.searchParams.get('limit'))));
+    });
     const first = expectSuccessTwin(await runToolContract(searchSpeechesTool, { limit: 101 }));
     expect(first).toMatchObject({
       truncated: true,
-      shown: 100,
-      cap: 100,
-      page: { next_offset: 100, limit: 100 },
+      shown: 80,
+      cap: 80,
+      page: { next_offset: 80, limit: 80 },
     });
     expect(first.notice).toBe(
-      'Requested limit normalized to the effective maximum of 100. Continue with offset 100.',
+      'Requested limit normalized to the effective maximum of 80 speeches. Continue with offset 80.',
     );
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('80');
     expect(
-      expectSuccessTwin(await runToolContract(searchSpeechesTool, { offset: 100 })),
+      expectSuccessTwin(await runToolContract(searchSpeechesTool, { offset: 80 })),
     ).toMatchObject({ items: [{ speech_id: 'LAST' }], page: { returned: 1, has_more: false } });
     installToolHttp(() => envelopeResponse([]));
     expect(
@@ -303,20 +317,32 @@ describe('euparl_search_speeches contract', () => {
     expect(data).not.toHaveProperty('speech');
   });
 
+  it.each([{ person_id: 'person/not-numeric' }, { activity_type: 'UNKNOWN' }, { language: 'xx' }])(
+    'rejects filter %j before network',
+    async (input) => {
+      const fetcher = installToolHttp(() => envelopeResponse([]));
+      expectErrorTwin(
+        await runToolContract(searchSpeechesTool, input),
+        'invalid_filter',
+        invalidHint,
+      );
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
-    { person_id: 'person/not-numeric' },
-    { activity_type: 'UNKNOWN' },
-    { language: 'xx' },
-    { sitting_date: '2025-02-30' },
-    { sitting_date_end: '2025-01-01' },
-    { sitting_date: '2025-01-31', sitting_date_end: '2025-01-01' },
-  ])('rejects filter %j before network', async (input) => {
+    [{ sitting_date: '2025-02-30' }, 'Pass an existing calendar day as YYYY-MM-DD.'],
+    [
+      { sitting_date_end: '2025-01-01' },
+      'Pass sitting_date with sitting_date_end, on or before it.',
+    ],
+    [
+      { sitting_date: '2025-01-31', sitting_date_end: '2025-01-01' },
+      'Pass sitting_date with sitting_date_end, on or before it.',
+    ],
+  ])('rejects sitting dates %j with their own recovery before network', async (input, hint) => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
-    expectErrorTwin(
-      await runToolContract(searchSpeechesTool, input),
-      'invalid_filter',
-      invalidHint,
-    );
+    expectErrorTwin(await runToolContract(searchSpeechesTool, input), 'invalid_filter', hint);
     expect(fetcher).not.toHaveBeenCalled();
   });
 

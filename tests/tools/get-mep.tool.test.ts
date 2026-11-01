@@ -201,7 +201,7 @@ describe('euparl_get_mep contract', () => {
       envelopeResponse([
         {
           id: 'person/900000001',
-          hasMembership: Array.from({ length: 101 }, (_, index) => ({ id: `membership/${index}` })),
+          hasMembership: Array.from({ length: 226 }, (_, index) => ({ id: `membership/${index}` })),
         },
       ]),
     );
@@ -212,24 +212,24 @@ describe('euparl_get_mep contract', () => {
         limit: 1000,
       }),
     );
-    expect(first.memberships).toHaveLength(100);
+    expect(first.memberships).toHaveLength(225);
     expect(first).toMatchObject({
-      totalCount: 101,
-      cap: 100,
-      page: { limit: 100, next_offset: 100 },
+      totalCount: 226,
+      cap: 225,
+      page: { limit: 225, next_offset: 225 },
     });
     expect(first.notice).toBe(
-      'Requested limit normalized to the effective maximum of 100. Continue with offset 100 and the returned snapshot.',
+      'Requested limit normalized to the effective maximum of 225 memberships. Continue with offset 225 and the returned snapshot.',
     );
     const last = expectSuccessTwin(
       await runToolContract(getMepTool, {
         mep_id: '900000001',
         section: 'memberships',
-        offset: 100,
+        offset: 225,
         snapshot: snapshotOf(first),
       }),
     );
-    expect(last.memberships).toEqual([{ id: 'membership/100' }]);
+    expect(last.memberships).toEqual([{ id: 'membership/225' }]);
   });
 
   it.each([204, 404])('returns found false for HTTP %i with discovery guidance', async (status) => {
@@ -288,7 +288,7 @@ describe('euparl_get_mep contract', () => {
     { mep_id: '' },
     { mep_id: 'https://evil.example/person/1' },
     { mep_id: '1?token=secret' },
-    { limit: 1001 },
+    { limit: 2.5 },
     { offset: -1 },
     { unknown: true },
   ])('rejects malformed fields %j', async (input) => {

@@ -218,12 +218,25 @@ export function normalizeMep(raw: RawMep) {
     ...field('political_group', raw['api:political-group']),
   };
 }
+/** Code-unit order, independent of locale. */
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+/** Dated records ascending, undated after them, then by id, then by the whole record: a total order. */
+function timelineOrder(a: { id: string; date?: string }, b: { id: string; date?: string }): number {
+  return (
+    Number(a.date === undefined) - Number(b.date === undefined) ||
+    compareText(a.date ?? '', b.date ?? '') ||
+    compareText(a.id, b.id) ||
+    compareText(JSON.stringify(a), JSON.stringify(b))
+  );
+}
 /** Historical participation fields are never joined to current membership. */
 function normalizeParticipant(raw: RawParticipation) {
   return {
     id: raw.id,
-    person_ids: canonicalIds(raw.had_participant_person, 'person'),
-    organization_ids: references(raw.had_participant_organization),
+    person_ids: canonicalIds(raw.had_participant_person, 'person').toSorted(),
+    organization_ids: references(raw.had_participant_organization).toSorted(),
     ...field('role', raw.participation_role),
     ...field('date', raw.activity_date),
     ...field('stage', raw.occured_at_stage),
@@ -232,32 +245,36 @@ function normalizeParticipant(raw: RawParticipation) {
     ...field('term_id', raw.parliamentary_term),
   };
 }
-/** Procedure sections are complete normalized collections before local paging. */
+/**
+ * Complete normalized procedure sections for local paging. The upstream returns the same
+ * records and relation arrays in varying order, so every section and nested ID array is sorted
+ * into a total order before its snapshot is hashed and sliced.
+ */
 export function normalizeProcedure(raw: RawProcedure, language: string, notices: string[]) {
-  const events = (raw.consists_of ?? []).map((event) => ({
-    id: activityId(event),
-    ...field('date', event.activity_date),
-    ...field('activity_type', event.had_activity_type),
-    ...field('stage', event.occured_at_stage),
-    document_ids: [
-      ...new Set(
-        [
-          event.decided_on_a_realization_of,
-          event.based_on_a_realization_of,
-          event.recorded_in_a_realization_of,
-          event.created_a_realization_of,
-          event.documented_by_a_realization_of,
-        ].flatMap((relation) => canonicalIds(relation, 'document')),
-      ),
-    ],
-    sitting_ids: canonicalIds(event.was_scheduled_in, 'activity'),
-  }));
-  const ids = [
-    ...new Set([
-      ...canonicalIds(raw.created_a_realization_of, 'document'),
-      ...events.flatMap((event) => event.document_ids),
-    ]),
-  ];
+  const events = (raw.consists_of ?? [])
+    .map((event) => ({
+      id: activityId(event),
+      ...field('date', event.activity_date),
+      ...field('activity_type', event.had_activity_type),
+      ...field('stage', event.occured_at_stage),
+      document_ids: [
+        ...new Set(
+          [
+            event.decided_on_a_realization_of,
+            event.based_on_a_realization_of,
+            event.recorded_in_a_realization_of,
+            event.created_a_realization_of,
+            event.documented_by_a_realization_of,
+          ].flatMap((relation) => canonicalIds(relation, 'document')),
+        ),
+      ].toSorted(),
+      sitting_ids: canonicalIds(event.was_scheduled_in, 'activity').toSorted(),
+    }))
+    .toSorted(timelineOrder);
+  const ids = new Set([
+    ...canonicalIds(raw.created_a_realization_of, 'document'),
+    ...events.flatMap((event) => event.document_ids),
+  ]);
   return {
     procedure_id: raw.process_id ?? canonicalId(raw.id, 'procedure'),
     ...field('reference', raw.label),
@@ -266,8 +283,8 @@ export function normalizeProcedure(raw: RawProcedure, language: string, notices:
     ...field('stage', raw.current_stage),
     source_url: sourceUrl(raw.id),
     events,
-    participants: toArray(raw.had_participation).map(normalizeParticipant),
-    documents: ids.map((document_id) => ({
+    participants: toArray(raw.had_participation).map(normalizeParticipant).toSorted(timelineOrder),
+    documents: [...ids].toSorted().map((document_id) => ({
       document_id,
       source_url: sourceUrl(`eli/dl/doc/${document_id}`),
     })),
@@ -381,17 +398,65 @@ export function normalizeName(value: string): string {
     .replace(/\p{M}/gu, '')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ');
 }
-/** Requested position with the default 20 and effective maximum 100 applied. */
-export function pageWindow(input: Paging): { offset: number; limit: number } {
-  return { offset: input.offset ?? 0, limit: Math.min(input.limit ?? 20, 100) };
+/**
+ * Whole-item page cap per collection, at most 92,000 characters divided by the heaviest measured
+ * `content[]` row (the larger surface), rounded down to a multiple of 25 (of 5 below 100). Claude
+ * Code's default output budget truncates a result at 100,000 characters, and `page` renders after
+ * the items, so a longer page loses its `next_offset`; the other 8,000 hold the header, page
+ * block, notices and filter echo, measured at 1,400–2,400. Voters and sittings sit below that
+ * bound. Decisions exceed it at 100: one row can carry hundreds of document IDs, so no count
+ * bounds them. Organizations stop at 20 because each ID is one paced request inside the
+ * 40-second deadline.
+ */
+export const pageCaps = {
+  procedures: { maximum: 300, noun: 'procedures' },
+  questions: { maximum: 300, noun: 'questions' },
+  documents: { maximum: 225, noun: 'documents' },
+  speeches: { maximum: 80, noun: 'speeches' },
+  meps: { maximum: 300, noun: 'MEPs' },
+  memberships: { maximum: 225, noun: 'memberships' },
+  procedure_sections: { maximum: 125, noun: 'procedure section entries' },
+  voters: { maximum: 1000, noun: 'voters' },
+  sittings: { maximum: 100, noun: 'sittings' },
+  decisions: { maximum: 100, noun: 'decisions' },
+  reference: { maximum: 350, noun: 'reference entries' },
+  organizations: { maximum: 20, noun: 'organization lookups' },
+} as const;
+/** A paged collection with its own cap. */
+export type PagedCollection = keyof typeof pageCaps;
+/** Effective whole-item position after defaults, the collection cap and any search window. */
+export interface PageWindow {
+  limit: number;
+  offset: number;
+  snapshot?: string;
+}
+/**
+ * Requested position with the default 20 and the collection cap applied. Inside an upstream
+ * result window, the limit also narrows to the results left before it; an offset at or past the
+ * window is left for the caller to reject.
+ */
+export function pageWindow(
+  input: Paging,
+  collection: PagedCollection,
+  resultWindow?: number,
+): { offset: number; limit: number } {
+  const offset = input.offset ?? 0;
+  const limit = Math.min(input.limit ?? 20, pageCaps[collection].maximum);
+  return {
+    offset,
+    limit:
+      resultWindow !== undefined && offset < resultWindow
+        ? Math.min(limit, resultWindow - offset)
+        : limit,
+  };
 }
 /** Local snapshots include normalized scope and every returned field before slicing. */
 export function localPage<T>(
   items: T[],
-  input: Paging,
+  input: PageWindow,
   scope: unknown,
 ): { items: T[]; page: Page; total: number } {
-  const { offset, limit } = pageWindow(input);
+  const { offset, limit } = input;
   if (offset > 0 && !input.snapshot)
     throw validationError('Local continuation requires the previous page snapshot.', {
       reason: 'invalid_mode_fields',
@@ -411,11 +476,11 @@ export function localPage<T>(
 /** Preserve uncertain totals and omit inaccessible continuation at an upstream result window. */
 export function upstreamPage(
   returned: number,
-  input: Paging,
+  input: PageWindow,
   total?: number,
   resultWindow?: number,
 ): Page {
-  const { offset, limit } = pageWindow(input);
+  const { offset, limit } = input;
   const exactTotal =
     resultWindow !== undefined && total !== undefined && total >= resultWindow ? undefined : total;
   const atWindow =

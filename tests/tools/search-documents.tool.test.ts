@@ -95,17 +95,29 @@ describe('euparl_search_documents contract', () => {
     expect(data).toMatchObject({ truncated: true, page: { has_more: true } });
     expect(data).not.toHaveProperty('totalCount');
     expect(data.page).not.toHaveProperty('next_offset');
-    expectErrorTwin(
+    const narrowed = expectSuccessTwin(
       await runToolContract(searchDocumentsTool, { offset: 9990, limit: 20 }),
-      'invalid_filter',
-      invalidHint,
     );
-    expect(
-      expectSuccessTwin(
-        await runToolContract(searchDocumentsTool, { source: 'plenary', offset: 9990, limit: 20 }),
-      ),
-    ).toMatchObject({ items: [{ document_id: 'LAST' }], totalCount: 10000 });
-    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(narrowed).toMatchObject({ page: { offset: 9990, limit: 10 } });
+    expect(narrowed.notice).toContain(
+      'Requested limit normalized to 10: offset plus limit cannot pass the 10000-result search window.',
+    );
+    expect(new URL(String(fetcher.mock.calls[1]?.[0])).searchParams.get('limit')).toBe('10');
+    expectErrorTwin(
+      await runToolContract(searchDocumentsTool, { offset: 10000, limit: 20 }),
+      'invalid_filter',
+      'Narrow text, title, year, term, work_type, sitting dates or related_process_id. Restart paging at offset 0 after narrowing.',
+    );
+    const plenary = expectSuccessTwin(
+      await runToolContract(searchDocumentsTool, { source: 'plenary', offset: 9990, limit: 20 }),
+    );
+    expect(plenary).toMatchObject({
+      items: [{ document_id: 'LAST' }],
+      totalCount: 10000,
+      page: { limit: 20 },
+    });
+    expect(plenary.notice).toBe('Continue with offset 9991.');
+    expect(fetcher).toHaveBeenCalledTimes(3);
   });
   it.each([
     ['adopted_texts', 'adopted-texts', 'text_adopted', { year: 2025, term: 10 }],
@@ -277,13 +289,12 @@ describe('euparl_search_documents contract', () => {
   });
 
   it('discloses fallback language and renders the effective cap, continuation and end page', async () => {
-    const fetcher = installToolHttp((url) =>
-      envelopeResponse(
-        url.searchParams.get('offset') === '100'
-          ? []
-          : Array.from({ length: 100 }, (_, i) => ({ id: `eli/dl/doc/D-${i}` })),
-      ),
-    );
+    // One row more than the cap, sliced by the requested window as the upstream does.
+    const pool = Array.from({ length: 226 }, (_, i) => ({ id: `eli/dl/doc/D-${i}` }));
+    const fetcher = installToolHttp((url) => {
+      const offset = Number(url.searchParams.get('offset'));
+      return envelopeResponse(pool.slice(offset, offset + Number(url.searchParams.get('limit'))));
+    });
     const first = expectSuccessTwin(
       await runToolContract(searchDocumentsTool, {
         limit: 1000,
@@ -295,18 +306,25 @@ describe('euparl_search_documents contract', () => {
       }),
     );
     expect(first).toMatchObject({
-      page: { limit: 100, returned: 100, next_offset: 100 },
+      page: { limit: 225, returned: 225, next_offset: 225 },
       truncated: true,
-      shown: 100,
-      cap: 100,
+      shown: 225,
+      cap: 225,
     });
     expect(first.notice).toBe(
-      'Requested limit normalized to the effective maximum of 100. Continue with offset 100.',
+      'Requested limit normalized to the effective maximum of 225 documents. Continue with offset 225.',
     );
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('225');
     expect(
-      expectSuccessTwin(await runToolContract(searchDocumentsTool, { offset: 100 })),
-    ).toMatchObject({ items: [], page: { offset: 100, returned: 0, has_more: false } });
-    expect(fetcher).toHaveBeenCalledTimes(2);
+      expectSuccessTwin(await runToolContract(searchDocumentsTool, { offset: 225 })),
+    ).toMatchObject({
+      items: [{ document_id: 'D-225' }],
+      page: { offset: 225, returned: 1, has_more: false },
+    });
+    expect(
+      expectSuccessTwin(await runToolContract(searchDocumentsTool, { offset: 500 })),
+    ).toMatchObject({ items: [], page: { offset: 500, returned: 0, has_more: false } });
+    expect(fetcher).toHaveBeenCalledTimes(3);
     installToolHttp(() => envelopeResponse([documentRecord]));
     const fallback = expectSuccessTwin(
       await runToolContract(searchDocumentsTool, {
@@ -341,8 +359,6 @@ describe('euparl_search_documents contract', () => {
     { source: 'plenary', title: 'ignored' },
     { source: 'committee', sitting_date: '2025-01-01' },
     { source: 'plenary', related_process_id: '2025-0001' },
-    { sitting_date: '2025-02-30' },
-    { sitting_date_end: '2025-01-01' },
     { work_type: 'UNKNOWN' },
     { language: 'xx' },
   ] as const)('rejects unsupported filter %j before network', async (input) => {
@@ -354,6 +370,26 @@ describe('euparl_search_documents contract', () => {
     );
     expect(fetcher).not.toHaveBeenCalled();
   });
+
+  it.each([
+    [{ sitting_date: '2024-02-30' }, 'Pass an existing calendar day as YYYY-MM-DD.'],
+    [
+      { sitting_date_end: '2025-01-01' },
+      'Pass sitting_date with sitting_date_end, on or before it.',
+    ],
+  ] as const)(
+    'rejects sitting dates %j with their own recovery before network',
+    async (input, hint) => {
+      const fetcher = installToolHttp(() => envelopeResponse([]));
+      expectErrorTwin(
+        await runToolContract(searchDocumentsTool, input),
+        'invalid_filter',
+        hint,
+        JsonRpcErrorCode.ValidationError,
+      );
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     { mode: 'get' },

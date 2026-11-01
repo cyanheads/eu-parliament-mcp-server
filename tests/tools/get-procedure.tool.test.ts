@@ -62,6 +62,86 @@ const procedure = {
     { id: 'eli/dl/participation/EXAMPLE-2', had_participant_person: ['person/900000002'] },
   ],
 };
+const reorder = <T>(items: T[], reverse: boolean) => (reverse ? items.toReversed() : items);
+/** The same records in upstream order, or with every top-level and nested array reversed. */
+const reorderingProcedure = (reverse: boolean) => ({
+  id: 'eli/dl/proc/2025-9002',
+  process_id: '2025-9002',
+  created_a_realization_of: reorder(['eli/dl/doc/DOC-9', 'eli/dl/doc/DOC-5'], reverse),
+  consists_of: reorder(
+    [
+      {
+        id: 'eli/dl/event/EV-C',
+        activity_id: 'EV-C',
+        activity_date: '2025-03-01',
+        based_on_a_realization_of: reorder(
+          ['eli/dl/doc/DOC-3', 'eli/dl/doc/DOC-1', 'eli/dl/doc/DOC-2'],
+          reverse,
+        ),
+      },
+      {
+        id: 'eli/dl/event/EV-A',
+        activity_id: 'EV-A',
+        recorded_in_a_realization_of: ['eli/dl/doc/DOC-4'],
+      },
+      {
+        id: 'eli/dl/event/EV-B',
+        activity_id: 'EV-B',
+        activity_date: '2024-12-01',
+        was_scheduled_in: reorder(['eli/dl/event/MTG-2', 'eli/dl/event/MTG-1'], reverse),
+      },
+      { id: 'eli/dl/event/EV-D', activity_id: 'EV-D', activity_date: '2024-12-01' },
+    ],
+    reverse,
+  ),
+  had_participation: reorder(
+    [
+      {
+        id: 'eli/dl/participation/P-2',
+        activity_date: '2024-05-01',
+        had_participant_person: reorder(['person/900000002', 'person/900000001'], reverse),
+        had_participant_organization: reorder(['org/B', 'org/A'], reverse),
+      },
+      { id: 'eli/dl/participation/P-3', had_participant_person: ['person/900000003'] },
+      { id: 'eli/dl/participation/P-1', activity_date: '2024-05-01' },
+      { id: 'eli/dl/participation/P-0', activity_date: '2023-01-01' },
+    ],
+    reverse,
+  ),
+});
+const sortedSections = {
+  events: [
+    { id: 'EV-B', date: '2024-12-01', document_ids: [], sitting_ids: ['MTG-1', 'MTG-2'] },
+    { id: 'EV-D', date: '2024-12-01', document_ids: [], sitting_ids: [] },
+    { id: 'EV-C', date: '2025-03-01', document_ids: ['DOC-1', 'DOC-2', 'DOC-3'], sitting_ids: [] },
+    { id: 'EV-A', document_ids: ['DOC-4'], sitting_ids: [] },
+  ],
+  participants: [
+    {
+      id: 'eli/dl/participation/P-0',
+      date: '2023-01-01',
+      person_ids: [],
+      organization_ids: [],
+    },
+    {
+      id: 'eli/dl/participation/P-1',
+      date: '2024-05-01',
+      person_ids: [],
+      organization_ids: [],
+    },
+    {
+      id: 'eli/dl/participation/P-2',
+      date: '2024-05-01',
+      person_ids: ['900000001', '900000002'],
+      organization_ids: ['org/A', 'org/B'],
+    },
+    { id: 'eli/dl/participation/P-3', person_ids: ['900000003'], organization_ids: [] },
+  ],
+  documents: ['DOC-1', 'DOC-2', 'DOC-3', 'DOC-4', 'DOC-5', 'DOC-9'].map((document_id) => ({
+    document_id,
+    source_url: `https://data.europarl.europa.eu/eli/dl/doc/${document_id}`,
+  })),
+};
 const snapshotOf = (data: Record<string, unknown>) =>
   z.object({ snapshot: z.string() }).parse(data.page).snapshot;
 afterEach(() => vi.useRealTimers());
@@ -205,8 +285,37 @@ describe('euparl_get_procedure contract', () => {
     },
   );
 
+  it.each(['events', 'participants', 'documents'] as const)(
+    'keeps the %s snapshot and pages every record once when upstream reorders between calls',
+    async (section) => {
+      const fetcher = installToolHttp((_url, _init, index) =>
+        envelopeResponse([reorderingProcedure(index % 2 === 1)]),
+      );
+      const records: unknown[] = [];
+      let snapshot: string | undefined;
+      let offset: number | undefined = 0;
+      while (offset !== undefined) {
+        const data = expectSuccessTwin(
+          await runToolContract(getProcedureTool, {
+            procedure_id: '2025-9002',
+            section,
+            limit: 2,
+            offset,
+            ...(snapshot !== undefined && { snapshot }),
+          }),
+        );
+        snapshot ??= snapshotOf(data);
+        expect(snapshotOf(data)).toBe(snapshot);
+        records.push(...z.array(z.unknown()).parse(data[section]));
+        offset = z.object({ next_offset: z.number().optional() }).parse(data.page).next_offset;
+      }
+      expect(records).toEqual(sortedSections[section]);
+      expect(fetcher.mock.calls.length).toBe(Math.ceil(sortedSections[section].length / 2));
+    },
+  );
+
   it('caps whole events and retains cap notice alongside snapshot continuation', async () => {
-    const events = Array.from({ length: 101 }, (_, index) => ({
+    const events = Array.from({ length: 126 }, (_, index) => ({
       id: `eli/dl/event/EXAMPLE-${index}`,
     }));
     installToolHttp(() => envelopeResponse([{ id: procedure.id, consists_of: events }]));
@@ -217,15 +326,15 @@ describe('euparl_get_procedure contract', () => {
         limit: 1000,
       }),
     );
-    expect(data.events).toHaveLength(100);
+    expect(data.events).toHaveLength(125);
     expect(data).toMatchObject({
-      page: { limit: 100, returned: 100, next_offset: 100 },
-      totalCount: 101,
-      cap: 100,
-      shown: 100,
+      page: { limit: 125, returned: 125, next_offset: 125 },
+      totalCount: 126,
+      cap: 125,
+      shown: 125,
     });
     expect(data.notice).toBe(
-      'Requested limit normalized to the effective maximum of 100. Continue with offset 100 and the returned snapshot.',
+      'Requested limit normalized to the effective maximum of 125 procedure section entries. Continue with offset 125 and the returned snapshot.',
     );
   });
 

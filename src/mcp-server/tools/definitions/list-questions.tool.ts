@@ -96,7 +96,7 @@ export const listQuestionsTool = tool('euparl_list_questions', {
         'List-only question code from euparl_list_reference topic question_types; case-insensitive and whitespace-trimmed.',
       ),
       question_id: optionalString().describe(
-        'Get-only canonical E-{term}-{year}-{six-digit-sequence}, known document prefix/public URI, or human E-NNNNNN/YYYY citation; corresponding P/O prefixes are accepted.',
+        'Get-only canonical E-{term}-{year}-{six-digit-sequence}, known document prefix/public URI, or human E-NNNNNN/YYYY citation; P, O, G and K prefixes are accepted the same way.',
       ),
       term: z
         .number()
@@ -107,7 +107,7 @@ export const listQuestionsTool = tool('euparl_list_questions', {
         .describe(
           'Get-only term 0–10 to disambiguate a human citation; must agree with a canonical ID. Omit to verify candidates for every term overlapping the citation year.',
         ),
-      ...pagingInputFields,
+      ...pagingInputFields('questions'),
     })
     .strict(),
   output: z

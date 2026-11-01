@@ -10,7 +10,11 @@ import {
   expectSuccessTwin,
   installToolHttp,
 } from '../helpers/eu-parliament-contract.js';
-import { envelopeResponse, rosterRecords } from '../helpers/eu-parliament-fixtures.js';
+import {
+  envelopeResponse,
+  maltaOn20240313,
+  rosterRecords,
+} from '../helpers/eu-parliament-fixtures.js';
 
 const invalidHint =
   'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
@@ -23,6 +27,8 @@ const stalledHint =
 const rejectedHint =
   'Call euparl_list_reference for supported filters and identifiers, then retry with a narrower supported request.';
 const rateHint = 'Wait for the reported retry interval, then repeat the same euparl tool call.';
+const nameHint =
+  'Include at least one letter or digit in name_contains, or omit name_contains to browse the roster.';
 const snapshotOf = (data: Record<string, unknown>) =>
   z.object({ snapshot: z.string() }).parse(data.page).snapshot;
 afterEach(() => vi.useRealTimers());
@@ -165,31 +171,136 @@ describe('euparl_search_meps contract', () => {
     });
   });
 
-  it('routes equivalent filters while preserving historical published group identities', async () => {
-    const fetcher = installToolHttp(() =>
-      envelopeResponse([
-        {
-          id: 'person/900000003',
-          label: 'Historical member',
-          'api:country-of-representation': 'UK',
-          'api:political-group': 'PPE-DE',
-        },
-      ]),
+  it.each([' gb ', 'UK'])(
+    'routes United Kingdom input %j as GB while preserving historical published group identities',
+    async (country) => {
+      const fetcher = installToolHttp(() =>
+        envelopeResponse([
+          {
+            id: 'person/900000003',
+            label: 'Historical member',
+            'api:country-of-representation': 'GB',
+            'api:political-group': 'PPE-DE',
+          },
+        ]),
+      );
+      const data = expectSuccessTwin(
+        await runToolContract(searchMepsTool, {
+          country,
+          political_group: ' epp ',
+          term: 6,
+        }),
+      );
+      expect(data).toMatchObject({
+        appliedFilters: { country: 'GB', political_group: 'PPE', term: 6 },
+        items: [{ mep_id: '900000003', country: 'GB', political_group: 'PPE-DE' }],
+      });
+      const url = new URL(String(fetcher.mock.calls[0]?.[0]));
+      expect(url.searchParams.get('country-of-representation')).toBe('GB');
+      expect(url.searchParams.get('political-group')).toBe('PPE');
+    },
+  );
+
+  it('rejects a name_contains without letters or digits on both surfaces before HTTP', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse(rosterRecords));
+    const result = await runToolContract(searchMepsTool, { name_contains: '!!!', limit: 1 });
+    expectErrorTwin(result, 'invalid_filter', nameHint, JsonRpcErrorCode.ValidationError);
+    expect(contractText(result)).toContain(
+      'name_contains has no letter or digit after case, diacritic, and punctuation normalization.',
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('lists a dated roster through both surfaces', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-01T12:00:00Z'));
+    const fetcher = installToolHttp((url) =>
+      envelopeResponse(
+        url.searchParams.get('mandate-date') === '2024-03-13' ? maltaOn20240313.slice(0, 3) : [],
+      ),
     );
     const data = expectSuccessTwin(
       await runToolContract(searchMepsTool, {
-        country: ' gb ',
-        political_group: ' epp ',
-        term: 6,
+        mandate_date: '2024-03-13',
+        country: 'MT',
+        limit: 2,
       }),
     );
     expect(data).toMatchObject({
-      appliedFilters: { country: 'UK', political_group: 'PPE', term: 6 },
-      items: [{ mep_id: '900000003', country: 'UK', political_group: 'PPE-DE' }],
+      items: [
+        {
+          mep_id: '197394',
+          name: 'Josianne CUTAJAR',
+          given_name: 'Josianne',
+          family_name: 'Cutajar',
+          country: 'MT',
+          political_group: 'S&D',
+        },
+        { mep_id: '118859', name: 'Roberta METSOLA', political_group: 'PPE' },
+      ],
+      totalCount: 3,
+      appliedFilters: {
+        scope: 'mandate_date',
+        mandate_date: '2024-03-13',
+        language: 'en',
+        country: 'MT',
+      },
+      page: { returned: 2, next_offset: 2 },
     });
+    expect(data.appliedFilters).not.toHaveProperty('as_of');
     const url = new URL(String(fetcher.mock.calls[0]?.[0]));
-    expect(url.searchParams.get('country-of-representation')).toBe('UK');
-    expect(url.searchParams.get('political-group')).toBe('PPE');
+    expect(url.pathname).toBe('/api/v2/meps/show-current');
+    expect(url.searchParams.get('mandate-date')).toBe('2024-03-13');
+  });
+
+  it.each([
+    [{ term: 10, mandate_date: '2024-03-13' }, 'invalid_mode_fields', modeHint],
+    [
+      { mandate_date: '2026-11-02' },
+      'invalid_filter',
+      'Use a mandate_date on or before 2026-11-01, or omit mandate_date for members in office today.',
+    ],
+    [
+      { mandate_date: '2024-02-30' },
+      'invalid_filter',
+      'Pass an existing calendar day as YYYY-MM-DD.',
+    ],
+  ] as const)('rejects %j as %s on both surfaces before HTTP', async (input, reason, hint) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-01T12:00:00Z'));
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    expectErrorTwin(
+      await runToolContract(searchMepsTool, input),
+      reason,
+      hint,
+      JsonRpcErrorCode.ValidationError,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('explains date-bound group codes on both surfaces when a dated group search is empty', async () => {
+    const fetcher = installToolHttp(() => new Response(null, { status: 204 }));
+    const data = expectSuccessTwin(
+      await runToolContract(searchMepsTool, {
+        mandate_date: '2016-03-09',
+        political_group: 'GUE/NGL',
+      }),
+    );
+    expect(data).toMatchObject({
+      items: [],
+      totalCount: 0,
+      appliedFilters: {
+        scope: 'mandate_date',
+        mandate_date: '2016-03-09',
+        political_group: 'THE-LEFT',
+      },
+    });
+    expect(data.notice).toBe(
+      "No MEPs matched. Remove name_contains to browse, relax country or political_group, or call euparl_list_reference with topic mep_filters. On a mandate_date roster, political_group matches only the group code in force on that date; omit political_group and read each member's published political_group.",
+    );
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('political-group')).toBe(
+      'THE-LEFT',
+    );
   });
 
   it('renders the canonical code list on both invalid-filter surfaces before HTTP', async () => {
@@ -229,25 +340,25 @@ describe('euparl_search_meps contract', () => {
   });
 
   it('caps whole records and preserves special name data on both surfaces', async () => {
-    const rows = Array.from({ length: 101 }, (_, index) => ({
+    const rows = Array.from({ length: 301 }, (_, index) => ({
       id: `person/${900000000 + index}`,
       label: index === 0 ? '**name** `code`\n[link](https://example.org) \\ end' : 'Example',
     }));
     installToolHttp(() => envelopeResponse(rows));
     const data = expectSuccessTwin(await runToolContract(searchMepsTool, { term: 9, limit: 1000 }));
-    expect(data.items).toHaveLength(100);
+    expect(data.items).toHaveLength(300);
     expect(data.items).toEqual(
       expect.arrayContaining([
         { mep_id: '900000000', name: '**name** `code`\n[link](https://example.org) \\ end' },
       ]),
     );
     expect(data).toMatchObject({
-      totalCount: 101,
-      page: { limit: 100, next_offset: 100 },
-      cap: 100,
+      totalCount: 301,
+      page: { limit: 300, next_offset: 300 },
+      cap: 300,
     });
     expect(data.notice).toBe(
-      'Requested limit normalized to the effective maximum of 100. Continue with offset 100 and the returned snapshot.',
+      'Requested limit normalized to the effective maximum of 300 MEPs. Continue with offset 300 and the returned snapshot.',
     );
   });
 
@@ -278,7 +389,7 @@ describe('euparl_search_meps contract', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it.each([{ term: 11 }, { offset: -1 }, { limit: 0 }, { limit: 1001 }, { unexpected: true }])(
+  it.each([{ term: 11 }, { offset: -1 }, { limit: 0 }, { limit: 2.5 }, { unexpected: true }])(
     'rejects schema-invalid fields %j',
     async (input) => {
       const fetcher = installToolHttp(() => envelopeResponse([]));

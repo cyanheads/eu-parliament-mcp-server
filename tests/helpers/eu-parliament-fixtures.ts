@@ -22,6 +22,76 @@ export const rosterRecords = [
   },
 ];
 
+/** Live capture from 2026-11-01: meps/show-current?mandate-date=2024-03-13&country-of-representation=MT. */
+export const maltaOn20240313 = [
+  {
+    id: 'person/118859',
+    type: 'Person',
+    identifier: '118859',
+    label: 'Roberta METSOLA',
+    familyName: 'Metsola',
+    givenName: 'Roberta',
+    sortLabel: 'METSOLA',
+    'api:country-of-representation': 'MT',
+    'api:political-group': 'PPE',
+  },
+  {
+    id: 'person/124781',
+    type: 'Person',
+    identifier: '124781',
+    label: 'Alfred SANT',
+    familyName: 'Sant',
+    givenName: 'Alfred',
+    sortLabel: 'SANT',
+    'api:country-of-representation': 'MT',
+    'api:political-group': 'S&D',
+  },
+  {
+    id: 'person/197394',
+    type: 'Person',
+    identifier: '197394',
+    label: 'Josianne CUTAJAR',
+    familyName: 'Cutajar',
+    givenName: 'Josianne',
+    sortLabel: 'CUTAJAR',
+    'api:country-of-representation': 'MT',
+    'api:political-group': 'S&D',
+  },
+  {
+    id: 'person/197403',
+    type: 'Person',
+    identifier: '197403',
+    label: 'Alex AGIUS SALIBA',
+    familyName: 'Agius Saliba',
+    givenName: 'Alex',
+    sortLabel: 'AGIUSSALIBA',
+    'api:country-of-representation': 'MT',
+    'api:political-group': 'S&D',
+  },
+  {
+    id: 'person/209091',
+    type: 'Person',
+    identifier: '209091',
+    label: 'Cyrus ENGERER',
+    familyName: 'Engerer',
+    givenName: 'Cyrus',
+    sortLabel: 'ENGERER',
+    'api:country-of-representation': 'MT',
+    'api:political-group': 'S&D',
+  },
+  {
+    id: 'person/28122',
+    type: 'Person',
+    identifier: '28122',
+    label: 'David CASA',
+    familyName: 'Casa',
+    givenName: 'David',
+    sortLabel: 'CASA',
+    'api:country-of-representation': 'MT',
+    'api:political-group': 'PPE',
+  },
+];
+
 /** Embedded expressions contain multiple manifestations of each selected language. */
 export const documentRecord = {
   id: 'eli/dl/doc/AFCO-AD-900001',

@@ -95,7 +95,7 @@ export const searchSpeechesTool = tool('euparl_search_speeches', {
       sitting_date_end: optionalString().describe(
         'Search-only inclusive end date YYYY-MM-DD; requires sitting_date and cannot precede it.',
       ),
-      ...pagingInputFields,
+      ...pagingInputFields('speeches'),
     })
     .strict(),
   output: z
@@ -119,7 +119,7 @@ export const searchSpeechesTool = tool('euparl_search_speeches', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'An activity code, identifier, language or date range is unsupported, or offset plus effective limit exceeds the 10000-result search window.',
+      when: 'An activity code, identifier, language or date range is unsupported, or offset is 10000 or more, past the 10000-result search window.',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
       thrownBy: 'service',

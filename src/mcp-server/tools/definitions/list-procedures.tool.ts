@@ -37,7 +37,7 @@ export const listProceduresTool = tool('euparl_list_procedures', {
       process_type: optionalString().describe(
         'Optional procedure-type code from euparl_list_reference topic procedure_types; case-insensitive and whitespace-trimmed.',
       ),
-      ...pagingInputFields,
+      ...pagingInputFields('procedures'),
     })
     .strict(),
   output: z
@@ -52,7 +52,7 @@ export const listProceduresTool = tool('euparl_list_procedures', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A nonblank procedure type or language is unsupported, or offset plus effective limit exceeds the 10000-result search window.',
+      when: 'A nonblank procedure type or language is unsupported, or offset is 10000 or more, past the 10000-result search window.',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
       thrownBy: 'service',

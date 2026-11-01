@@ -12,12 +12,21 @@
   "repository": "https://github.com/cyanheads/eu-parliament-mcp-server",
   "license": "Apache-2.0",
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "ai-tools", "typescript", "bun", "stdio", "streamable-http", "cyanheads", "european-parliament", "european-union", "legislation", "roll-call-votes", "meps", "open-data"],
+  "userConfig": {
+    "EUPARL_CLAMP_LIMITS": {
+      "type": "string",
+      "title": "Clamp limit inputs",
+      "description": "Clamp a limit above its collection's page cap to that cap with a notice (default when blank). Set false to reject a limit above the tool's largest cap instead.",
+      "default": ""
+    }
+  },
   "mcpServers": {
     "eu-parliament-mcp-server": {
       "command": "npx",
       "args": ["-y", "@cyanheads/eu-parliament-mcp-server"],
       "env": {
-        "MCP_TRANSPORT_TYPE": "stdio"
+        "MCP_TRANSPORT_TYPE": "stdio",
+        "EUPARL_CLAMP_LIMITS": "${user_config.EUPARL_CLAMP_LIMITS}"
       }
     }
   }

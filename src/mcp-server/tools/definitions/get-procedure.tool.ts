@@ -25,11 +25,11 @@ const eventSchema = z
     stage: z.string().optional().describe('Published event stage.'),
     document_ids: z
       .array(z.string().describe('Canonical related document identifier.'))
-      .describe('Explicit event document relations, deduplicated in first-seen order.'),
+      .describe('Explicit event document relations, deduplicated and sorted by identifier.'),
     sitting_ids: z
       .array(z.string().describe('Canonical scheduled sitting identifier.'))
       .describe(
-        'Explicit scheduled sitting relations; when absent, a published vote-event date can select a sitting for euparl_get_plenary_votes decisions with document_id.',
+        'Explicit scheduled sitting relations, sorted by identifier; when absent, a published vote-event date can select a sitting for euparl_get_plenary_votes decisions with document_id.',
       ),
   })
   .strict()
@@ -39,10 +39,10 @@ const participantSchema = z
     id: z.string().describe('Published participation identity.'),
     person_ids: z
       .array(z.string().describe('Canonical person identifier.'))
-      .describe('Explicit participating people.'),
+      .describe('Explicit participating people, sorted by identifier.'),
     organization_ids: z
       .array(z.string().describe('Published organization identity.'))
-      .describe('Explicit participating organizations.'),
+      .describe('Explicit participating organizations, sorted by identifier.'),
     role: z.string().optional().describe('Published historical participation role.'),
     date: z.string().optional().describe('Published participation date.'),
     stage: z.string().optional().describe('Published participation stage.'),
@@ -93,7 +93,7 @@ export const getProcedureTool = tool('euparl_get_procedure', {
         .describe(
           'Default overview returns scalars and counts; choose a collection for complete paged items.',
         ),
-      ...pagingInputFields,
+      ...pagingInputFields('procedure_sections'),
       snapshot: optionalString().describe(
         'Previous collection snapshot; required for local offset above 0, optional at offset 0.',
       ),
@@ -132,15 +132,21 @@ export const getProcedureTool = tool('euparl_get_procedure', {
       events: z
         .array(eventSchema)
         .optional()
-        .describe('Selected event page, present only for the events section.'),
+        .describe(
+          'Selected event page in date order, undated events last and ties by id; present only for the events section.',
+        ),
       participants: z
         .array(participantSchema)
         .optional()
-        .describe('Selected historical participation page, present only for participants.'),
+        .describe(
+          'Selected historical participation page in date order, undated participations last and ties by id; present only for participants.',
+        ),
       documents: z
         .array(documentSchema)
         .optional()
-        .describe('Selected deduplicated linked-document page, present only for documents.'),
+        .describe(
+          'Selected deduplicated linked-document page sorted by document_id; present only for documents.',
+        ),
       page: pageSchema
         .optional()
         .describe('Selected collection continuation; absent on overview or missing detail.'),

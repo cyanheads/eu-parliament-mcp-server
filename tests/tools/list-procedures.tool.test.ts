@@ -16,6 +16,21 @@ const invalidHint =
 const rejectedHint =
   'Call euparl_list_reference for supported filters and identifiers, then retry with a narrower supported request.';
 const rateHint = 'Wait for the reported retry interval, then repeat the same euparl tool call.';
+const windowHint =
+  'Narrow process_type to retrieve a smaller procedure set. Restart paging at offset 0 after narrowing.';
+const typedWindowHint =
+  'process_type is the only procedure filter, so no narrower procedure set exists. Restart at offset 0 with the same process_type and follow page.next_offset.';
+/** Upstream procedure page honoring the requested offset and limit, total past the window. */
+const procedurePage = (url: URL) => {
+  const offset = Number(url.searchParams.get('offset'));
+  const limit = Number(url.searchParams.get('limit'));
+  return Response.json({
+    data: Array.from({ length: limit }, (_, index) => ({
+      id: `eli/dl/proc/2025-${String(offset + index).padStart(4, '0')}`,
+    })),
+    meta: { total: 20000 },
+  });
+};
 afterEach(() => vi.useRealTimers());
 
 describe('euparl_list_procedures contract', () => {
@@ -35,10 +50,76 @@ describe('euparl_list_procedures contract', () => {
     expectErrorTwin(
       await runToolContract(listProceduresTool, { offset: 10000, limit: 1 }),
       'invalid_filter',
-      invalidHint,
+      windowHint,
     );
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
+  it('routes a past-window offset with process_type set back to offset 0 before HTTP', async () => {
+    const fetcher = installToolHttp(procedurePage);
+    expectErrorTwin(
+      await runToolContract(listProceduresTool, { process_type: 'cod', offset: 10000 }),
+      'invalid_filter',
+      typedWindowHint,
+      JsonRpcErrorCode.ValidationError,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+  const narrowRoute = 'Narrow process_type to retrieve a smaller procedure set.';
+  const typedRoute =
+    'process_type is the only procedure filter, so no narrower procedure set exists.';
+  it.each([
+    [{}, narrowRoute, typedRoute],
+    [{ process_type: 'COD' }, typedRoute, narrowRoute],
+  ])('states the exhausted-window route for %j on both surfaces', async (filter, route, other) => {
+    installToolHttp(procedurePage);
+    const data = expectSuccessTwin(
+      await runToolContract(listProceduresTool, { ...filter, offset: 9900, limit: 1000 }),
+    );
+    expect(data.page).not.toHaveProperty('next_offset');
+    expect(data.notice).toContain(
+      `The 10000-result search window is exhausted; further matches cannot be ruled out. ${route}`,
+    );
+    expect(data.notice).not.toContain(other);
+  });
+  it('returns a full 300-row page with the cap notice on both surfaces for limit 5000', async () => {
+    const fetcher = installToolHttp(procedurePage);
+    const result = await runToolContract(listProceduresTool, { process_type: 'COD', limit: 5000 });
+    const data = expectSuccessTwin(result);
+    expect(data.items).toHaveLength(300);
+    expect(data).toMatchObject({
+      page: { offset: 0, limit: 300, returned: 300, has_more: true, next_offset: 300 },
+      cap: 300,
+      shown: 300,
+    });
+    expect(data.notice).toContain(
+      'Requested limit normalized to the effective maximum of 300 procedures.',
+    );
+    expect(contractText(result)).toContain(
+      'Requested limit normalized to the effective maximum of 300 procedures.',
+    );
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('300');
+  });
+  it.each([
+    [9900, 100],
+    [9950, 50],
+  ])(
+    'narrows offset %i with limit 1000 to the %i rows left in the window',
+    async (offset, rows) => {
+      const fetcher = installToolHttp(procedurePage);
+      const result = await runToolContract(listProceduresTool, { offset, limit: 1000 });
+      const data = expectSuccessTwin(result);
+      expect(data.items).toHaveLength(rows);
+      expect(data).toMatchObject({ page: { offset, limit: rows, returned: rows, has_more: true } });
+      expect(data.page).not.toHaveProperty('next_offset');
+      expect(data.notice).toContain(
+        `Requested limit normalized to ${rows}: offset plus limit cannot pass the 10000-result search window.`,
+      );
+      expect(data.notice).toContain('The 10000-result search window is exhausted');
+      expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe(
+        String(rows),
+      );
+    },
+  );
   it('normalizes type aliases and renders exact sparse records plus active source links', async () => {
     const reference = '2025/9001(COD) `quoted`\n**literal markdown**';
     const fetcher = installToolHttp(
@@ -78,14 +159,16 @@ describe('euparl_list_procedures contract', () => {
           source_url: 'https://data.europarl.europa.eu/eli/dl/proc/2025-9002',
         },
       ],
-      page: { limit: 100, returned: 2, has_more: false },
+      page: { limit: 300, returned: 2, has_more: false },
       appliedFilters: { process_type: 'COD' },
       totalCount: 2,
     });
-    expect(data.notice).toBe('Requested limit normalized to the effective maximum of 100.');
+    expect(data.notice).toBe(
+      'Requested limit normalized to the effective maximum of 300 procedures.',
+    );
     const url = new URL(String(fetcher.mock.calls[0]?.[0]));
     expect(url.searchParams.get('process-type')).toBe('COD');
-    expect(url.searchParams.get('limit')).toBe('100');
+    expect(url.searchParams.get('limit')).toBe('300');
     expect(data.items).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ title: expect.anything() })]),
     );

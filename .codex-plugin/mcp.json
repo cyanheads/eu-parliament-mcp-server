@@ -4,6 +4,7 @@
     "args": ["-y", "@cyanheads/eu-parliament-mcp-server"],
     "env": {
       "MCP_TRANSPORT_TYPE": "stdio"
-    }
+    },
+    "env_vars": ["EUPARL_CLAMP_LIMITS"]
   }
 }

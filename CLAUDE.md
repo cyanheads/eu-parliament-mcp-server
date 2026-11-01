@@ -52,15 +52,15 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ### Server identity and configuration
 
-`src/index.ts` registers nine tools and no resources or prompts. Both `createApp()` name and title are `eu-parliament-mcp-server`; the package description comes from `package.json`. The install name is `@cyanheads/eu-parliament-mcp-server` and registry identity is `io.github.cyanheads/eu-parliament-mcp-server`.
+`src/index.ts` registers nine tools and no resource or prompt definitions; `createApp({ skills: 'skills' })` serves the published `skills/eu-parliament-guide` as `skill://eu-parliament-guide/SKILL.md`. Keep that skill in step when identifier chains, gates, or coverage change. Both `createApp()` name and title are `eu-parliament-mcp-server`; the package description comes from `package.json`. The install name is `@cyanheads/eu-parliament-mcp-server` and registry identity is `io.github.cyanheads/eu-parliament-mcp-server`.
 
-The upstream API is keyless. There is no server-specific environment schema or base-URL override. Use the framework settings in `.env.example`. The app declares `sessionMode: 'stateless'`; an explicit `MCP_SESSION_MODE` overrides it.
+The upstream API is keyless, with no base-URL override. `src/config/server-config.ts` parses the one server variable, `EUPARL_CLAMP_LIMITS`, in `setup()`; the `limit` schema reads it per call and per `tools/list` emission, never at import, because `.env` loads inside `createApp()`. Otherwise use the framework settings in `.env.example`. The app declares `sessionMode: 'stateless'`; an explicit `MCP_SESSION_MODE` overrides it.
 
 ### Domain invariants
 
 - Only adopted texts and speeches accept keyword search. Speech search accepts terms 9 and 10, defaulting to 10; document and speech detail returns metadata and file references, not extracted bodies.
 - Page whole items with `page.next_offset`; local collections require the returned `snapshot` above offset zero. Restart at zero without a snapshot after `snapshot_changed`.
-- Current and explicit-term rosters are acquired completely before filtering names. Voter name resolution needs `roster_term` and never supplies historical affiliations.
+- Current, explicit-term, and `mandate_date` rosters are acquired completely before filtering names. Voter name resolution needs `roster_term` and never supplies historical affiliations.
 - Preserve missing fields, language provenance, recorded versus intended voters, and absent versus published-empty voter arrays.
 - Keep source attribution to European Parliament Open Data, CC BY 4.0, and disclose identifier/structure normalization.
 
@@ -128,6 +128,7 @@ See framework CLAUDE.md and the `api-errors` skill for the full auto-classificat
 ```text
 src/
   index.ts
+  config/server-config.ts            # EUPARL_CLAMP_LIMITS, parsed in setup()
   services/eu-parliament/
     eu-parliament-client.ts          # Fixed-origin transport, pacing and deadlines
     eu-parliament-schemas.ts         # Upstream JSON-LD edge schemas

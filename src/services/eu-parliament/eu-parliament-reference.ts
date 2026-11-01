@@ -3,9 +3,12 @@
  * @module services/eu-parliament/eu-parliament-reference
  */
 import { validationError } from '@cyanheads/mcp-ts-core/errors';
-import type { LocalizedText } from './eu-parliament-normalization.js';
+import { type LocalizedText, pageCaps } from './eu-parliament-normalization.js';
 
-/** Canonical input codes copied from the public OpenAPI, plus verified group tokens. */
+/**
+ * Canonical input codes copied from the public OpenAPI, plus verified group tokens. Country lists
+ * GB, not the OpenAPI enum's UK: rosters publish and match United Kingdom members only as GB.
+ */
 const codes = {
   language: [
     'bg',
@@ -85,7 +88,7 @@ const codes = {
     'SK',
     'FI',
     'SE',
-    'UK',
+    'GB',
   ],
   political_group: [
     'PPE',
@@ -147,7 +150,7 @@ export function normalizeCode(
   if (value === undefined || value.trim() === '') return undefined;
   let canonical = family === 'language' ? value.trim().toLowerCase() : value.trim().toUpperCase();
   if (family === 'political_group') canonical = aliases.get(canonical) ?? canonical;
-  if (family === 'country' && canonical === 'GB') canonical = 'UK';
+  if (family === 'country' && canonical === 'UK') canonical = 'GB';
   if (!(codes[family] as readonly string[]).includes(canonical)) {
     const guidance =
       family === 'country' || family === 'political_group' || family === 'gender'
@@ -188,6 +191,9 @@ export interface ReferenceEntry {
   source_url?: string;
   start_date?: string;
 }
+const pageCapList = Object.values(pageCaps)
+  .map(({ maximum, noun }) => `${maximum} ${noun}`)
+  .join(', ');
 /** Static tables have no upstream totals or snapshot requirement. */
 export function referenceEntries(
   topic: Exclude<ReferenceTopic, 'committees' | 'political_groups' | 'organizations'>,
@@ -214,11 +220,11 @@ export function referenceEntries(
       return [
         ...rows(
           codes.country,
-          'country; ISO alpha-2; case-insensitive input; GB→UK; UK is historical.',
+          'country; ISO alpha-2; case-insensitive input; UK→GB, the code Parliament publishes and matches for United Kingdom members, on historical rosters only.',
         ),
         ...codes.political_group.map((code) => ({
           code,
-          description: `political_group; ${['PFE', 'ESN'].includes(code) ? 'observed in live API' : 'documented by OpenAPI'}; case-insensitive; aliases EPP→PPE, S&D→S-D, Verts/ALE and Greens/EFA→VERTS-ALE, The Left and GUE/NGL→THE-LEFT, Renew→RENEW, PfE and Patriots→PFE. Query aliases never rewrite historical organization identities.`,
+          description: `political_group; ${['PFE', 'ESN'].includes(code) ? 'observed in live API' : 'documented by OpenAPI'}; case-insensitive; aliases EPP→PPE, S&D→S-D, Verts/ALE and Greens/EFA→VERTS-ALE, The Left and GUE/NGL→THE-LEFT, Renew→RENEW, PfE and Patriots→PFE. Query aliases never rewrite historical organization identities. On mandate_date rosters a code matches only members published under it on that date.`,
         })),
         ...rows(codes.gender, 'gender; case-insensitive input.'),
       ];
@@ -251,7 +257,7 @@ export function referenceEntries(
         {
           code: 'question',
           description:
-            'E-term-year-six-digit-sequence (also P/O), or E-six-digit-sequence/year citation; omitted term verifies canonical candidates for all overlapping terms, including both adjacent terms in election years.',
+            'E-term-year-six-digit-sequence, or E-six-digit-sequence/year citation; P, O, G and K prefixes work the same way; omitted term verifies canonical candidates for all overlapping terms, including both adjacent terms in election years.',
         },
         ...rows(
           codes.language,
@@ -276,14 +282,18 @@ export function referenceEntries(
             'Ninth- and tenth-term speech metadata and source links; search defaults to term 10. Published labels are not transcripts; coverage is not guaranteed for other terms.',
         },
         {
+          code: 'meps',
+          description:
+            "Omit term and mandate_date for members in office today; term selects that published term roster; mandate_date YYYY-MM-DD, not after today (UTC) and exclusive with term, selects members seated that day with country and group as published then. A term's first sitting day can return an incomplete roster or an upstream error; use the following day. Names filter locally over the complete roster.",
+        },
+        {
           code: 'votes',
           description:
             'Discover sittings, page compact decisions, read a rich decision, then page recorded or intended positions. Names require explicit roster_term and reflect that published roster, never historical affiliation.',
         },
         {
           code: 'paging',
-          description:
-            'Effective limit 100, except organization lookup pages at most 20 supplied IDs without a snapshot. Speeches, procedures and adopted texts expose a 10000-result search window; offset plus effective limit cannot exceed 10000. Capped totals are lower bounds. At the window boundary has_more may remain true without next_offset; narrow supported filters. Local continuation requires returned snapshot; collection is reacquired and drift causes snapshot_changed. No retained cache.',
+          description: `Page caps: ${pageCapList}. A larger limit returns the cap with a notice; a server set to EUPARL_CLAMP_LIMITS=false rejects a limit above its tool's largest cap; a smaller collection cap in the same tool still clamps with a notice. Organization lookups page the supplied IDs without a snapshot. Speeches, procedures and adopted texts expose a 10000-result search window: a page reaching past it narrows to the results left, with a notice, and an offset of 10000 or more is rejected. Capped totals are lower bounds. At the window boundary has_more may remain true without next_offset; narrow supported filters. Local continuation requires returned snapshot; collection is reacquired and drift causes snapshot_changed. No retained cache.`,
         },
         {
           code: 'questions',

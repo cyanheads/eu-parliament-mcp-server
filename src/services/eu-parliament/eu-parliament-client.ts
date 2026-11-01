@@ -56,7 +56,10 @@ const allowlists = new Map<string, readonly string[]>([
     'meps',
     [...lists, 'parliamentary-term', 'country-of-representation', 'political-group', 'gender'],
   ],
-  ['meps/show-current', [...lists, 'country-of-representation', 'political-group', 'gender']],
+  [
+    'meps/show-current',
+    [...lists, 'mandate-date', 'country-of-representation', 'political-group', 'gender'],
+  ],
   ['meetings', [...lists, 'year']],
   ['parliamentary-questions', [...lists, 'year', 'work-type']],
 ]);

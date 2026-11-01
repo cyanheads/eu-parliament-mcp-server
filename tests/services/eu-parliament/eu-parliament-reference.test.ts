@@ -30,10 +30,33 @@ describe('Parliament reference codes', () => {
     expect(normalizeCode(undefined, 'gender')).toBeUndefined();
     expect(normalizeCode('  ', 'gender')).toBeUndefined();
   });
-  it('normalizes the historical country alias without conflating filter families', () => {
-    expect(normalizeCode(' gb ', 'country')).toBe('UK');
+  it.each([' gb ', 'GB', ' uk ', 'Uk'])(
+    'normalizes United Kingdom input %j to the published GB code',
+    (input) => {
+      expect(normalizeCode(input, 'country')).toBe('GB');
+    },
+  );
+  it('keeps United Kingdom codes out of other filter families', () => {
     expect(() => normalizeCode('GB', 'political_group')).toThrow();
+    expect(() => normalizeCode('UK', 'gender')).toThrow();
     expect(() => normalizeCode('EPP', 'country')).toThrow();
+  });
+  it('lists GB, never UK, as the United Kingdom mep_filters code', () => {
+    const countries = referenceEntries('mep_filters').filter((entry) =>
+      entry.description?.startsWith('country;'),
+    );
+    expect(countries.map((entry) => entry.code)).toContain('GB');
+    expect(countries.map((entry) => entry.code)).not.toContain('UK');
+    expect(countries.find((entry) => entry.code === 'GB')?.description).toContain('UK→GB');
+  });
+  it('documents date-bound group matching and the mandate_date roster selector', () => {
+    expect(
+      referenceEntries('mep_filters').find((entry) => entry.code === 'THE-LEFT')?.description,
+    ).toContain('On mandate_date rosters a code matches only members published under it');
+    const roster = referenceEntries('coverage').find((entry) => entry.code === 'meps')?.description;
+    expect(roster).toContain('mandate_date');
+    expect(roster).toContain('exclusive with term');
+    expect(roster).toContain("A term's first sitting day can return an incomplete roster");
   });
   it.each(['PPE-DE', 'PSE', 'ALDE', '__proto__', 'constructor'])(
     'keeps unsupported historical or arbitrary group %s invalid',
@@ -42,7 +65,7 @@ describe('Parliament reference codes', () => {
   it.each([
     [
       'country',
-      'BE, BG, CZ, DK, DE, EE, IE, GR, ES, FR, HR, IT, CY, LV, LT, LU, HU, MT, NL, AT, PL, PT, RO, SI, SK, FI, SE, UK',
+      'BE, BG, CZ, DK, DE, EE, IE, GR, ES, FR, HR, IT, CY, LV, LT, LU, HU, MT, NL, AT, PL, PT, RO, SI, SK, FI, SE, GB',
     ],
     ['political_group', 'PPE, NI, S-D, VERTS-ALE, ECR, RENEW, THE-LEFT, ID, PFE, ESN'],
     ['gender', 'FEMALE, MALE, NAP, NKN, NST'],
@@ -59,5 +82,13 @@ describe('Parliament reference codes', () => {
     expect(
       referenceEntries('coverage').find((item) => item.code === 'questions')?.description,
     ).toContain('Missing answer links do not prove unanswered');
+  });
+  it('states every collection page cap, the clamp switch and the window rule in the paging row', () => {
+    const paging = referenceEntries('coverage').find((item) => item.code === 'paging')?.description;
+    expect(paging).toContain(
+      'Page caps: 300 procedures, 300 questions, 225 documents, 80 speeches, 300 MEPs, 225 memberships, 125 procedure section entries, 1000 voters, 100 sittings, 100 decisions, 350 reference entries, 20 organization lookups.',
+    );
+    expect(paging).toContain('EUPARL_CLAMP_LIMITS=false');
+    expect(paging).toContain('an offset of 10000 or more is rejected');
   });
 });

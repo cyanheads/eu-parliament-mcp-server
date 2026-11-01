@@ -135,7 +135,9 @@ describe('euparl_list_reference contract', () => {
       truncated: true,
       page: { limit: 20, returned: 20, next_offset: 20 },
     });
-    expect(first.notice).toContain('effective maximum of 20');
+    expect(first.notice).toBe(
+      'Requested limit normalized to the effective maximum of 20 organization lookups. Continue with offset 20.',
+    );
     expect(fetcher).toHaveBeenCalledTimes(20);
     const last = expectSuccessTwin(
       await runToolContract(listReferenceTool, {
@@ -390,11 +392,42 @@ describe('euparl_list_reference contract', () => {
     const data = expectSuccessTwin(
       await runToolContract(listReferenceTool, { topic: 'political_groups', limit: 1000 }),
     );
-    expect(data).toMatchObject({ items: [], page: { limit: 100, returned: 0, has_more: false } });
+    expect(data).toMatchObject({ items: [], page: { limit: 350, returned: 0, has_more: false } });
     expect(data.notice).toBe(
-      'Requested limit normalized to the effective maximum of 100. No reference entries matched. Call euparl_list_reference with topic identifiers to inspect accepted identifiers.',
+      'Requested limit normalized to the effective maximum of 350 reference entries. No reference entries matched. Call euparl_list_reference with topic identifiers to inspect accepted identifiers.',
     );
-    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('100');
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('350');
+  });
+
+  it('fills a capped live page from more upstream rows than the cap and continues past it', async () => {
+    // One row more than the cap, sliced by the requested window as the upstream does.
+    const pool = Array.from({ length: 351 }, (_, i) => ({
+      ...body,
+      id: `org/${i}`,
+      identifier: `C${i}`,
+    }));
+    const fetcher = installToolHttp((url) => {
+      const offset = Number(url.searchParams.get('offset'));
+      return envelopeResponse(pool.slice(offset, offset + Number(url.searchParams.get('limit'))));
+    });
+    const first = expectSuccessTwin(
+      await runToolContract(listReferenceTool, { topic: 'committees', limit: 1000 }),
+    );
+    expect(first).toMatchObject({
+      page: { limit: 350, returned: 350, has_more: true, next_offset: 350 },
+      truncated: true,
+      shown: 350,
+      cap: 350,
+    });
+    expect(first.notice).toBe(
+      'Requested limit normalized to the effective maximum of 350 reference entries. Continue with offset 350.',
+    );
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('350');
+    expect(
+      expectSuccessTwin(
+        await runToolContract(listReferenceTool, { topic: 'committees', offset: 350 }),
+      ),
+    ).toMatchObject({ items: [{ code: 'C350' }], page: { returned: 1, has_more: false } });
   });
 
   it('rejects unsupported language with declared recovery before network', async () => {

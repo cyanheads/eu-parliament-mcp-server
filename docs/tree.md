@@ -1,6 +1,6 @@
 # eu-parliament-mcp-server - Directory Structure
 
-Generated on: 2026-10-26 03:39:22
+Generated on: 2026-11-01 10:22:59
 
 ```text
 eu-parliament-mcp-server/
@@ -135,7 +135,12 @@ eu-parliament-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── eu-parliament-guide/
+│       └── SKILL.md
 ├── src/
+│   ├── config/
+│   │   └── server-config.ts
 │   ├── mcp-server/
 │   │   ├── prompts/
 │   │   │   └── definitions/
@@ -163,6 +168,8 @@ eu-parliament-mcp-server/
 │   │       └── eu-parliament-service.ts
 │   └── index.ts
 ├── tests/
+│   ├── config/
+│   │   └── server-config.test.ts
 │   ├── fuzz/
 │   ├── helpers/
 │   │   ├── eu-parliament-contract.ts
@@ -181,6 +188,8 @@ eu-parliament-mcp-server/
 │   │       └── eu-parliament-service.test.ts
 │   ├── smoke/
 │   └── tools/
+│       ├── utils/
+│       │   └── eu-parliament-tool.test.ts
 │       ├── get-mep.tool.test.ts
 │       ├── get-plenary-votes.tool.test.ts
 │       ├── get-procedure.tool.test.ts

@@ -9,6 +9,7 @@ import {
   serviceUnavailable,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
+import { createCounter, logger, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import {
   type ClientOptions,
   type Envelope,
@@ -31,7 +32,10 @@ import {
   normalizeProcedure,
   normalizeQuestion,
   normalizeSpeech,
+  type PagedCollection,
+  type PageWindow,
   type Paging,
+  pageCaps,
   pageWindow,
   sourceUrl,
   upstreamPage,
@@ -111,10 +115,12 @@ export interface SpeechesInput extends Paging {
   text?: string;
   title?: string;
 }
-/** Complete current or explicit-term roster filtering. */
+/** Complete current, dated, or explicit-term roster filtering. */
 export interface MepsInput extends Paging {
   country?: string;
   gender?: string;
+  /** YYYY-MM-DD on `meps/show-current`; exclusive with term. */
+  mandate_date?: string;
   name_contains?: string;
   political_group?: string;
   term?: number;
@@ -148,8 +154,11 @@ export interface QuestionsInput extends Paging {
 function invalidMode(message: string): never {
   throw validationError(message, { reason: 'invalid_mode_fields' });
 }
-function invalidFilter(message: string): never {
-  throw validationError(message, { reason: 'invalid_filter' });
+function invalidFilter(message: string, hint?: string): never {
+  throw validationError(message, {
+    reason: 'invalid_filter',
+    ...(hint !== undefined && { recovery: { hint } }),
+  });
 }
 function meaningful(value: unknown): boolean {
   return (
@@ -178,7 +187,10 @@ function date(value: string): string {
     Number.isNaN(Date.parse(value)) ||
     new Date(value).toISOString().slice(0, 10) !== value
   )
-    invalidFilter('Use a real calendar date in YYYY-MM-DD form.');
+    invalidFilter(
+      'Use a real calendar date in YYYY-MM-DD form.',
+      'Pass an existing calendar day as YYYY-MM-DD.',
+    );
   return value;
 }
 function dates(input: { sitting_date?: string; sitting_date_end?: string }): void {
@@ -186,12 +198,19 @@ function dates(input: { sitting_date?: string; sitting_date_end?: string }): voi
   if (input.sitting_date_end) {
     date(input.sitting_date_end);
     if (!input.sitting_date || input.sitting_date_end < input.sitting_date)
-      invalidFilter('sitting_date_end requires an ordered sitting_date range.');
+      invalidFilter(
+        'sitting_date_end requires an ordered sitting_date range.',
+        'Pass sitting_date with sitting_date_end, on or before it.',
+      );
   }
 }
-function scopePage(input: Paging) {
+function scopePage(input: Paging, collection: PagedCollection, resultWindow?: number) {
   const language = normalizeCode(input.language, 'language') ?? 'en';
-  return { ...pageWindow(input), language, ...field('snapshot', input.snapshot) };
+  return {
+    ...pageWindow(input, collection, resultWindow),
+    language,
+    ...field('snapshot', input.snapshot),
+  };
 }
 function result<T>(
   data: T,
@@ -210,22 +229,55 @@ function result<T>(
     },
   };
 }
-function noticesFor(input: Paging): string[] {
-  return (input.limit ?? 20) > 100
-    ? ['Requested limit normalized to the effective maximum of 100.']
-    : [];
-}
 const searchResultWindow = 10_000;
-function searchWindow(input: Paging, narrowing: string): void {
-  const { offset, limit } = pageWindow(input);
-  if (offset + limit > searchResultWindow)
+let limitClamps: ReturnType<typeof createCounter> | undefined;
+const loggedClamps = new Set<PagedCollection>();
+/**
+ * Disclose a limit the collection cap or the search window narrowed. Every clamp is counted;
+ * the first per collection is also logged, once per process.
+ */
+function noticesFor(input: Paging, paging: PageWindow, collection: PagedCollection): string[] {
+  const requested = input.limit ?? 20;
+  if (paging.limit >= requested) return [];
+  const { maximum, noun } = pageCaps[collection];
+  const bound = paging.limit < maximum ? 'search_window' : 'collection_cap';
+  limitClamps ??= createCounter(
+    'euparl.limit.clamps',
+    'Paged calls whose requested limit was narrowed to a collection cap or search window',
+    '{calls}',
+  );
+  limitClamps.add(1, { 'euparl.collection': collection, 'euparl.limit.bound': bound });
+  if (!loggedClamps.has(collection)) {
+    loggedClamps.add(collection);
+    logger.info(
+      `Limit clamped on ${collection}: requested ${requested}, effective ${paging.limit}; later clamps on this collection are counted, not logged.`,
+      requestContextService.createRequestContext({
+        operation: 'LimitClamp',
+        additionalContext: { collection, bound, requested, effective: paging.limit },
+      }),
+    );
+  }
+  return [
+    bound === 'search_window'
+      ? `Requested limit normalized to ${paging.limit}: offset plus limit cannot pass the ${searchResultWindow}-result search window.`
+      : `Requested limit normalized to the effective maximum of ${maximum} ${noun}.`,
+  ];
+}
+const restartAfterNarrowing = 'Restart paging at offset 0 after narrowing.';
+/**
+ * The limit already narrows inside the window; an offset at or past it cannot be served. `hint`
+ * is the caller's route back inside the window.
+ */
+function searchWindow(paging: PageWindow, hint: string): void {
+  if (paging.offset >= searchResultWindow)
     invalidFilter(
-      `This search exposes at most 10000 results; offset plus effective limit must not exceed 10000. ${narrowing}`,
+      `This search exposes at most ${searchResultWindow} results; offset ${paging.offset} is past the window.`,
+      hint,
     );
 }
 function searchPage(
   returned: number,
-  input: Paging,
+  input: PageWindow,
   total: number | undefined,
   notices: string[],
   narrowing: string,
@@ -263,8 +315,9 @@ export class EuParliamentService {
   /** Live bodies page upstream; static tables page without snapshots. */
   async listReference(input: ReferenceInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const paging = scopePage(input);
-    const notices = input.topic === 'organizations' ? [] : noticesFor(input);
+    const collection = input.topic === 'organizations' ? 'organizations' : 'reference';
+    const paging = scopePage(input, collection);
+    const notices = noticesFor(input, paging, collection);
     const normalizeBody = (raw: RawBody) => ({
       code: raw.identifier ?? raw.id,
       id: raw.id,
@@ -283,16 +336,8 @@ export class EuParliamentService {
       if (!input.organization_ids?.length)
         invalidMode('organizations requires nonempty organization_ids.');
       const ids = input.organization_ids.map((id) => canonicalId(id, 'organization'));
-      const selectedPaging = { ...paging, limit: Math.min(paging.limit, 20) };
-      if ((input.limit ?? 20) > 20)
-        notices.push(
-          'Requested limit normalized to the effective maximum of 20 organization lookups.',
-        );
       const items: ReferenceEntry[] = [];
-      for (const organization_id of ids.slice(
-        paging.offset,
-        paging.offset + selectedPaging.limit,
-      )) {
+      for (const organization_id of ids.slice(paging.offset, paging.offset + paging.limit)) {
         const response = await this.client.get(
           `corporate-bodies/${organization_id}`,
           {},
@@ -321,7 +366,7 @@ export class EuParliamentService {
           'No organization IDs remain at this offset. Restart at offset 0 or supply another organization_ids list.',
         );
       return result(
-        { topic: input.topic, items, page: upstreamPage(items.length, selectedPaging, ids.length) },
+        { topic: input.topic, items, page: upstreamPage(items.length, paging, ids.length) },
         { topic: input.topic, language: paging.language, organization_ids: ids },
         notices,
         ids.length,
@@ -334,7 +379,7 @@ export class EuParliamentService {
         input.topic === 'committees' ? 'COMMITTEE_PARLIAMENTARY_STANDING' : 'EU_POLITICAL_GROUP';
       const response = await this.client.get(
         'corporate-bodies',
-        { ...pageWindow(paging), 'body-classification': classification },
+        { offset: paging.offset, limit: paging.limit, 'body-classification': classification },
         bodySchema,
         operation,
       );
@@ -363,14 +408,21 @@ export class EuParliamentService {
   /** Catalogue rows deliberately do not claim procedure titles. */
   async listProcedures(input: ProceduresInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const paging = scopePage(input);
+    const paging = scopePage(input, 'procedures', searchResultWindow);
     const process_type = normalizeCode(input.process_type, 'process_type');
-    const notices = noticesFor(input);
-    const narrowing = 'Narrow process_type to retrieve a smaller procedure set.';
-    searchWindow(paging, narrowing);
+    const notices = noticesFor(input, paging, 'procedures');
+    // process_type is the only procedure filter: once set, nothing narrower is left to offer.
+    const [narrowing, restart] =
+      process_type === undefined
+        ? ['Narrow process_type to retrieve a smaller procedure set.', restartAfterNarrowing]
+        : [
+            'process_type is the only procedure filter, so no narrower procedure set exists.',
+            'Restart at offset 0 with the same process_type and follow page.next_offset.',
+          ];
+    searchWindow(paging, `${narrowing} ${restart}`);
     const response = await this.client.get(
       'procedures',
-      { ...pageWindow(paging), 'process-type': process_type },
+      { offset: paging.offset, limit: paging.limit, 'process-type': process_type },
       procedureSchema,
       operation,
     );
@@ -396,8 +448,8 @@ export class EuParliamentService {
   /** Overview omits collections; selected sections use complete-record snapshots. */
   async getProcedure(input: ProcedureInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const paging = scopePage(input);
-    const notices = noticesFor(input);
+    const paging = scopePage(input, 'procedure_sections');
+    const notices = noticesFor(input, paging, 'procedure_sections');
     const procedure_id = canonicalId(input.procedure_id, 'procedure');
     const section = input.section ?? 'overview';
     if (section === 'overview' && paging.offset !== 0)
@@ -479,8 +531,13 @@ export class EuParliamentService {
   /** Search-only filters are checked against the selected source before HTTP. */
   async searchDocuments(input: DocumentsInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const paging = scopePage(input);
-    const notices = noticesFor(input);
+    const source = input.source ?? 'adopted_texts';
+    const paging = scopePage(
+      input,
+      'documents',
+      source === 'adopted_texts' ? searchResultWindow : undefined,
+    );
+    const notices = noticesFor(input, paging, 'documents');
     const mode = input.mode ?? 'search';
     if (mode === 'get') {
       forbid(input, [
@@ -518,10 +575,9 @@ export class EuParliamentService {
       );
     }
     forbid(input, ['document_id', 'snapshot']);
-    const source = input.source ?? 'adopted_texts';
     const narrowing =
       'Narrow text, title, year, term, work_type, sitting dates or related_process_id.';
-    if (source === 'adopted_texts') searchWindow(paging, narrowing);
+    if (source === 'adopted_texts') searchWindow(paging, `${narrowing} ${restartAfterNarrowing}`);
     dates(input);
     if (
       source !== 'adopted_texts' &&
@@ -557,7 +613,8 @@ export class EuParliamentService {
       ...field('related_process_id', related_process_id),
     };
     const query = {
-      ...pageWindow(paging),
+      offset: paging.offset,
+      limit: paging.limit,
       'work-type': work_type,
       ...(source !== 'committee' && { year: input.year }),
       ...(source !== 'plenary' && { 'parliamentary-term': input.term }),
@@ -592,8 +649,8 @@ export class EuParliamentService {
   /** Speech results preserve metadata rather than manufacturing transcripts. */
   async searchSpeeches(input: SpeechesInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const paging = scopePage(input);
-    const notices = noticesFor(input);
+    const paging = scopePage(input, 'speeches', searchResultWindow);
+    const notices = noticesFor(input, paging, 'speeches');
     const mode = input.mode ?? 'search';
     if (mode === 'get') {
       forbid(input, [
@@ -624,14 +681,15 @@ export class EuParliamentService {
     forbid(input, ['speech_id', 'snapshot']);
     const term = input.term ?? 10;
     const narrowing = 'Narrow text, title, person_id, activity_type or sitting dates.';
-    searchWindow(paging, narrowing);
+    searchWindow(paging, `${narrowing} ${restartAfterNarrowing}`);
     dates(input);
     const activity_type = normalizeCode(input.activity_type, 'activity_type');
     const person_id = input.person_id ? canonicalId(input.person_id, 'person') : undefined;
     const response = await this.client.get(
       'speeches',
       {
-        ...pageWindow(paging),
+        offset: paging.offset,
+        limit: paging.limit,
         text: input.text,
         title: input.title,
         'person-id': person_id,
@@ -717,29 +775,52 @@ export class EuParliamentService {
   /** Full selected roster is acquired before strict token matching and local paging. */
   async searchMeps(input: MepsInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const paging = scopePage(input);
-    const notices = noticesFor(input);
+    const paging = scopePage(input, 'meps');
+    const notices = noticesFor(input, paging, 'meps');
     localPaging(input);
+    const today = new Date(this.client.now()).toISOString().slice(0, 10);
+    const mandate_date = input.mandate_date?.trim() ? input.mandate_date : undefined;
+    if (mandate_date !== undefined) {
+      if (input.term !== undefined)
+        invalidMode(
+          'Supply term or mandate_date, not both: term selects a term roster, mandate_date the members seated on that date.',
+        );
+      date(mandate_date);
+      // Parliament answers a future date with today's roster, which would misreport the date.
+      if (mandate_date > today)
+        invalidFilter(
+          `mandate_date ${mandate_date} is after the current UTC date ${today}.`,
+          `Use a mandate_date on or before ${today}, or omit mandate_date for members in office today.`,
+        );
+    }
     const country = normalizeCode(input.country, 'country');
     const political_group = normalizeCode(input.political_group, 'political_group');
     const gender = normalizeCode(input.gender, 'gender');
     const tokens = input.name_contains
       ? normalizeName(input.name_contains).split(/\s+/).filter(Boolean)
       : [];
+    // A tokenless nonblank filter would otherwise match every row and return the whole roster.
+    if (!tokens.length && input.name_contains?.trim())
+      invalidFilter(
+        'name_contains has no letter or digit after case, diacritic, and punctuation normalization.',
+        'Include at least one letter or digit in name_contains, or omit name_contains to browse the roster.',
+      );
     const filters = {
-      scope: input.term === undefined ? 'current' : 'parliamentary_term',
-      ...(input.term === undefined
-        ? { as_of: new Date(this.client.now()).toISOString().slice(0, 10) }
-        : { term: input.term }),
+      ...(input.term !== undefined
+        ? { scope: 'parliamentary_term', term: input.term }
+        : mandate_date !== undefined
+          ? { scope: 'mandate_date', mandate_date }
+          : { scope: 'current', as_of: today }),
       language: paging.language,
       ...field('country', country),
       ...field('political_group', political_group),
       ...field('gender', gender),
-      ...field('name_contains', input.name_contains ? tokens.join(' ') : undefined),
+      ...field('name_contains', tokens.length ? tokens.join(' ') : undefined),
     };
     const all = await this.roster(
       {
         ...(input.term !== undefined && { 'parliamentary-term': input.term }),
+        ...(mandate_date !== undefined && { 'mandate-date': mandate_date }),
         'country-of-representation': country,
         'political-group': political_group,
         gender,
@@ -764,18 +845,23 @@ export class EuParliamentService {
       )
       .map(normalizeMep);
     const page = localPage(selected, paging, filters);
-    if (!selected.length)
+    if (!selected.length) {
       notices.push(
         'No MEPs matched. Remove name_contains to browse, relax country or political_group, or call euparl_list_reference with topic mep_filters.',
       );
+      if (!all.length && mandate_date !== undefined && political_group !== undefined)
+        notices.push(
+          "On a mandate_date roster, political_group matches only the group code in force on that date; omit political_group and read each member's published political_group.",
+        );
+    }
     return result({ items: page.items, page: page.page }, filters, notices, page.total);
   }
 
   /** Full memberships remain a separate local collection. */
   async getMep(input: MepInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const paging = scopePage(input);
-    const notices = noticesFor(input);
+    const paging = scopePage(input, 'memberships');
+    const notices = noticesFor(input, paging, 'memberships');
     const mep_id = canonicalId(input.mep_id, 'person');
     const section = input.section ?? 'overview';
     if (section === 'overview' && paging.offset !== 0)
@@ -826,9 +912,10 @@ export class EuParliamentService {
   /** Sitting decisions are fetched whole, then compact records or voter positions are paged. */
   async getPlenaryVotes(input: VotesInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const paging = scopePage(input);
-    const notices = noticesFor(input);
     const mode = input.mode ?? 'decisions';
+    const collection = mode === 'sittings' || mode === 'voters' ? mode : 'decisions';
+    const paging = scopePage(input, collection);
+    const notices = noticesFor(input, paging, collection);
     if (mode !== 'decisions') forbid(input, ['document_id']);
     if (mode !== 'decision') forbid(input, ['mep_id']);
     const document_id = input.document_id?.trim()
@@ -842,7 +929,7 @@ export class EuParliamentService {
       if (input.year === undefined) invalidMode('year is required for sittings mode.');
       const response = await this.client.get(
         'meetings',
-        { ...pageWindow(paging), year: input.year },
+        { offset: paging.offset, limit: paging.limit, year: input.year },
         sittingSchema,
         operation,
       );
@@ -1001,15 +1088,15 @@ export class EuParliamentService {
   /** Resolve every overlapping term candidate before choosing a human citation. */
   async listQuestions(input: QuestionsInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const paging = scopePage(input);
-    const notices = noticesFor(input);
+    const paging = scopePage(input, 'questions');
+    const notices = noticesFor(input, paging, 'questions');
     const mode = input.mode ?? 'list';
     if (mode === 'list') {
       forbid(input, ['question_id', 'term', 'snapshot']);
       const work_type = normalizeCode(input.work_type, 'question');
       const response = await this.client.get(
         'parliamentary-questions',
-        { ...pageWindow(paging), year: input.year, 'work-type': work_type },
+        { offset: paging.offset, limit: paging.limit, year: input.year, 'work-type': work_type },
         questionSchema,
         operation,
       );
@@ -1039,7 +1126,10 @@ export class EuParliamentService {
     const citation = required(input.question_id, 'question_id').trim();
     let question_id: string | undefined;
     let resolved: Envelope<RawQuestion> | undefined;
-    const human = /^([EPO])-(\d{6})\/(\d{4})$/.exec(citation);
+    const questionForms =
+      'Use a canonical question identifier such as E-10-2025-000001 or a human citation such as E-000001/2025, with prefix E, P, O, G or K.';
+    // Published work prefixes: E written, P priority written, O oral, G major and K minor interpellation.
+    const human = /^([EPOGK])-(\d{6})\/(\d{4})$/.exec(citation);
     if (human) {
       if (input.term !== undefined)
         question_id = `${human[1]}-${input.term}-${human[3]}-${human[2]}`;
@@ -1075,10 +1165,10 @@ export class EuParliamentService {
         resolved = matches[0]?.response;
       }
     } else {
+      if (/^[A-Za-z]+-\d{6}\/\d{4}$/.test(citation)) invalidFilter(questionForms);
       question_id = canonicalId(citation, 'document');
-      const match = /^[EPO]-(\d+)-\d{4}-\d{6}$/.exec(question_id);
-      if (!match)
-        invalidFilter('Use a canonical question identifier or human E-NNNNNN/YYYY citation.');
+      const match = /^[EPOGK]-(\d+)-\d{4}-\d{6}$/.exec(question_id);
+      if (!match) invalidFilter(questionForms);
       if (input.term !== undefined && Number(match[1]) !== input.term)
         invalidFilter('term conflicts with the canonical question identifier.');
     }

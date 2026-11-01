@@ -16,9 +16,12 @@ const invalidHint =
   'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
 const modeHint =
   'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.';
+const acceptedForms =
+  'Use a canonical question identifier such as E-10-2025-000001 or a human citation such as E-000001/2025, with prefix E, P, O, G or K.';
 const row = (id: string) => ({ id: `eli/dl/doc/${id}`, identifier: id });
 const page = (start: number, count: number) =>
   Array.from({ length: count }, (_, i) => row(`E-10-2025-${String(start + i).padStart(6, '0')}`));
+const questionPath = (id: string) => `/api/v2/parliamentary-questions/${id}`;
 afterEach(() => vi.useRealTimers());
 
 describe('euparl_list_questions contract', () => {
@@ -48,7 +51,7 @@ describe('euparl_list_questions contract', () => {
     ).toMatchObject({ year: '2025', 'work-type': 'QUESTION_WRITTEN', offset: '0', limit: '20' });
   });
 
-  it.each(['E', 'P', 'O'])(
+  it.each(['E', 'P', 'O', 'G', 'K'])(
     'resolves %s human citation directly with explicit term',
     async (prefix) => {
       const id = `${prefix}-10-2025-900001`;
@@ -100,6 +103,108 @@ describe('euparl_list_questions contract', () => {
       },
     });
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['P-10-2025-900001', 'O-10-2025-900001', 'G-9-2023-001001', 'K-8-2017-000001'])(
+    'resolves canonical %s directly',
+    async (id) => {
+      const fetcher = installToolHttp(() => envelopeResponse([row(id)]));
+      expect(
+        expectSuccessTwin(
+          await runToolContract(listQuestionsTool, { mode: 'get', question_id: id }),
+        ),
+      ).toMatchObject({ found: true, question: { question_id: id } });
+      expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
+        questionPath(id),
+      ]);
+    },
+  );
+
+  it.each([
+    ['G-001001/2023', ['G-9-2023-001001'], 'G-9-2023-001001'],
+    ['G-001001/2024', ['G-9-2024-001001', 'G-10-2024-001001'], 'G-10-2024-001001'],
+    ['K-000001/2019', ['K-8-2019-000001', 'K-9-2019-000001'], 'K-8-2019-000001'],
+  ] as const)(
+    'resolves interpellation citation %s through every candidate term',
+    async (question_id, candidates, published) => {
+      const fetcher = installToolHttp((url) =>
+        url.pathname === questionPath(published)
+          ? envelopeResponse([row(published)])
+          : new Response(null, { status: 404 }),
+      );
+      expect(
+        expectSuccessTwin(await runToolContract(listQuestionsTool, { mode: 'get', question_id })),
+      ).toMatchObject({
+        found: true,
+        question: { question_id: published },
+        appliedFilters: { question_id: published },
+      });
+      expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual(
+        candidates.map(questionPath),
+      );
+    },
+  );
+
+  it('rejects a term that conflicts with a canonical interpellation identifier before HTTP', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    const result = await runToolContract(listQuestionsTool, {
+      mode: 'get',
+      question_id: 'K-8-2017-000001',
+      term: 9,
+    });
+    expectErrorTwin(result, 'invalid_filter', invalidHint);
+    expect(contractText(result)).toContain(
+      'term conflicts with the canonical question identifier.',
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'X-001001/2023',
+    'g-001001/2023',
+    'QT-001001/2023',
+    'X-10-2025-900001',
+    'e-10-2025-900001',
+    'https://data.europarl.europa.eu/eli/dl/doc/X-10-2025-900001',
+  ])(
+    'rejects unsupported question prefix %s before HTTP, naming the accepted forms',
+    async (question_id) => {
+      const fetcher = installToolHttp(() => envelopeResponse([]));
+      const result = await runToolContract(listQuestionsTool, { mode: 'get', question_id });
+      expectErrorTwin(result, 'invalid_filter', invalidHint);
+      expect(contractText(result)).toContain(acceptedForms);
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    (size: number) => 'E'.repeat(size),
+    (size: number) => `E-${'1'.repeat(size)}`,
+    (size: number) => `${'E'.repeat(size)}-000001/2025-`,
+    (size: number) => `E-${'1-'.repeat(size / 2)}`,
+  ])('bounds question identifier parsing CPU over long rejected input', async (shape) => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    const reject = async (question_id: string) => {
+      const result = await runToolContract(listQuestionsTool, { mode: 'get', question_id });
+      expect(result.isError).toBe(true);
+    };
+    for (let warmup = 0; warmup < 20; warmup++) await reject(shape(5120));
+    const cpuUs: number[] = [];
+    for (let size = 5120; size <= 327680; size *= 2) {
+      const input = shape(size);
+      let least = Number.POSITIVE_INFINITY;
+      for (let trial = 0; trial < 5; trial++) {
+        const start = process.threadCpuUsage();
+        for (let iteration = 0; iteration < 8; iteration++) await reject(input);
+        const used = process.threadCpuUsage(start);
+        least = Math.min(least, used.user + used.system);
+      }
+      expect(least).toBeLessThan(250000);
+      cpuUs.push(least);
+    }
+    expect(cpuUs[0]).toBeGreaterThan(0);
+    expect(cpuUs.at(-1)!).toBeLessThan(cpuUs[0]! * 256);
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it('preserves mixed answer references, nested file links, hostile-looking titles and missing-answer uncertainty', async () => {
@@ -218,23 +323,23 @@ describe('euparl_list_questions contract', () => {
 
   it('renders cap disclosure, second page, and offset beyond the end', async () => {
     installToolHttp((url) =>
-      envelopeResponse(url.searchParams.get('offset') === '0' ? page(1, 100) : []),
+      envelopeResponse(url.searchParams.get('offset') === '0' ? page(1, 300) : []),
     );
     const first = expectSuccessTwin(
       await runToolContract(listQuestionsTool, { limit: 1000, work_type: '', language: ' ' }),
     );
     expect(first).toMatchObject({
-      page: { next_offset: 100, limit: 100 },
+      page: { next_offset: 300, limit: 300 },
       truncated: true,
-      shown: 100,
-      cap: 100,
+      shown: 300,
+      cap: 300,
     });
     expect(first.notice).toBe(
-      'Requested limit normalized to the effective maximum of 100. Continue with offset 100.',
+      'Requested limit normalized to the effective maximum of 300 questions. Continue with offset 300.',
     );
     expect(
-      expectSuccessTwin(await runToolContract(listQuestionsTool, { offset: 100 })),
-    ).toMatchObject({ items: [], page: { offset: 100, has_more: false } });
+      expectSuccessTwin(await runToolContract(listQuestionsTool, { offset: 300 })),
+    ).toMatchObject({ items: [], page: { offset: 300, has_more: false } });
     expect(
       expectSuccessTwin(await runToolContract(listQuestionsTool, { offset: 1000 })),
     ).toMatchObject({ items: [], page: { offset: 1000, returned: 0, has_more: false } });

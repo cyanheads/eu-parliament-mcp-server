@@ -14,6 +14,7 @@ import {
   pagingInputFields,
   serviceInput,
 } from '@/mcp-server/tools/utils/eu-parliament-tool.js';
+import { pageCaps } from '@/services/eu-parliament/eu-parliament-normalization.js';
 import { referenceTopics } from '@/services/eu-parliament/eu-parliament-reference.js';
 import { getEuParliamentService } from '@/services/eu-parliament/eu-parliament-service.js';
 
@@ -56,8 +57,7 @@ const entrySchema = z
 /** Discover supported filters, identifier syntax and coverage limitations. */
 export const listReferenceTool = tool('euparl_list_reference', {
   title: 'List parliamentary reference data',
-  description:
-    'List parliamentary codes, identifier formats, historical committees and political groups, or coverage limitations. Choose organizations with organization_ids to resolve supported membership organization IDs into published names and dates; ordered per-item found false means no detail was published. Organization lookups page the supplied IDs with an effective maximum of 20 per call; repeat the same ID list with page.next_offset. Other topics retain historical coverage and an effective maximum of 100. These lists do not require snapshots; missing end dates do not establish current status.',
+  description: `List parliamentary codes, identifier formats, historical committees and political groups, or coverage limitations. Choose organizations with organization_ids to resolve supported membership organization IDs into published names and dates; ordered per-item found false means no detail was published. Organization lookups page the supplied IDs with an effective maximum of ${pageCaps.organizations.maximum} per call; repeat the same ID list with page.next_offset. Other topics retain historical coverage and an effective maximum of ${pageCaps.reference.maximum} per page. These lists do not require snapshots; missing end dates do not establish current status.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -76,12 +76,9 @@ export const listReferenceTool = tool('euparl_list_reference', {
         )
         .optional()
         .describe(
-          'Required nonempty list only for organizations; order and duplicates retained, with at most 20 looked up per page.',
+          `Required nonempty list only for organizations; order and duplicates retained, with at most ${pageCaps.organizations.maximum} looked up per page.`,
         ),
-      ...pagingInputFields,
-      limit: pagingInputFields.limit.describe(
-        'Whole items requested; default 20, effective maximum 20 for organizations or 100 for other topics, with notice.',
-      ),
+      ...pagingInputFields('reference', 'organizations'),
     })
     .strict(),
   output: z

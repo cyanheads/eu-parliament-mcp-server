@@ -79,12 +79,27 @@ describe('EuParliamentClient', () => {
   it.each([
     ['https://evil.example/x', {}],
     ['meps', { text: 'ignored upstream' }],
+    ['meps', { 'mandate-date': '2024-03-13' }],
     ['documents/ABC', { limit: 1 }],
   ])('rejects unapproved path/query before fetch: %s', async (path, query) => {
     const fetcher = vi.fn<typeof fetch>();
     const client = new EuParliamentClient({ fetch: fetcher });
     await expect(client.get(path, query, record, client.operation(signal()))).rejects.toThrow();
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('sends mandate-date on the current-roster route', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse([]));
+    const client = new EuParliamentClient({ fetch: fetcher });
+    await client.get(
+      'meps/show-current',
+      { 'mandate-date': '2024-03-13', 'country-of-representation': 'MT' },
+      record,
+      client.operation(signal()),
+    );
+    expect(String(fetcher.mock.calls[0]?.[0])).toBe(
+      'https://data.europarl.europa.eu/api/v2/meps/show-current?mandate-date=2024-03-13&country-of-representation=MT&format=application%2Fld%2Bjson',
+    );
   });
 
   it.each([

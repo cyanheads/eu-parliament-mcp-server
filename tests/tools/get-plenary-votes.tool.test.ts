@@ -652,7 +652,7 @@ describe('euparl_get_plenary_votes contract', () => {
     );
     expect(first).toMatchObject({
       page: { limit: 100, returned: 1, has_more: false },
-      notice: 'Requested limit normalized to the effective maximum of 100.',
+      notice: 'Requested limit normalized to the effective maximum of 100 sittings.',
     });
     expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('100');
     const past = expectSuccessTwin(
@@ -665,62 +665,98 @@ describe('euparl_get_plenary_votes contract', () => {
     });
   });
 
-  it.each(['decisions', 'voters'] as const)(
-    'caps %s without losing the final item',
-    async (mode) => {
-      installToolHttp(() =>
-        envelopeResponse(
-          mode === 'decisions'
-            ? Array.from({ length: 101 }, (_, index) => ({ id: `eli/dl/event/EXAMPLE-${index}` }))
-            : [
-                {
-                  ...decisionRecord,
-                  had_voter_favor: Array.from(
-                    { length: 101 },
-                    (_, index) => `person/${900000000 + index}`,
-                  ),
-                },
-              ],
-        ),
-      );
-      const input =
+  it.each([
+    ['decisions', 100],
+    ['voters', 1000],
+  ] as const)('caps %s at %i without losing the final item', async (mode, cap) => {
+    installToolHttp(() =>
+      envelopeResponse(
         mode === 'decisions'
-          ? { sitting_id: selected.sitting_id, mode }
-          : { ...selected, mode, position: 'favor' };
-      const first = expectSuccessTwin(
-        await runToolContract(getPlenaryVotesTool, { ...input, limit: 1000 }),
-      );
-      expect(first[mode]).toHaveLength(100);
-      expect(first).toMatchObject({
-        totalCount: 101,
-        cap: 100,
-        page: { limit: 100, next_offset: 100 },
-      });
-      expect(first.notice).toBe(
-        'Requested limit normalized to the effective maximum of 100. Continue with offset 100 and the returned snapshot.',
-      );
-      const last = expectSuccessTwin(
-        await runToolContract(getPlenaryVotesTool, {
-          ...input,
-          offset: 100,
-          snapshot: snapshotOf(first),
-        }),
-      );
-      expect(last[mode]).toEqual(
-        mode === 'decisions'
-          ? [
+          ? Array.from({ length: cap + 1 }, (_, index) => ({
+              id: `eli/dl/event/EXAMPLE-${index}`,
+            }))
+          : [
               {
-                decision_id: 'EXAMPLE-100',
-                document_ids: [],
-                recording_document_ids: [],
-                voter_counts: [],
-                source_url: 'https://data.europarl.europa.eu/eli/dl/event/EXAMPLE-100',
+                ...decisionRecord,
+                had_voter_favor: Array.from(
+                  { length: cap + 1 },
+                  (_, index) => `person/${900000000 + index}`,
+                ),
               },
-            ]
-          : [{ mep_id: '900000100' }],
-      );
-    },
-  );
+            ],
+      ),
+    );
+    const input =
+      mode === 'decisions'
+        ? { sitting_id: selected.sitting_id, mode }
+        : { ...selected, mode, position: 'favor' };
+    const first = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, { ...input, limit: 5000 }),
+    );
+    expect(first[mode]).toHaveLength(cap);
+    expect(first).toMatchObject({
+      totalCount: cap + 1,
+      cap,
+      page: { limit: cap, next_offset: cap },
+    });
+    expect(first.notice).toBe(
+      `Requested limit normalized to the effective maximum of ${cap} ${mode}. Continue with offset ${cap} and the returned snapshot.`,
+    );
+    const last = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        ...input,
+        offset: cap,
+        snapshot: snapshotOf(first),
+      }),
+    );
+    expect(last[mode]).toEqual(
+      mode === 'decisions'
+        ? [
+            {
+              decision_id: 'EXAMPLE-100',
+              document_ids: [],
+              recording_document_ids: [],
+              voter_counts: [],
+              source_url: 'https://data.europarl.europa.eu/eli/dl/event/EXAMPLE-100',
+            },
+          ]
+        : [{ mep_id: '900001000' }],
+    );
+  });
+
+  it('returns a 618-voter position in one call without continuation', async () => {
+    const decision_id = 'MTG-PL-2024-03-13-DEC-166086';
+    const favor = Array.from({ length: 618 }, (_, index) => `person/${910000000 + index}`);
+    const fetcher = installToolHttp(() =>
+      envelopeResponse([
+        {
+          ...decisionRecord,
+          id: `eli/dl/event/${decision_id}`,
+          activity_id: decision_id,
+          activity_date: '2024-03-13',
+          had_voter_favor: favor,
+        },
+      ]),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        sitting_id: '2024-03-13',
+        decision_id,
+        mode: 'voters',
+        position: 'favor',
+        limit: 1000,
+      }),
+    );
+    expect(data.voters).toHaveLength(618);
+    expect(data).toMatchObject({
+      totalCount: 618,
+      page: { offset: 0, limit: 1000, returned: 618, has_more: false },
+      voters: expect.arrayContaining([{ mep_id: '910000617' }]),
+    });
+    expect(data.page).not.toHaveProperty('next_offset');
+    expect(data).not.toHaveProperty('notice');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
 
   it.each([204, 404])(
     'returns empty decisions for HTTP %i rather than parsing an empty body',
@@ -792,23 +828,23 @@ describe('euparl_get_plenary_votes contract', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it.each([{ sitting_id: '2025-02-30' }, { sitting_id: '2025-01-15', language: 'xx' }])(
-    'rejects unsupported semantic filters %j',
-    async (input) => {
-      const fetcher = installToolHttp(() => envelopeResponse([]));
-      expectErrorTwin(
-        await runToolContract(getPlenaryVotesTool, input),
-        'invalid_filter',
-        invalidHint,
-        JsonRpcErrorCode.ValidationError,
-      );
-      expect(fetcher).not.toHaveBeenCalled();
-    },
-  );
+  it.each([
+    [{ sitting_id: '2025-02-30' }, 'Pass an existing calendar day as YYYY-MM-DD.'],
+    [{ sitting_id: '2025-01-15', language: 'xx' }, invalidHint],
+  ])('rejects unsupported semantic filters %j', async (input, hint) => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    expectErrorTwin(
+      await runToolContract(getPlenaryVotesTool, input),
+      'invalid_filter',
+      hint,
+      JsonRpcErrorCode.ValidationError,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
 
   it.each([
     { sitting_id: 'https://evil.example/2025-01-15' },
-    { limit: 1001 },
+    { limit: 2.5 },
     { position: 'nonvoter' },
     { roster_term: 11 },
     { unknown: true },
