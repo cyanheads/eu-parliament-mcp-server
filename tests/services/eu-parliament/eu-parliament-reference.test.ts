@@ -90,5 +90,12 @@ describe('Parliament reference codes', () => {
     );
     expect(paging).toContain('EUPARL_CLAMP_LIMITS=false');
     expect(paging).toContain('an offset of 10000 or more is rejected');
+    expect(paging).toContain(
+      'A decisions page also ends at whole decisions before their rendered rows pass 92000 characters, with a notice; its first decision always returns whole, page.limit keeps the requested limit, and next_offset resumes at the first decision left out.',
+    );
+    expect(paging).toContain('procedures without process_type expose a 10000-result search window');
+    expect(paging).toContain(
+      'a process_type listing is acquired whole and paged in procedure_id order, and its snapshot is optional',
+    );
   });
 });

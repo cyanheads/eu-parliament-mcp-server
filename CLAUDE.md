@@ -59,7 +59,8 @@ The upstream API is keyless, with no base-URL override. `src/config/server-confi
 ### Domain invariants
 
 - Only adopted texts and speeches accept keyword search. Speech search accepts terms 9 and 10, defaulting to 10; document and speech detail returns metadata and file references, not extracted bodies.
-- Page whole items with `page.next_offset`; local collections require the returned `snapshot` above offset zero. Restart at zero without a snapshot after `snapshot_changed`.
+- Page whole items with `page.next_offset`; local collections require the returned `snapshot` above offset zero, except `process_type` procedure listings, where it is optional. Restart at zero without a snapshot after `snapshot_changed`.
+- Parliament serves each `/procedures` list request from one of two orderings, so upstream offsets repeat and skip rows; a `process_type` set is acquired whole in one request and sorted by `procedure_id`.
 - Current, explicit-term, and `mandate_date` rosters are acquired completely before filtering names. Voter name resolution needs `roster_term` and never supplies historical affiliations.
 - Preserve missing fields, language provenance, recorded versus intended voters, and absent versus published-empty voter arrays.
 - Keep source attribution to European Parliament Open Data, CC BY 4.0, and disclose identifier/structure normalization.
@@ -134,6 +135,7 @@ src/
     eu-parliament-schemas.ts         # Upstream JSON-LD edge schemas
     eu-parliament-normalization.ts   # IDs, localization and paging
     eu-parliament-reference.ts       # Supported filter codes and reference topics
+    eu-parliament-rendering.ts       # Field-path content[] text; sizes budgeted page rows
     eu-parliament-service.ts         # Domain workflows and service initialization
   mcp-server/tools/
     definitions/                    # Nine *.tool.ts definitions

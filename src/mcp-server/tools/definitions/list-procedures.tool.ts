@@ -30,7 +30,7 @@ const procedureSchema = z
 export const listProceduresTool = tool('euparl_list_procedures', {
   title: 'List parliamentary procedures',
   description:
-    'List procedure references by procedure type. Titles, stages, and participants require euparl_get_procedure with a returned procedure_id. Use euparl_list_reference topic procedure_types for supported process_type codes. No keyword, year, committee, or stage filter is available. Search exposes at most 10000 results; continue with page.next_offset when present, otherwise narrow process_type.',
+    'List procedure references by procedure type. Titles, stages, and participants require euparl_get_procedure with a returned procedure_id. Use euparl_list_reference topic procedure_types for supported process_type codes. No keyword, year, committee, or stage filter is available. With process_type, every procedure of that type is listed in procedure_id order: continue with page.next_offset, passing the returned page.snapshot to detect a changed set. Without process_type, at most 10000 results are reachable and Parliament serves pages from two orderings, so pages can repeat or omit procedures; continue with page.next_offset when present, and set process_type for a complete walk.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -38,6 +38,9 @@ export const listProceduresTool = tool('euparl_list_procedures', {
         'Optional procedure-type code from euparl_list_reference topic procedure_types; case-insensitive and whitespace-trimmed.',
       ),
       ...pagingInputFields('procedures'),
+      snapshot: optionalString().describe(
+        'Returned page.snapshot of a process_type listing; optional at every offset, and a set that changed since fails snapshot_changed. Rejected without process_type.',
+      ),
     })
     .strict(),
   output: z
@@ -52,9 +55,33 @@ export const listProceduresTool = tool('euparl_list_procedures', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A nonblank procedure type or language is unsupported, or offset is 10000 or more, past the 10000-result search window.',
+      when: 'A nonblank procedure type or language is unsupported, or offset is 10000 or more without process_type, past the 10000-result search window.',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'invalid_mode_fields',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'snapshot is supplied without process_type.',
+      recovery:
+        'Remove snapshot, or repeat the call with the process_type of the listing that returned it.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'snapshot_changed',
+      code: JsonRpcErrorCode.Conflict,
+      when: 'The complete process_type set changed since the supplied snapshot.',
+      recovery:
+        'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'upstream_paging_stalled',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'A process_type response holds fewer distinct procedures than its reported total, repeats a procedure, or reaches the 10000-result window.',
+      recovery:
+        'Retry the same euparl tool call later; do not treat an incomplete lookup as a complete result.',
       thrownBy: 'service',
     },
     {

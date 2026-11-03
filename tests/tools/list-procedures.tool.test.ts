@@ -18,8 +18,14 @@ const rejectedHint =
 const rateHint = 'Wait for the reported retry interval, then repeat the same euparl tool call.';
 const windowHint =
   'Narrow process_type to retrieve a smaller procedure set. Restart paging at offset 0 after narrowing.';
-const typedWindowHint =
-  'process_type is the only procedure filter, so no narrower procedure set exists. Restart at offset 0 with the same process_type and follow page.next_offset.';
+const modeHint =
+  'Remove snapshot, or repeat the call with the process_type of the listing that returned it.';
+const snapshotHint =
+  'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.';
+const stalledHint =
+  'Retry the same euparl tool call later; do not treat an incomplete lookup as a complete result.';
+const orderingNotice =
+  'Parliament serves each page of the unfiltered procedure listing from one of two orderings, so pages reached through next_offset can repeat some procedures and omit others. Set process_type for a complete walk in procedure_id order.';
 /** Upstream procedure page honoring the requested offset and limit, total past the window. */
 const procedurePage = (url: URL) => {
   const offset = Number(url.searchParams.get('offset'));
@@ -54,42 +60,37 @@ describe('euparl_list_procedures contract', () => {
     );
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
-  it('routes a past-window offset with process_type set back to offset 0 before HTTP', async () => {
-    const fetcher = installToolHttp(procedurePage);
-    expectErrorTwin(
-      await runToolContract(listProceduresTool, { process_type: 'cod', offset: 10000 }),
-      'invalid_filter',
-      typedWindowHint,
-      JsonRpcErrorCode.ValidationError,
-    );
-    expect(fetcher).not.toHaveBeenCalled();
-  });
-  const narrowRoute = 'Narrow process_type to retrieve a smaller procedure set.';
-  const typedRoute =
-    'process_type is the only procedure filter, so no narrower procedure set exists.';
-  it.each([
-    [{}, narrowRoute, typedRoute],
-    [{ process_type: 'COD' }, typedRoute, narrowRoute],
-  ])('states the exhausted-window route for %j on both surfaces', async (filter, route, other) => {
+  it('states the exhausted-window route without process_type on both surfaces', async () => {
     installToolHttp(procedurePage);
     const data = expectSuccessTwin(
-      await runToolContract(listProceduresTool, { ...filter, offset: 9900, limit: 1000 }),
+      await runToolContract(listProceduresTool, { offset: 9900, limit: 1000 }),
     );
     expect(data.page).not.toHaveProperty('next_offset');
     expect(data.notice).toContain(
-      `The 10000-result search window is exhausted; further matches cannot be ruled out. ${route}`,
+      'The 10000-result search window is exhausted; further matches cannot be ruled out. Narrow process_type to retrieve a smaller procedure set.',
     );
-    expect(data.notice).not.toContain(other);
   });
-  it('returns a full 300-row page with the cap notice on both surfaces for limit 5000', async () => {
-    const fetcher = installToolHttp(procedurePage);
+  it('returns a full 300-row process_type page with the cap notice on both surfaces for limit 5000', async () => {
+    const ids = Array.from({ length: 400 }, (_, index) => `2025-${String(index).padStart(4, '0')}`);
+    const fetcher = installToolHttp(() =>
+      Response.json({
+        data: ids.toReversed().map((id) => ({ id: `eli/dl/proc/${id}` })),
+        meta: { total: ids.length },
+      }),
+    );
     const result = await runToolContract(listProceduresTool, { process_type: 'COD', limit: 5000 });
     const data = expectSuccessTwin(result);
-    expect(data.items).toHaveLength(300);
+    expect(data.items).toEqual(
+      ids.slice(0, 300).map((id) => ({
+        procedure_id: id,
+        source_url: `https://data.europarl.europa.eu/eli/dl/proc/${id}`,
+      })),
+    );
     expect(data).toMatchObject({
       page: { offset: 0, limit: 300, returned: 300, has_more: true, next_offset: 300 },
       cap: 300,
       shown: 300,
+      totalCount: 400,
     });
     expect(data.notice).toContain(
       'Requested limit normalized to the effective maximum of 300 procedures.',
@@ -97,7 +98,7 @@ describe('euparl_list_procedures contract', () => {
     expect(contractText(result)).toContain(
       'Requested limit normalized to the effective maximum of 300 procedures.',
     );
-    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('300');
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('10000');
   });
   it.each([
     [9900, 100],
@@ -159,7 +160,7 @@ describe('euparl_list_procedures contract', () => {
           source_url: 'https://data.europarl.europa.eu/eli/dl/proc/2025-9002',
         },
       ],
-      page: { limit: 300, returned: 2, has_more: false },
+      page: { limit: 300, returned: 2, has_more: false, snapshot: expect.any(String) },
       appliedFilters: { process_type: 'COD' },
       totalCount: 2,
     });
@@ -168,7 +169,7 @@ describe('euparl_list_procedures contract', () => {
     );
     const url = new URL(String(fetcher.mock.calls[0]?.[0]));
     expect(url.searchParams.get('process-type')).toBe('COD');
-    expect(url.searchParams.get('limit')).toBe('300');
+    expect(url.searchParams.get('limit')).toBe('10000');
     expect(data.items).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ title: expect.anything() })]),
     );
@@ -206,16 +207,266 @@ describe('euparl_list_procedures contract', () => {
     expect(new URL(String(fetcher.mock.calls[1]?.[0])).searchParams.get('offset')).toBe('1');
   });
 
-  it.each([204, 404])(
-    'renders empty HTTP %i including past-end offset and guidance',
-    async (status) => {
-      installToolHttp(() => new Response(null, { status }));
-      const data = expectSuccessTwin(await runToolContract(listProceduresTool, { offset: 1000 }));
+  it('pages unfiltered procedures at the caller offset and limit with an exact smaller total', async () => {
+    const ids = Array.from({ length: 45 }, (_, index) => `2025-${String(index).padStart(4, '0')}`);
+    const fetcher = installToolHttp((url) => {
+      const offset = Number(url.searchParams.get('offset'));
+      const limit = Number(url.searchParams.get('limit'));
+      return Response.json({
+        data: ids.slice(offset, offset + limit).map((id) => ({ id: `eli/dl/proc/${id}` })),
+        meta: { total: ids.length },
+      });
+    });
+    const middle = expectSuccessTwin(
+      await runToolContract(listProceduresTool, { offset: 20, limit: 20 }),
+    );
+    expect(middle).toMatchObject({
+      items: ids.slice(20, 40).map((procedure_id) => ({ procedure_id })),
+      page: { offset: 20, limit: 20, returned: 20, has_more: true, next_offset: 40 },
+      totalCount: 45,
+    });
+    const last = expectSuccessTwin(
+      await runToolContract(listProceduresTool, { offset: 40, limit: 20 }),
+    );
+    expect(last).toMatchObject({
+      items: ids.slice(40).map((procedure_id) => ({ procedure_id })),
+      page: { offset: 40, limit: 20, returned: 5, has_more: false },
+      totalCount: 45,
+    });
+    expect(last.page).not.toHaveProperty('next_offset');
+    expect(last.page).not.toHaveProperty('snapshot');
+    expect(fetcher.mock.calls.map(([url]) => [...new URL(String(url)).searchParams])).toEqual([
+      [
+        ['offset', '20'],
+        ['limit', '20'],
+        ['format', 'application/ld+json'],
+      ],
+      [
+        ['offset', '40'],
+        ['limit', '20'],
+        ['format', 'application/ld+json'],
+      ],
+    ]);
+  });
+
+  describe('process_type local collection over two upstream orderings', () => {
+    /** 23 sparse and full rows; a letter-suffixed ID sorts after its bare number. */
+    const rows = Array.from({ length: 23 }, (_, index) => {
+      const id = `${2023 + (index % 3)}-${String(100 - index).padStart(4, '0')}${index === 5 ? 'A' : ''}`;
+      return {
+        id: `eli/dl/proc/${id}`,
+        ...(index % 3 === 0 && {
+          process_id: id,
+          label: `${id.replace('-', '/')}(COD)`,
+          process_type: 'def/ep-procedure-types/COD',
+        }),
+      };
+    });
+    const sortedIds = rows
+      .map((row) => row.id.slice('eli/dl/proc/'.length))
+      .toSorted((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    /** Parliament serves each request from one of two orderings of the same set, alternating here. */
+    const twoOrderings = (url: URL, _init: RequestInit | undefined, index: number) => {
+      const step = index % 2 === 0 ? 7 : 11;
+      const ordering = rows.map((_, position) => rows[(position * step) % rows.length]!);
+      const offset = Number(url.searchParams.get('offset'));
+      const limit = Number(url.searchParams.get('limit'));
+      return Response.json({
+        data: ordering.slice(offset, offset + limit),
+        meta: { total: rows.length },
+      });
+    };
+    const walk = async (limits: number[], passSnapshot: boolean) => {
+      const seen: string[] = [];
+      const snapshots = new Set<unknown>();
+      let offset = 0;
+      let snapshot: unknown;
+      for (let call = 0; call < 30; call++) {
+        const data = expectSuccessTwin(
+          await runToolContract(listProceduresTool, {
+            process_type: 'COD',
+            offset,
+            limit: limits[call % limits.length],
+            ...(passSnapshot && typeof snapshot === 'string' && { snapshot }),
+          }),
+        );
+        expect(data.totalCount).toBe(rows.length);
+        const page = data.page as { next_offset?: number; snapshot?: unknown };
+        seen.push(...(data.items as { procedure_id: string }[]).map((item) => item.procedure_id));
+        snapshots.add(page.snapshot);
+        snapshot = page.snapshot;
+        if (page.next_offset === undefined) break;
+        offset = page.next_offset;
+      }
+      return { seen, snapshots };
+    };
+
+    it.each([
+      ['a constant limit', [5], true],
+      ['a limit changing between calls', [3, 7, 4, 9, 2], true],
+      ['a constant limit without passing the snapshot', [5], false],
+    ])(
+      'yields every procedure exactly once in procedure_id order at %s',
+      async (_, limits, passSnapshot) => {
+        const fetcher = installToolHttp(twoOrderings);
+        const { seen, snapshots } = await walk(limits, passSnapshot);
+        expect(seen).toEqual(sortedIds);
+        expect(snapshots.size).toBe(1);
+        expect([...snapshots][0]).toMatch(/^[a-f0-9]{64}$/);
+        for (const [url] of fetcher.mock.calls)
+          expect([...new URL(String(url)).searchParams]).toEqual([
+            ['offset', '0'],
+            ['limit', '10000'],
+            ['process-type', 'COD'],
+            ['format', 'application/ld+json'],
+          ]);
+      },
+    );
+
+    it('fails snapshot_changed for a changed set and still serves the continuation without a snapshot', async () => {
+      const added = { id: 'eli/dl/proc/2023-0001' };
+      installToolHttp((url, init, index) =>
+        index === 0
+          ? twoOrderings(url, init, index)
+          : Response.json({ data: [...rows, added], meta: { total: rows.length + 1 } }),
+      );
+      const first = expectSuccessTwin(
+        await runToolContract(listProceduresTool, { process_type: 'COD', limit: 5 }),
+      );
+      const { snapshot } = first.page as { snapshot: string };
+      expectErrorTwin(
+        await runToolContract(listProceduresTool, {
+          process_type: 'COD',
+          offset: 5,
+          limit: 5,
+          snapshot,
+        }),
+        'snapshot_changed',
+        snapshotHint,
+        JsonRpcErrorCode.Conflict,
+      );
+      const unchecked = expectSuccessTwin(
+        await runToolContract(listProceduresTool, { process_type: 'COD', offset: 5, limit: 5 }),
+      );
+      expect(unchecked).toMatchObject({
+        items: ['2023-0001', ...sortedIds].slice(5, 10).map((procedure_id) => ({ procedure_id })),
+        page: { offset: 5, returned: 5, next_offset: 10 },
+        totalCount: rows.length + 1,
+      });
+      expect((unchecked.page as { snapshot: string }).snapshot).not.toBe(snapshot);
+    });
+
+    it.each([{}, { process_type: ' ' }])(
+      'rejects a snapshot without process_type (%j) before HTTP',
+      async (filter) => {
+        const fetcher = installToolHttp(twoOrderings);
+        expectErrorTwin(
+          await runToolContract(listProceduresTool, { ...filter, snapshot: 'a'.repeat(64) }),
+          'invalid_mode_fields',
+          modeHint,
+          JsonRpcErrorCode.ValidationError,
+        );
+        expect(fetcher).not.toHaveBeenCalled();
+      },
+    );
+
+    it('fails upstream_paging_stalled on both surfaces when a response holds fewer rows than meta.total', async () => {
+      const fetcher = installToolHttp(() =>
+        Response.json({ data: rows.slice(0, 20), meta: { total: rows.length } }),
+      );
+      const result = await runToolContract(listProceduresTool, { process_type: 'COD' });
+      expectErrorTwin(
+        result,
+        'upstream_paging_stalled',
+        stalledHint,
+        JsonRpcErrorCode.ServiceUnavailable,
+      );
+      expect(contractText(result)).toContain('20 distinct procedures in 20 rows');
+      expect(contractText(result)).not.toContain('procedure_id');
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([rows.length, 10_000])(
+      'serves offset %i, at or past the end of the set, as an empty page after one request',
+      async (offset) => {
+        const fetcher = installToolHttp(twoOrderings);
+        const data = expectSuccessTwin(
+          await runToolContract(listProceduresTool, { process_type: 'COD', offset }),
+        );
+        expect(data).toMatchObject({
+          items: [],
+          page: { offset, limit: 20, returned: 0, has_more: false },
+          totalCount: rows.length,
+        });
+        expect(data.page).toHaveProperty('snapshot');
+        expect(data).not.toHaveProperty('notice');
+        expect(fetcher).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it.each([
+      ['HTTP 204', () => new Response(null, { status: 204 })],
+      ['an empty 200 envelope', () => Response.json({ data: [], meta: { total: 0 } })],
+    ])('lists an empty process_type set from %s with totalCount 0', async (_, respond) => {
+      installToolHttp(respond);
+      const data = expectSuccessTwin(
+        await runToolContract(listProceduresTool, { process_type: 'BUI' }),
+      );
       expect(data).toMatchObject({
         items: [],
-        page: { offset: 1000, returned: 0, has_more: false },
+        page: { offset: 0, returned: 0, has_more: false },
+        totalCount: 0,
         notice:
           'No procedures matched. Remove process_type or call euparl_list_reference with topic procedure_types.',
+      });
+    });
+
+    it('discloses two upstream orderings on every unfiltered page and never on process_type pages', async () => {
+      installToolHttp(twoOrderings);
+      for (const offset of [0, 5]) {
+        const unfiltered = expectSuccessTwin(
+          await runToolContract(listProceduresTool, { offset, limit: 5 }),
+        );
+        expect(unfiltered.notice).toContain(orderingNotice);
+        expect(unfiltered.page).not.toHaveProperty('snapshot');
+      }
+      const typed = expectSuccessTwin(
+        await runToolContract(listProceduresTool, { process_type: 'COD', limit: 5 }),
+      );
+      expect(typed.notice).toBe('Continue with offset 5 and the returned snapshot.');
+    });
+  });
+
+  it.each([
+    [
+      204,
+      0,
+      'No procedures matched. Remove process_type or call euparl_list_reference with topic procedure_types.',
+    ],
+    [
+      404,
+      0,
+      'No procedures matched. Remove process_type or call euparl_list_reference with topic procedure_types.',
+    ],
+    [
+      204,
+      1000,
+      'The page at offset 1000 returned no procedures. Restart at offset 0 or return to the previous page.',
+    ],
+    [
+      404,
+      1000,
+      'The page at offset 1000 returned no procedures. Restart at offset 0 or return to the previous page.',
+    ],
+  ] as const)(
+    'renders unfiltered empty HTTP %i at offset %i with guidance for that position',
+    async (status, offset, notice) => {
+      installToolHttp(() => new Response(null, { status }));
+      const data = expectSuccessTwin(await runToolContract(listProceduresTool, { offset }));
+      expect(data).toMatchObject({
+        items: [],
+        page: { offset, returned: 0, has_more: false },
+        notice: `${notice} ${orderingNotice}`,
       });
       expect(data).not.toHaveProperty('totalCount');
     },

@@ -147,6 +147,29 @@ const snapshotOf = (data: Record<string, unknown>) =>
 afterEach(() => vi.useRealTimers());
 
 describe('euparl_get_procedure contract', () => {
+  it('routes a vote-results event id to vote_item_id and older sittings to decision labels', () => {
+    const event = z
+      .object({
+        properties: z.object({
+          events: z.object({
+            items: z.object({
+              properties: z.object({
+                id: z.object({ description: z.string() }),
+                sitting_ids: z.object({ description: z.string() }),
+              }),
+            }),
+          }),
+        }),
+      })
+      .parse(z.toJSONSchema(getProcedureTool.output)).properties.events.items.properties;
+    expect(event.id.description).toContain(
+      'A PLENARY_VOTE_RESULTS event id is a vote item: pass it as vote_item_id to euparl_get_plenary_votes',
+    );
+    expect(event.sitting_ids.description).toContain('decisions with vote_item_id or document_id');
+    expect(event.sitting_ids.description).toContain(
+      'find the report citation in decision labels instead',
+    );
+  });
   it.each([
     '2025-9001',
     '2025/9001(COD)',

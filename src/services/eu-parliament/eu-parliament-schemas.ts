@@ -8,18 +8,38 @@ import { z } from 'zod';
 const localizedSchema = z.record(z.string(), z.string());
 const referenceSchema = z.union([z.string(), z.object({ id: z.string() })]);
 const referencesSchema = z.union([referenceSchema, z.array(referenceSchema)]).optional();
-/** Participation may be a singleton object on speech records. */
-const participationSchema = z.object({
-  id: z.string(),
-  had_participant_person: referencesSchema,
-  had_participant_organization: referencesSchema,
-  participation_role: z.string().optional(),
+/**
+ * An activity date that is not a plain xsd:date compacts to the prefixed key as a typed literal:
+ * 2014–2019 sittings publish xsd:dateTime local midnight (`2019-07-02T00:00:00+02:00`).
+ */
+const activityDateFields = {
   activity_date: z.string().optional(),
-  occured_at_stage: z.string().optional(),
-  politicalGroup: z.string().optional(),
-  participation_in_name_of: z.string().optional(),
-  parliamentary_term: z.string().optional(),
-});
+  'eli-dl:activity_date': z.object({ '@value': z.string().regex(/^\d{4}-\d{2}-\d{2}/) }).optional(),
+};
+type ActivityDated = z.infer<z.ZodObject<typeof activityDateFields>>;
+/**
+ * Folds the typed literal into `activity_date` as its calendar day as written (never the UTC
+ * day), the form later years publish, so readers see one key.
+ */
+function foldActivityDate<T extends ActivityDated>(raw: T): Omit<T, 'eli-dl:activity_date'> {
+  const { 'eli-dl:activity_date': typed, ...rest } = raw;
+  const date = raw.activity_date ?? typed?.['@value'].slice(0, 10);
+  return date === undefined ? rest : { ...rest, activity_date: date };
+}
+/** Participation may be a singleton object on speech records. */
+const participationSchema = z
+  .object({
+    id: z.string(),
+    had_participant_person: referencesSchema,
+    had_participant_organization: referencesSchema,
+    participation_role: z.string().optional(),
+    ...activityDateFields,
+    occured_at_stage: z.string().optional(),
+    politicalGroup: z.string().optional(),
+    participation_in_name_of: z.string().optional(),
+    parliamentary_term: z.string().optional(),
+  })
+  .transform(foldActivityDate);
 const participationsSchema = z
   .union([participationSchema, z.array(participationSchema)])
   .optional();
@@ -57,25 +77,35 @@ const documentFields = {
 };
 /** Generic works include sparse speech subdivisions and embedded answers. */
 export const documentSchema = z.object(documentFields);
+/**
+ * Family record (`/adopted-texts|committee-documents|plenary-documents/{id}`) read only for the
+ * relation the generic record lacks, which mixes procedures with sitting events.
+ */
+export const documentFamilySchema = z.object({
+  id: z.string(),
+  inverse_created_a_realization_of: referencesSchema,
+});
 /** Question detail embeds answer work records. */
 export const questionSchema = z.object({
   ...documentFields,
   inverse_answers_to: z.array(z.union([z.string(), documentSchema])).optional(),
 });
 /** Event relationships vary by activity type. */
-const eventSchema = z.object({
-  id: z.string(),
-  activity_id: z.string().optional(),
-  activity_date: z.string().optional(),
-  had_activity_type: z.string().optional(),
-  occured_at_stage: z.string().optional(),
-  decided_on_a_realization_of: referencesSchema,
-  based_on_a_realization_of: referencesSchema,
-  recorded_in_a_realization_of: referencesSchema,
-  created_a_realization_of: referencesSchema,
-  documented_by_a_realization_of: referencesSchema,
-  was_scheduled_in: referencesSchema,
-});
+const eventSchema = z
+  .object({
+    id: z.string(),
+    activity_id: z.string().optional(),
+    ...activityDateFields,
+    had_activity_type: z.string().optional(),
+    occured_at_stage: z.string().optional(),
+    decided_on_a_realization_of: referencesSchema,
+    based_on_a_realization_of: referencesSchema,
+    recorded_in_a_realization_of: referencesSchema,
+    created_a_realization_of: referencesSchema,
+    documented_by_a_realization_of: referencesSchema,
+    was_scheduled_in: referencesSchema,
+  })
+  .transform(foldActivityDate);
 /** Procedure detail and sparse catalogue entries share one validated noun. */
 export const procedureSchema = z.object({
   id: z.string(),
@@ -115,41 +145,48 @@ export const mepSchema = z.object({
 const activityFields = {
   id: z.string(),
   activity_id: z.string().optional(),
-  activity_date: z.string().optional(),
+  ...activityDateFields,
   activity_start_date: z.string().optional(),
   activity_end_date: z.string().optional(),
   activity_label: localizedSchema.optional(),
   had_activity_type: z.string().optional(),
 };
 /** Speech labels and document references do not imply a transcript. */
-export const speechSchema = z.object({
-  ...activityFields,
-  had_participation: participationsSchema,
-  recorded_in_a_realization_of: referencesSchema,
-});
+export const speechSchema = z
+  .object({
+    ...activityFields,
+    had_participation: participationsSchema,
+    recorded_in_a_realization_of: referencesSchema,
+  })
+  .transform(foldActivityDate);
 /** Sitting discovery uses the source activity identity. */
-export const sittingSchema = z.object(activityFields);
+export const sittingSchema = z.object(activityFields).transform(foldActivityDate);
 /** Recorded and intended arrays remain separately optional. */
-export const decisionSchema = z.object({
-  ...activityFields,
-  activity_order: z.string().optional(),
-  decision_method: z.string().optional(),
-  decision_outcome: z.string().optional(),
-  number_of_attendees: z.number().optional(),
-  number_of_votes_favor: z.number().optional(),
-  number_of_votes_against: z.number().optional(),
-  number_of_votes_abstention: z.number().optional(),
-  had_voter_favor: z.array(z.string()).optional(),
-  had_voter_against: z.array(z.string()).optional(),
-  had_voter_abstention: z.array(z.string()).optional(),
-  had_voter_intended_favor: z.array(z.string()).optional(),
-  had_voter_intended_against: z.array(z.string()).optional(),
-  had_voter_intended_abstention: z.array(z.string()).optional(),
-  decided_on_a_realization_of: referencesSchema,
-  recorded_in_a_realization_of: referencesSchema,
-  referenceText: localizedSchema.optional(),
-  comment: localizedSchema.optional(),
-});
+export const decisionSchema = z
+  .object({
+    ...activityFields,
+    activity_order: z.string().optional(),
+    decision_method: z.string().optional(),
+    decision_outcome: z.string().optional(),
+    number_of_attendees: z.number().optional(),
+    number_of_votes_favor: z.number().optional(),
+    number_of_votes_against: z.number().optional(),
+    number_of_votes_abstention: z.number().optional(),
+    had_voter_favor: z.array(z.string()).optional(),
+    had_voter_against: z.array(z.string()).optional(),
+    had_voter_abstention: z.array(z.string()).optional(),
+    had_voter_intended_favor: z.array(z.string()).optional(),
+    had_voter_intended_against: z.array(z.string()).optional(),
+    had_voter_intended_abstention: z.array(z.string()).optional(),
+    decided_on_a_realization_of: referencesSchema,
+    decided_on_a_part_of_a_realization_of: referencesSchema,
+    recorded_in_a_realization_of: referencesSchema,
+    /** The vote item (a procedure's PLENARY_VOTE_RESULTS event) this decision belongs to. */
+    inverse_consists_of: referencesSchema,
+    referenceText: localizedSchema.optional(),
+    comment: localizedSchema.optional(),
+  })
+  .transform(foldActivityDate);
 /** Live reference bodies carry classification rather than filter-code guesses. */
 export const bodySchema = z.object({
   id: z.string(),

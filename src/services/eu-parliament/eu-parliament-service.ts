@@ -4,6 +4,7 @@
  */
 import type { Context } from '@cyanheads/mcp-ts-core';
 import {
+  McpError,
   notFound,
   serializationError,
   serviceUnavailable,
@@ -15,10 +16,13 @@ import {
   type Envelope,
   EuParliamentClient,
   type Operation,
+  operationTimeoutMs,
 } from './eu-parliament-client.js';
 import {
   activityId,
   canonicalId,
+  compareText,
+  type DecisionSummary,
   decisionVoters,
   field,
   localized,
@@ -36,26 +40,33 @@ import {
   type PageWindow,
   type Paging,
   pageCaps,
+  pageRowBudgetChars,
   pageWindow,
+  procedureIds,
   sourceUrl,
   upstreamPage,
   type VoterPosition,
 } from './eu-parliament-normalization.js';
 import {
+  documentFamily,
   normalizeCode,
   type ReferenceEntry,
   type ReferenceTopic,
   referenceEntries,
 } from './eu-parliament-reference.js';
+import { renderedChars } from './eu-parliament-rendering.js';
 import {
   bodySchema,
   decisionSchema,
+  documentFamilySchema,
   documentSchema,
   mepSchema,
   procedureSchema,
   questionSchema,
   type RawBody,
+  type RawDocument,
   type RawMep,
+  type RawProcedure,
   type RawQuestion,
   sittingSchema,
   speechSchema,
@@ -140,6 +151,7 @@ export interface VotesInput extends Paging {
   resolve_names?: boolean;
   roster_term?: number;
   sitting_id?: string;
+  vote_item_id?: string;
   year?: number;
 }
 /** Questions resolve exact citations across every term overlapping the citation year. */
@@ -293,16 +305,105 @@ function searchPage(
     );
   return { page, total: total !== undefined && total < searchResultWindow ? total : undefined };
 }
+/**
+ * An empty upstream page at offset 0 means nothing matched. Past it, the empty page says nothing
+ * about earlier pages (a 204 carries no total), so the notice names only the position.
+ */
+function emptyNotice(offset: number, collection: PagedCollection, noMatch: string): string {
+  return offset > 0
+    ? `The page at offset ${offset} returned no ${pageCaps[collection].noun}. Restart at offset 0 or return to the previous page.`
+    : noMatch;
+}
 const documentEndpoints = {
   adopted_texts: 'adopted-texts',
   committee: 'committee-documents',
   plenary: 'plenary-documents',
 } as const;
-function stalled(): never {
-  throw serviceUnavailable(
-    'Parliament pagination did not establish a complete collection. Retry later.',
-    { reason: 'upstream_paging_stalled', retryable: false },
+/** Sparse catalogue row; titles, stages and participants need a procedure lookup. */
+function procedureRow(raw: RawProcedure) {
+  return {
+    procedure_id: raw.process_id ?? canonicalId(raw.id, 'procedure'),
+    ...field('reference', raw.label),
+    ...field('process_type', raw.process_type),
+    source_url: sourceUrl(raw.id),
+  };
+}
+function stalled(
+  message = 'Parliament pagination did not establish a complete collection. Retry later.',
+): never {
+  throw serviceUnavailable(message, { reason: 'upstream_paging_stalled', retryable: false });
+}
+const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? '' : 's'}`;
+/** Vote items a steering notice names; it counts the rest, and every decision row lists its own. */
+const namedVoteItems = 5;
+/**
+ * Name the vote items holding decisions document_id matched beside decisions it left out, in
+ * first-match order, so a caller starting from a report reaches the whole vote.
+ */
+function voteItemSteering(
+  decisions: DecisionSummary[],
+  matched: DecisionSummary[],
+): string | undefined {
+  const selected = new Set(matched);
+  const counts = new Map<string, { all: number; left: number }>();
+  for (const decision of decisions)
+    for (const item of decision.vote_item_ids) {
+      const count = counts.get(item) ?? { all: 0, left: 0 };
+      count.all++;
+      if (!selected.has(decision)) count.left++;
+      counts.set(item, count);
+    }
+  const split = [...new Set(matched.flatMap((decision) => decision.vote_item_ids))].flatMap(
+    (item) => {
+      const count = counts.get(item);
+      return count?.left ? [{ item, ...count }] : [];
+    },
   );
+  if (!split.length) return undefined;
+  const named = split
+    .slice(0, namedVoteItems)
+    .map(({ item, all, left }) => `${item} (${left} of ${all} left out)`);
+  const rest = split.slice(namedVoteItems);
+  if (rest.length)
+    named.push(
+      `and ${plural(rest.length, 'more vote item')} (${plural(
+        rest.reduce((sum, { left }) => sum + left, 0),
+        'decision',
+      )} left out; each decision row lists its vote_item_ids)`,
+    );
+  return `document_id left out other decisions of the vote items it matched: ${named.join(', ')}. Pass a vote item as vote_item_id without document_id to read all of its decisions.`;
+}
+/**
+ * Why a decisions page is empty: a sitting that published no decisions routes to sitting
+ * discovery whatever the filters; otherwise the filter that matched nothing and the lever that helps.
+ */
+function decisionsUnmatched(
+  decisions: DecisionSummary[],
+  document_id: string | undefined,
+  vote_item_id: string | undefined,
+): string {
+  if (!decisions.length)
+    return 'No decision data was published for this sitting. Call euparl_get_plenary_votes with mode sittings and year to discover available sittings.';
+  const related = (decision: DecisionSummary) =>
+    decision.document_ids.length > 0 ||
+    decision.partial_document_ids.length > 0 ||
+    decision.vote_item_ids.length > 0;
+  if (!decisions.some(related)) {
+    const names = [
+      ...(document_id === undefined ? [] : ['document_id']),
+      ...(vote_item_id === undefined ? [] : ['vote_item_id']),
+    ].join(' and ');
+    return `No decision in this sitting publishes a decided-on, part-of or vote-item relation, so a report or vote item cannot select its decisions. Remove ${names} and find the report's citation (its document label, such as A9-0188/2023) in decision labels.`;
+  }
+  if (vote_item_id !== undefined) {
+    const held = decisions.filter((decision) => decision.vote_item_ids.includes(vote_item_id));
+    return held.length > 0
+      ? `No decision of vote_item_id matched document_id. Remove document_id to read the vote item's ${plural(held.length, 'decision')}.`
+      : 'No decision in this sitting belongs to vote_item_id. Remove vote_item_id to inspect all published decisions.';
+  }
+  return decisions.some((decision) => decision.vote_item_ids.length > 0)
+    ? "No decisions matched document_id in the complete sitting. A vote can decide on no document: pass the procedure's PLENARY_VOTE_RESULTS event id as vote_item_id, or remove document_id to inspect all published decisions."
+    : 'No decisions matched document_id in the complete sitting. Remove document_id to inspect all published decisions.';
 }
 
 /** Public GET workflow service; one client instance shares pacing across operations. */
@@ -386,7 +487,11 @@ export class EuParliamentService {
       const items = response.data.map(normalizeBody);
       if (!items.length)
         notices.push(
-          'No reference entries matched. Call euparl_list_reference with topic identifiers to inspect accepted identifiers.',
+          emptyNotice(
+            paging.offset,
+            'reference',
+            'No reference entries matched. Call euparl_list_reference with topic identifiers to inspect accepted identifiers.',
+          ),
         );
       return result(
         { topic: input.topic, items, page: upstreamPage(items.length, paging, response.total) },
@@ -405,44 +510,67 @@ export class EuParliamentService {
     );
   }
 
-  /** Catalogue rows deliberately do not claim procedure titles. */
+  /**
+   * Catalogue rows deliberately do not claim procedure titles. Parliament serves each
+   * `/procedures` request from one of two orderings of the same set, so upstream offsets repeat
+   * and skip rows across calls. A `process_type` set fits inside the 10000-result window, so it is
+   * acquired whole in one request and paged locally in `procedure_id` order; its snapshot is
+   * optional because that order is deterministic for an unchanged set. Unfiltered listings exceed
+   * the window, so they keep upstream paging and disclose the overlap.
+   */
   async listProcedures(input: ProceduresInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const paging = scopePage(input, 'procedures', searchResultWindow);
     const process_type = normalizeCode(input.process_type, 'process_type');
+    const filters = { ...field('process_type', process_type) };
+    const noMatches =
+      'No procedures matched. Remove process_type or call euparl_list_reference with topic procedure_types.';
+    if (process_type === undefined) {
+      const paging = scopePage(input, 'procedures', searchResultWindow);
+      if (input.snapshot !== undefined)
+        invalidMode('snapshot applies only to a process_type listing.');
+      const notices = noticesFor(input, paging, 'procedures');
+      const narrowing = 'Narrow process_type to retrieve a smaller procedure set.';
+      searchWindow(paging, `${narrowing} ${restartAfterNarrowing}`);
+      const response = await this.client.get(
+        'procedures',
+        { offset: paging.offset, limit: paging.limit },
+        procedureSchema,
+        operation,
+      );
+      const items = response.data.map(procedureRow);
+      if (!items.length) notices.push(emptyNotice(paging.offset, 'procedures', noMatches));
+      const paged = searchPage(items.length, paging, response.total, notices, narrowing);
+      notices.push(
+        'Parliament serves each page of the unfiltered procedure listing from one of two orderings, so pages reached through next_offset can repeat some procedures and omit others. Set process_type for a complete walk in procedure_id order.',
+      );
+      return result({ items, page: paged.page }, filters, notices, paged.total);
+    }
+    const paging = scopePage(input, 'procedures');
     const notices = noticesFor(input, paging, 'procedures');
-    // process_type is the only procedure filter: once set, nothing narrower is left to offer.
-    const [narrowing, restart] =
-      process_type === undefined
-        ? ['Narrow process_type to retrieve a smaller procedure set.', restartAfterNarrowing]
-        : [
-            'process_type is the only procedure filter, so no narrower procedure set exists.',
-            'Restart at offset 0 with the same process_type and follow page.next_offset.',
-          ];
-    searchWindow(paging, `${narrowing} ${restart}`);
+    // The whole-set read (about 1 MB for RSP) may outlast the 15 s attempt bound, never the deadline.
     const response = await this.client.get(
       'procedures',
-      { offset: paging.offset, limit: paging.limit, 'process-type': process_type },
+      { offset: 0, limit: searchResultWindow, 'process-type': process_type },
       procedureSchema,
       operation,
+      { attemptLimitMs: operationTimeoutMs },
     );
-    const items = response.data.map((raw) => ({
-      procedure_id: raw.process_id ?? canonicalId(raw.id, 'procedure'),
-      ...field('reference', raw.label),
-      ...field('process_type', raw.process_type),
-      source_url: sourceUrl(raw.id),
-    }));
-    if (!items.length)
-      notices.push(
-        'No procedures matched. Remove process_type or call euparl_list_reference with topic procedure_types.',
+    const items = response.data
+      .map(procedureRow)
+      .toSorted((a, b) => compareText(a.procedure_id, b.procedure_id));
+    const distinct = new Set(items.map((item) => item.procedure_id)).size;
+    // A total at the window is capped, and a full window without one may be cut: neither is whole.
+    const atWindow =
+      response.total === undefined
+        ? items.length >= searchResultWindow
+        : response.total >= searchResultWindow;
+    if (atWindow || distinct < items.length || distinct < (response.total ?? 0))
+      stalled(
+        `Parliament returned ${distinct} distinct procedures in ${items.length} rows for process_type ${process_type} against a reported total of ${response.total ?? 'none'}, so the complete set was not acquired. Retry later.`,
       );
-    const paged = searchPage(items.length, paging, response.total, notices, narrowing);
-    return result(
-      { items, page: paged.page },
-      { ...field('process_type', process_type) },
-      notices,
-      paged.total,
-    );
+    if (!items.length) notices.push(noMatches);
+    const page = localPage(items, paging, filters);
+    return result({ items: page.items, page: page.page }, filters, notices, page.total);
   }
 
   /** Overview omits collections; selected sections use complete-record snapshots. */
@@ -564,11 +692,15 @@ export class EuParliamentService {
         notices.push(
           'No document detail was published. Call euparl_search_documents in search mode to discover identifiers.',
         );
+      const familyIds = raw ? await this.familyProcedureIds(raw, operation, notices) : [];
       return result(
         {
           mode,
           found: !!raw,
-          ...field('document', raw ? normalizeDocument(raw, paging.language, notices) : undefined),
+          ...field(
+            'document',
+            raw ? normalizeDocument(raw, paging.language, notices, familyIds) : undefined,
+          ),
         },
         { mode, document_id, language: paging.language },
         notices,
@@ -637,13 +769,53 @@ export class EuParliamentService {
     const items = response.data.map(normalizeDocumentSummary);
     if (!items.length)
       notices.push(
-        'No documents matched. Remove a named filter, or call euparl_list_reference with topic document_types; keyword search is available only for adopted_texts.',
+        emptyNotice(
+          paging.offset,
+          'documents',
+          'No documents matched. Remove a named filter, or call euparl_list_reference with topic document_types; keyword search is available only for adopted_texts.',
+        ),
       );
     const paged =
       source === 'adopted_texts'
         ? searchPage(items.length, paging, response.total, notices, narrowing)
         : { page: upstreamPage(items.length, paging, response.total), total: response.total };
     return result({ mode, source, items, page: paged.page }, filters, notices, paged.total);
+  }
+
+  /**
+   * Procedures of an adopted text, plenary or committee document, published only on its family
+   * record: one attempt inside the get's deadline, with `language=mul` so no expression is
+   * embedded. 204/404 means the family publishes no record. Any other classified failure leaves
+   * the generic answer standing with a notice; caller cancellation and unclassified throws
+   * propagate.
+   */
+  private async familyProcedureIds(
+    raw: RawDocument,
+    operation: Operation,
+    notices: string[],
+  ): Promise<string[]> {
+    const family = documentFamily(raw.work_type);
+    if (!family) return [];
+    const document_id = canonicalId(raw.identifier ?? raw.id, 'document');
+    try {
+      const response = await this.client.get(
+        `${documentEndpoints[family]}/${document_id}`,
+        { language: 'mul' },
+        documentFamilySchema,
+        operation,
+        { attempts: 1 },
+      );
+      if (response.status !== 'ok') return [];
+      const [record] = response.data;
+      if (response.data.length === 1 && record?.id === raw.id)
+        return procedureIds(record.inverse_created_a_realization_of);
+    } catch (error) {
+      if (operation.callerSignal.aborted || !(error instanceof McpError)) throw error;
+    }
+    notices.push(
+      `The procedure relation could not be read from the ${family} family record of this document, so procedure_ids may be incomplete; repeat the same get to retry.`,
+    );
+    return [];
   }
 
   /** Speech results preserve metadata rather than manufacturing transcripts. */
@@ -705,7 +877,11 @@ export class EuParliamentService {
     const items = response.data.map((raw) => normalizeSpeech(raw, paging.language, notices));
     if (!items.length)
       notices.push(
-        'No speech records matched. Broaden sitting_date or remove person_id; call euparl_list_reference with topic activity_types. Speech search supports terms 9 and 10.',
+        emptyNotice(
+          paging.offset,
+          'speeches',
+          `No speech records matched in term ${term}${input.term === undefined ? ' (the default)' : ''}. Term 9 ran 2019-07-02 to 2024-07-15 and term 10 began 2024-07-16; ${input.sitting_date === undefined ? 'pass term to search the other term' : 'pass the term containing sitting_date'}. Speech records do not cover every date of a term; euparl_list_reference topic coverage gives the dates they cover. Otherwise broaden sitting_date or remove person_id; call euparl_list_reference with topic activity_types.`,
+        ),
       );
     const paged = searchPage(items.length, paging, response.total, notices, narrowing);
     return result(
@@ -916,10 +1092,13 @@ export class EuParliamentService {
     const collection = mode === 'sittings' || mode === 'voters' ? mode : 'decisions';
     const paging = scopePage(input, collection);
     const notices = noticesFor(input, paging, collection);
-    if (mode !== 'decisions') forbid(input, ['document_id']);
+    if (mode !== 'decisions') forbid(input, ['document_id', 'vote_item_id']);
     if (mode !== 'decision') forbid(input, ['mep_id']);
     const document_id = input.document_id?.trim()
       ? canonicalId(input.document_id, 'document')
+      : undefined;
+    const vote_item_id = input.vote_item_id?.trim()
+      ? canonicalId(input.vote_item_id, 'activity')
       : undefined;
     const mep_id = input.mep_id?.trim() ? canonicalId(input.mep_id, 'person') : undefined;
     if (mode !== 'voters' && (input.resolve_names || input.roster_term !== undefined))
@@ -939,7 +1118,14 @@ export class EuParliamentService {
         ...field('label', localized(raw.activity_label, paging.language, notices)),
         source_url: sourceUrl(raw.id),
       }));
-      if (!sittings.length) notices.push('No sittings matched this year. Try another year.');
+      if (!sittings.length)
+        notices.push(
+          emptyNotice(
+            paging.offset,
+            'sittings',
+            'No sittings matched this year. Try another year.',
+          ),
+        );
       return result(
         { mode, sittings, page: upstreamPage(sittings.length, paging, response.total) },
         { mode, year: input.year, language: paging.language },
@@ -953,6 +1139,13 @@ export class EuParliamentService {
     if (!/^MTG-PL-\d{4}-\d{2}-\d{2}$/.test(sitting_id))
       invalidFilter('Use a sitting date or exact MTG-PL-YYYY-MM-DD identifier.');
     date(sitting_id.slice(7));
+    // A vote item names its sitting; a mismatch could only return an empty whole-sitting download.
+    const voteItemDate = vote_item_id?.match(/^MTG-PL-(\d{4}-\d{2}-\d{2})-/)?.[1];
+    if (voteItemDate !== undefined && voteItemDate !== sitting_id.slice(7))
+      invalidFilter(
+        `vote_item_id belongs to the ${voteItemDate} sitting, not ${sitting_id.slice(7)}.`,
+        `Retry with sitting_id ${voteItemDate}, the date in vote_item_id.`,
+      );
     if (mode === 'decisions') forbid(input, ['decision_id', 'position']);
     if (mode === 'decision') {
       forbid(input, ['position']);
@@ -982,6 +1175,7 @@ export class EuParliamentService {
       language: paging.language,
       ...field('decision_id', decision_id),
       ...field('document_id', document_id),
+      ...field('vote_item_id', vote_item_id),
       ...field('mep_id', mep_id),
       ...field('position', input.position),
       ...(mode === 'voters' && {
@@ -993,20 +1187,27 @@ export class EuParliamentService {
       const decisions = response.data.map((raw) =>
         normalizeDecisionSummary(raw, paging.language, notices),
       );
-      const selected =
-        document_id === undefined
-          ? decisions
-          : decisions.filter((decision) =>
-              [...decision.document_ids, ...decision.recording_document_ids].some(
-                (id) => id === document_id || id.startsWith(`${document_id}-`),
-              ),
-            );
-      const page = localPage(selected, paging, filters);
-      if (!page.total)
+      const selected = decisions.filter(
+        (decision) =>
+          (document_id === undefined ||
+            [
+              ...decision.document_ids,
+              ...decision.recording_document_ids,
+              ...decision.partial_document_ids,
+            ].some((id) => id === document_id || id.startsWith(`${document_id}-`))) &&
+          (vote_item_id === undefined || decision.vote_item_ids.includes(vote_item_id)),
+      );
+      const page = localPage(selected, paging, filters, (decision, index) =>
+        renderedChars(decision, `result.decisions[${index}]`),
+      );
+      if (!page.total) notices.push(decisionsUnmatched(decisions, document_id, vote_item_id));
+      else if (document_id !== undefined && vote_item_id === undefined) {
+        const steering = voteItemSteering(decisions, selected);
+        if (steering) notices.push(steering);
+      }
+      if (page.items.length < Math.min(paging.limit, page.total - paging.offset))
         notices.push(
-          document_id === undefined
-            ? 'No decision data was published for this sitting. Call euparl_get_plenary_votes with mode sittings and year to discover available sittings.'
-            : 'No decisions matched document_id in the complete sitting. Remove document_id to inspect all published decisions.',
+          `The ${pageRowBudgetChars}-character budget for decision rows ended this page after ${plural(page.items.length, 'whole decision')}.`,
         );
       return result(
         { mode, sitting_id, decisions: page.items, page: page.page },
@@ -1059,7 +1260,7 @@ export class EuParliamentService {
       );
       if (resolution.unresolved)
         notices.push(
-          'Some voter identities are unresolved. Call euparl_get_mep with the returned mep_id.',
+          'Some voter identities are unresolved. roster_term must be the term containing the sitting date (voter_resolution.sitting_date); if it is not, retry with that term. Call euparl_get_mep with any mep_id still unresolved.',
         );
     }
     const page = localPage(voters, paging, {
@@ -1107,7 +1308,11 @@ export class EuParliamentService {
       }));
       if (!items.length)
         notices.push(
-          'No questions matched. Remove work_type or change year; call euparl_list_reference with topic question_types.',
+          emptyNotice(
+            paging.offset,
+            'questions',
+            'No questions matched. Remove work_type or change year; call euparl_list_reference with topic question_types.',
+          ),
         );
       return result(
         { mode, items, page: upstreamPage(items.length, paging, response.total) },

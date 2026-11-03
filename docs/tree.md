@@ -1,6 +1,6 @@
 # eu-parliament-mcp-server - Directory Structure
 
-Generated on: 2026-11-01 11:05:42
+Generated on: 2026-11-03 03:45:29
 
 ```text
 eu-parliament-mcp-server/
@@ -165,6 +165,7 @@ eu-parliament-mcp-server/
 │   │       ├── eu-parliament-client.ts
 │   │       ├── eu-parliament-normalization.ts
 │   │       ├── eu-parliament-reference.ts
+│   │       ├── eu-parliament-rendering.ts
 │   │       ├── eu-parliament-schemas.ts
 │   │       └── eu-parliament-service.ts
 │   └── index.ts
@@ -185,6 +186,7 @@ eu-parliament-mcp-server/
 │   │       ├── eu-parliament-client.test.ts
 │   │       ├── eu-parliament-normalization.test.ts
 │   │       ├── eu-parliament-reference.test.ts
+│   │       ├── eu-parliament-rendering.test.ts
 │   │       ├── eu-parliament-schemas.test.ts
 │   │       └── eu-parliament-service.test.ts
 │   ├── smoke/

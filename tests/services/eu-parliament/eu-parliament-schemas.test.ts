@@ -5,7 +5,9 @@ import {
   decisionSchema,
   documentSchema,
   mepSchema,
+  procedureSchema,
   questionSchema,
+  sittingSchema,
   speechSchema,
 } from '../../../src/services/eu-parliament/eu-parliament-schemas.js';
 import {
@@ -98,6 +100,68 @@ describe('Parliament noun schemas', () => {
     expect(parsed.had_voter_intended_against).toEqual(['person/900000005']);
     expect(parsed.had_voter_intended_abstention).toEqual(['person/900000006']);
     expect(decisionSchema.parse({ id: decisionRecord.id })).not.toHaveProperty('had_voter_favor');
+  });
+
+  it.each([
+    ['sitting', sittingSchema],
+    ['speech', speechSchema],
+    ['decision', decisionSchema],
+  ] as const)(
+    'reads a %s date published only as a typed literal as its written calendar day',
+    (_, schema) => {
+      for (const [value, date] of [
+        ['2019-01-14T00:00:00+01:00', '2019-01-14'],
+        ['2019-07-02T00:00:00+02:00', '2019-07-02'],
+      ])
+        expect(
+          schema.parse({
+            id: 'eli/dl/event/EXAMPLE',
+            'eli-dl:activity_date': { '@value': value, type: 'xsd:dateTime' },
+          }),
+        ).toEqual({ id: 'eli/dl/event/EXAMPLE', activity_date: date });
+    },
+  );
+
+  it('reads typed-literal dates on nested procedure events and on singleton or array participations', () => {
+    const typed = (value: string) => ({ '@value': value, type: 'xsd:dateTime' });
+    const procedure = procedureSchema.parse({
+      id: 'eli/dl/proc/2018-0089',
+      consists_of: [
+        { id: 'eli/dl/event/EV-1', 'eli-dl:activity_date': typed('2018-05-02T00:00:00+02:00') },
+        { id: 'eli/dl/event/EV-2', activity_date: '2020-11-24' },
+      ],
+      had_participation: [
+        {
+          id: 'eli/dl/participation/P-1',
+          'eli-dl:activity_date': typed('2018-12-12T00:00:00+01:00'),
+        },
+      ],
+    });
+    expect(procedure.consists_of).toEqual([
+      { id: 'eli/dl/event/EV-1', activity_date: '2018-05-02' },
+      { id: 'eli/dl/event/EV-2', activity_date: '2020-11-24' },
+    ]);
+    expect(procedure.had_participation).toEqual([
+      { id: 'eli/dl/participation/P-1', activity_date: '2018-12-12' },
+    ]);
+    expect(
+      speechSchema.parse({
+        id: 'eli/dl/event/S-1',
+        had_participation: {
+          id: 'p/1',
+          'eli-dl:activity_date': typed('2021-07-05T00:00:00+02:00'),
+        },
+      }).had_participation,
+    ).toEqual({ id: 'p/1', activity_date: '2021-07-05' });
+  });
+
+  it('rejects a typed-literal date that does not open with a calendar day', () => {
+    expect(
+      sittingSchema.safeParse({
+        id: 'eli/dl/event/MTG-PL-2019-01-14',
+        'eli-dl:activity_date': { '@value': 'Monday, 14 January 2019', type: 'xsd:dateTime' },
+      }).success,
+    ).toBe(false);
   });
 
   it('accepts singleton speech participation and sparse source references', () => {

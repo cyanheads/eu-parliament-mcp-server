@@ -65,6 +65,57 @@ describe('euparl_search_speeches contract', () => {
       page: { returned: 0, has_more: false },
     });
   });
+  it('keeps the defaulted term, one request and the broadening guidance on an empty date search', async () => {
+    const fetcher = installToolHttp(() => new Response(null, { status: 204 }));
+    const data = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, { sitting_date: '2024-03-12', limit: 3 }),
+    );
+    expect(data).toMatchObject({
+      items: [],
+      appliedFilters: { term: 10, sitting_date: '2024-03-12' },
+      page: { returned: 0, has_more: false },
+    });
+    expect(data.notice).toMatch(
+      /broaden sitting_date or remove person_id; call euparl_list_reference with topic activity_types\./i,
+    );
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('parliamentary-term')).toBe(
+      '10',
+    );
+  });
+  const dated = 'pass the term containing sitting_date';
+  it.each([
+    [{ sitting_date: '2024-03-12', limit: 3 }, 'term 10 (the default)', 10, dated],
+    [{ term: 9, sitting_date: '2025-12-16', limit: 1 }, 'term 9', 9, dated],
+    [{ term: 9, sitting_date: '2020-01-15' }, 'term 9', 9, dated],
+    [{ term: 10, sitting_date: '2024-03-12' }, 'term 10', 10, dated],
+    [{ text: 'fisheries' }, 'term 10 (the default)', 10, 'pass term to search the other term'],
+  ] as const)(
+    'names the searched term, both term calendars and the coverage row when %j matches nothing',
+    async (input, named, term, lever) => {
+      const fetcher = installToolHttp(() => new Response(null, { status: 204 }));
+      const data = expectSuccessTwin(await runToolContract(searchSpeechesTool, input));
+      expect(data).toMatchObject({ items: [], appliedFilters: { term } });
+      expect(data.notice).toBe(
+        `No speech records matched in ${named}. Term 9 ran 2019-07-02 to 2024-07-15 and term 10 began 2024-07-16; ${lever}. Speech records do not cover every date of a term; euparl_list_reference topic coverage gives the dates they cover. Otherwise broaden sitting_date or remove person_id; call euparl_list_reference with topic activity_types.`,
+      );
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    },
+  );
+  it('reports an empty page past offset 0 without claiming nothing matched or advising a term', async () => {
+    installToolHttp(() => new Response(null, { status: 204 }));
+    const data = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, {
+        term: 9,
+        sitting_date: '2024-03-12',
+        offset: 500,
+      }),
+    );
+    expect(data).toMatchObject({ items: [], page: { offset: 500, returned: 0, has_more: false } });
+    expect(data.notice).toBe(
+      'The page at offset 500 returned no speeches. Restart at offset 0 or return to the previous page.',
+    );
+  });
   it('routes ninth-term text, date and person search while preserving source references on both surfaces', async () => {
     const fetcher = installToolHttp(() =>
       envelopeResponse([{ ...speech, id: 'eli/dl/event/CRE-9-2024-03-12-S1' }]),
@@ -199,6 +250,8 @@ describe('euparl_search_speeches contract', () => {
         ]);
       if (url.pathname.endsWith('/documents/AFCO-AD-900001'))
         return envelopeResponse([documentRecord]);
+      if (url.pathname.endsWith('/committee-documents/AFCO-AD-900001'))
+        return new Response(null, { status: 404 });
       throw new Error(`Unexpected route ${url.pathname}`);
     });
     const first = expectSuccessTwin(
@@ -230,7 +283,8 @@ describe('euparl_search_speeches contract', () => {
         ],
       },
     });
-    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(parent).not.toHaveProperty('notice');
+    expect(fetcher).toHaveBeenCalledTimes(4);
   });
 
   it('accepts singleton participation and preserves sparse metadata without a transcript', async () => {

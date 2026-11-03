@@ -81,6 +81,97 @@ describe('euparl_list_reference contract', () => {
       '/api/v2/corporate-bodies/5144',
     ]);
   });
+  it('resolves committee, group, term and institution codes beside decimal IDs, keeping supplied case', async () => {
+    const records = new Map<string, Record<string, unknown>>([
+      [
+        'IMCO',
+        {
+          id: 'org/IMCO',
+          identifier: 'IMCO',
+          label: 'IMCO',
+          prefLabel: { en: 'Committee on the Internal Market and Consumer Protection' },
+          classification: 'def/ep-entities/COMMITTEE_PARLIAMENTARY_STANDING',
+        },
+      ],
+      [
+        'S-D',
+        {
+          id: 'org/S-D',
+          identifier: 'S-D',
+          label: 'S&D',
+          prefLabel: {
+            en: 'Group of the Progressive Alliance of Socialists and Democrats in the European Parliament',
+          },
+          classification: 'def/ep-entities/EU_POLITICAL_GROUP',
+        },
+      ],
+    ]);
+    const fetcher = installToolHttp((url) => {
+      const code = url.pathname.split('/').at(-1)!;
+      if (['imco', 's-d', 'EP-9', 'ZZZZ'].includes(code))
+        return new Response(null, { status: 404 });
+      return envelopeResponse([records.get(code) ?? { id: `org/${code}`, identifier: code }]);
+    });
+    const ids = [
+      'org/IMCO',
+      'org/S-D',
+      'imco',
+      'CJ40',
+      'org/ep-9',
+      's-d',
+      'org/EU_PARLIAMENT',
+      'DLAT',
+      'EP-9',
+      'https://data.europarl.europa.eu/org/GUE-NGL',
+      'ZZZZ',
+      '5154',
+    ];
+    const data = expectSuccessTwin(
+      await runToolContract(listReferenceTool, { topic: 'organizations', organization_ids: ids }),
+    );
+    const expected = [
+      ['IMCO', true],
+      ['S-D', true],
+      ['imco', false],
+      ['CJ40', true],
+      ['ep-9', true],
+      ['s-d', false],
+      ['EU_PARLIAMENT', true],
+      ['DLAT', true],
+      ['EP-9', false],
+      ['GUE-NGL', true],
+      ['ZZZZ', false],
+      ['5154', true],
+    ] as const;
+    expect(data.items).toMatchObject(
+      expected.map(([organization_id, found]) => ({
+        organization_id,
+        found,
+        source_url: `https://data.europarl.europa.eu/org/${organization_id}`,
+      })),
+    );
+    expect((data.items as unknown[]).slice(0, 2)).toMatchObject([
+      {
+        id: 'org/IMCO',
+        classification: 'def/ep-entities/COMMITTEE_PARLIAMENTARY_STANDING',
+        name: {
+          value: 'Committee on the Internal Market and Consumer Protection',
+          language: 'en',
+        },
+      },
+      {
+        id: 'org/S-D',
+        classification: 'def/ep-entities/EU_POLITICAL_GROUP',
+        label: { value: 'S&D', language: 'mul' },
+      },
+    ]);
+    expect(data.appliedFilters).toMatchObject({
+      organization_ids: expected.map(([organization_id]) => organization_id),
+    });
+    expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual(
+      expected.map(([organization_id]) => `/api/v2/corporate-bodies/${organization_id}`),
+    );
+  });
   it('enriches historical bodies with published names and sparse dates without extra HTTP', async () => {
     const fetcher = installToolHttp(() =>
       envelopeResponse([
@@ -211,6 +302,27 @@ describe('euparl_list_reference contract', () => {
         topic: 'organizations',
         organization_ids: ['5144', 'https://evil.example/org/5144'],
         limit: 1,
+      }),
+      'invalid_filter',
+      invalidHint,
+      JsonRpcErrorCode.ValidationError,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+  it.each([
+    'S&D',
+    'GUE/NGL',
+    'The Left',
+    'org/../5144',
+    '%35',
+    '5144?x=y',
+    'https://evil.example/org/5144',
+  ])('rejects organization label or unsafe form %s before any request', async (id) => {
+    const fetcher = installToolHttp(() => envelopeResponse([body]));
+    expectErrorTwin(
+      await runToolContract(listReferenceTool, {
+        topic: 'organizations',
+        organization_ids: ['5144', id],
       }),
       'invalid_filter',
       invalidHint,
@@ -397,6 +509,20 @@ describe('euparl_list_reference contract', () => {
       'Requested limit normalized to the effective maximum of 350 reference entries. No reference entries matched. Call euparl_list_reference with topic identifiers to inspect accepted identifiers.',
     );
     expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('350');
+  });
+
+  it('reports an empty live-list page past offset 0 without claiming nothing matched', async () => {
+    installToolHttp(() => new Response(null, { status: 204 }));
+    expect(
+      expectSuccessTwin(
+        await runToolContract(listReferenceTool, { topic: 'committees', offset: 350 }),
+      ),
+    ).toMatchObject({
+      items: [],
+      page: { offset: 350, returned: 0, has_more: false },
+      notice:
+        'The page at offset 350 returned no reference entries. Restart at offset 0 or return to the previous page.',
+    });
   });
 
   it('fills a capped live page from more upstream rows than the cap and continues past it', async () => {

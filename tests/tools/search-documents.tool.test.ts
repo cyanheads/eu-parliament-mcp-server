@@ -1,6 +1,6 @@
 /** @fileoverview Document discovery and nested source-file wire contracts. */
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it } from 'vitest';
 import { searchDocumentsTool } from '../../src/mcp-server/tools/definitions/search-documents.tool.js';
 import {
@@ -288,6 +288,105 @@ describe('euparl_search_documents contract', () => {
     expect(new URL(String(fetcher.mock.calls[0]?.[0])).pathname).toBe(`/api/v2/documents/${id}`);
   });
 
+  it.each([
+    [
+      { source: 'adopted_texts', offset: 0 },
+      'No documents matched. Remove a named filter, or call euparl_list_reference with topic document_types; keyword search is available only for adopted_texts.',
+    ],
+    [
+      { source: 'plenary', offset: 0 },
+      'No documents matched. Remove a named filter, or call euparl_list_reference with topic document_types; keyword search is available only for adopted_texts.',
+    ],
+    [
+      { source: 'committee', offset: 40 },
+      'The page at offset 40 returned no documents. Restart at offset 0 or return to the previous page.',
+    ],
+  ] as const)('renders an empty %j page with guidance for that position', async (input, notice) => {
+    installToolHttp(() => new Response(null, { status: 204 }));
+    expect(expectSuccessTwin(await runToolContract(searchDocumentsTool, input))).toMatchObject({
+      items: [],
+      page: { offset: input.offset, returned: 0, has_more: false },
+      notice,
+    });
+  });
+
+  describe('family procedure relation', () => {
+    const generic = { ...documentRecord, refers_to: 'eli/dl/proc/2020-0001' };
+    const install = (family: () => Response) =>
+      installToolHttp((url) =>
+        url.pathname.startsWith('/api/v2/documents/') ? envelopeResponse([generic]) : family(),
+      );
+    const input = { mode: 'get', document_id: documentRecord.id, language: 'pl' } as const;
+    const get = () => runToolContract(searchDocumentsTool, input);
+    const withoutProcedures = (result: Awaited<ReturnType<typeof get>>) => ({
+      structured: {
+        ...(result.structuredContent as { document: object }),
+        document: {
+          ...(result.structuredContent as { document: object }).document,
+          procedure_ids: [],
+        },
+      },
+      text: contractText(result)
+        .split('\n')
+        .filter((line) => line !== '' && !line.startsWith('result.document.procedure_ids'))
+        .join('\n'),
+    });
+
+    it('adds the committee record procedures on both surfaces and changes nothing else', async () => {
+      const fetcher = install(() =>
+        envelopeResponse([
+          {
+            id: documentRecord.id,
+            inverse_created_a_realization_of: ['eli/dl/proc/2021-0106', 'eli/dl/proc/2020-0001'],
+          },
+        ]),
+      );
+      const related = await get();
+      expect(expectSuccessTwin(related)).toMatchObject({
+        found: true,
+        document: { procedure_ids: ['2020-0001', '2021-0106'] },
+      });
+      expect(String(fetcher.mock.calls[1]?.[0])).toBe(
+        'https://data.europarl.europa.eu/api/v2/committee-documents/AFCO-AD-900001?language=mul&format=application%2Fld%2Bjson',
+      );
+      install(() => new Response(null, { status: 404 }));
+      const unpublished = await get();
+      expect(expectSuccessTwin(unpublished)).toMatchObject({
+        document: { procedure_ids: ['2020-0001'] },
+      });
+      expect(withoutProcedures(related)).toEqual(withoutProcedures(unpublished));
+    });
+
+    it('renders the degraded-relation notice on both surfaces when the family read fails', async () => {
+      const fetcher = install(() => new Response(null, { status: 503 }));
+      const data = expectSuccessTwin(await get());
+      expect(data).toMatchObject({ found: true, document: { procedure_ids: ['2020-0001'] } });
+      expect(data.notice).toContain(
+        'The procedure relation could not be read from the committee family record of this document, so procedure_ids may be incomplete; repeat the same get to retry.',
+      );
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it('rethrows caller cancellation during the family read instead of answering with a notice', async () => {
+      const controller = new AbortController();
+      const fetcher = installToolHttp((url, init) => {
+        if (url.pathname.startsWith('/api/v2/documents/')) return envelopeResponse([generic]);
+        controller.abort(new DOMException('Document read stopped', 'AbortError'));
+        init?.signal?.throwIfAborted();
+        throw new Error('Cancellation did not reach fetch');
+      });
+      // runToolContract settles a handler that returns after the abort as RequestCancelled too, so
+      // only a direct handler call shows whether the cancellation was rethrown or degraded.
+      await expect(
+        searchDocumentsTool.handler(
+          searchDocumentsTool.input.parse(input),
+          createMockContext({ errors: searchDocumentsTool.errors, signal: controller.signal }),
+        ),
+      ).rejects.toMatchObject({ name: 'AbortError', message: 'Document read stopped' });
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it('discloses fallback language and renders the effective cap, continuation and end page', async () => {
     // One row more than the cap, sliced by the requested window as the upstream does.
     const pool = Array.from({ length: 226 }, (_, i) => ({ id: `eli/dl/doc/D-${i}` }));
@@ -323,7 +422,12 @@ describe('euparl_search_documents contract', () => {
     });
     expect(
       expectSuccessTwin(await runToolContract(searchDocumentsTool, { offset: 500 })),
-    ).toMatchObject({ items: [], page: { offset: 500, returned: 0, has_more: false } });
+    ).toMatchObject({
+      items: [],
+      page: { offset: 500, returned: 0, has_more: false },
+      notice:
+        'The page at offset 500 returned no documents. Restart at offset 0 or return to the previous page.',
+    });
     expect(fetcher).toHaveBeenCalledTimes(3);
     installToolHttp(() => envelopeResponse([documentRecord]));
     const fallback = expectSuccessTwin(
@@ -442,6 +546,10 @@ describe('euparl_search_documents contract', () => {
       found: true,
       document: { document_id: 'AFCO-AD-900001', links: [{ language: 'en' }] },
     });
-    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
+      '/api/v2/documents/AFCO-AD-900001',
+      '/api/v2/documents/AFCO-AD-900001',
+      '/api/v2/committee-documents/AFCO-AD-900001',
+    ]);
   });
 });

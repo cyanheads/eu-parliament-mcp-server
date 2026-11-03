@@ -10,6 +10,7 @@ import {
   type PagedCollection,
   pageCaps,
 } from '@/services/eu-parliament/eu-parliament-normalization.js';
+import { fieldPathText } from '@/services/eu-parliament/eu-parliament-rendering.js';
 import type { Enrichment } from '@/services/eu-parliament/eu-parliament-service.js';
 
 /** Accept form-client blank values without changing nonblank source text. */
@@ -182,41 +183,14 @@ export const enrichmentFields = {
     .describe('Whole items shown on this partial page.'),
   cap: z.number().int().positive().optional().describe('Effective whole-item page limit.'),
 };
-function quoted(value: string): string {
-  const json = JSON.stringify(value);
-  let longestRun = 0;
-  for (const match of json.matchAll(/`+/g)) longestRun = Math.max(longestRun, match[0].length);
-  const fence = '`'.repeat(longestRun + 1);
-  return `${fence} ${json} ${fence}`;
-}
-/** Render every scalar, empty container and array entry, retaining active URL links. */
-function renderValue(value: unknown, path = 'result'): string {
-  if (Array.isArray(value))
-    return value.length
-      ? value.map((item, index) => renderValue(item, `${path}[${index}]`)).join('\n')
-      : `${path}: []`;
-  if (value !== null && typeof value === 'object') {
-    const entries = Object.entries(value);
-    return entries.length
-      ? entries.map(([key, item]) => renderValue(item, `${path}.${key}`)).join('\n')
-      : `${path}: {}`;
-  }
-  if (typeof value === 'string') {
-    const text = quoted(value);
-    return `${path}: ${/^https?:\/\/[^\s<>]*$/.test(value) ? `[${text}](<${value.replaceAll('\\', '%5C')}>)` : text}`;
-  }
-  return `${path}: ${String(value)}`;
-}
 /** Full field-path response twin; a blank line keeps each value independent. */
 export function formatResult(value: unknown) {
-  return [{ type: 'text' as const, text: renderValue(value).replaceAll('\n', '\n\n') }];
+  return [{ type: 'text' as const, text: fieldPathText(value) }];
 }
 /** Structured enrichment needs a renderer rather than the generic object trailer. */
 export const enrichmentTrailer = {
-  appliedFilters: {
-    render: (value: unknown) => renderValue(value, 'appliedFilters').replaceAll('\n', '\n\n'),
-  },
-  notice: { render: (value: unknown) => renderValue(value, 'notice') },
+  appliedFilters: { render: (value: unknown) => fieldPathText(value, 'appliedFilters') },
+  notice: { render: (value: unknown) => fieldPathText(value, 'notice') },
 };
 /** Apply filters, availability, notices, exact totals and page-cap disclosure; notices survive truncation. */
 export function applyEnrichment(

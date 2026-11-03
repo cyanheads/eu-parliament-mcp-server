@@ -80,7 +80,7 @@ export const getMepTool = tool('euparl_get_mep', {
                 .string()
                 .optional()
                 .describe(
-                  'Published organization identity; resolve supported decimal organization IDs with euparl_list_reference topic organizations and organization_ids.',
+                  'Published organization identity, decimal (org/5154) or term code (org/ep-9); resolve either with euparl_list_reference topic organizations and organization_ids.',
                 ),
               classification: z
                 .string()

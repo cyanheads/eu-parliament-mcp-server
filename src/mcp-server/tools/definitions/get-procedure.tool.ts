@@ -19,7 +19,11 @@ import { getEuParliamentService } from '@/services/eu-parliament/eu-parliament-s
 
 const eventSchema = z
   .object({
-    id: z.string().describe('Published canonical event identifier.'),
+    id: z
+      .string()
+      .describe(
+        'Published canonical event identifier. A PLENARY_VOTE_RESULTS event id is a vote item: pass it as vote_item_id to euparl_get_plenary_votes, with the sitting on its date, for every decision of that vote.',
+      ),
     date: z.string().optional().describe('Published activity date.'),
     activity_type: z.string().optional().describe('Published activity type code or URI.'),
     stage: z.string().optional().describe('Published event stage.'),
@@ -29,7 +33,7 @@ const eventSchema = z
     sitting_ids: z
       .array(z.string().describe('Canonical scheduled sitting identifier.'))
       .describe(
-        'Explicit scheduled sitting relations, sorted by identifier; when absent, a published vote-event date can select a sitting for euparl_get_plenary_votes decisions with document_id.',
+        'Explicit scheduled sitting relations, sorted by identifier; when absent, a published vote-event date selects the sitting for euparl_get_plenary_votes decisions with vote_item_id or document_id. Older sittings publish no vote items or report relations on decisions, so neither filter matches there; find the report citation in decision labels instead.',
       ),
   })
   .strict()
@@ -42,18 +46,24 @@ const participantSchema = z
       .describe('Explicit participating people, sorted by identifier.'),
     organization_ids: z
       .array(z.string().describe('Published organization identity.'))
-      .describe('Explicit participating organizations, sorted by identifier.'),
+      .describe(
+        'Explicit participating organizations, sorted by identifier; resolve each with euparl_list_reference topic organizations.',
+      ),
     role: z.string().optional().describe('Published historical participation role.'),
     date: z.string().optional().describe('Published participation date.'),
     stage: z.string().optional().describe('Published participation stage.'),
     political_group_id: z
       .string()
       .optional()
-      .describe('Published historical political group; never joined to a current group.'),
+      .describe(
+        'Published historical political group code (org/S-D); never joined to a current group. Resolve with euparl_list_reference topic organizations.',
+      ),
     represented_organization_id: z
       .string()
       .optional()
-      .describe('Published organization represented by this participation.'),
+      .describe(
+        'Published organization represented by this participation, usually a committee code (org/IMCO); resolve with euparl_list_reference topic organizations.',
+      ),
     term_id: z.string().optional().describe('Published parliamentary-term identity.'),
   })
   .strict()

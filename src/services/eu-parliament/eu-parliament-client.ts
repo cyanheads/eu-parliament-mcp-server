@@ -66,17 +66,30 @@ const allowlists = new Map<string, readonly string[]>([
 /** Single-record and sitting-decision routes accept no query parameters. */
 const detailRoute =
   /^(?:procedures|documents|speeches|meps|parliamentary-questions|corporate-bodies)\/[^/]+$|^meetings\/[^/]+\/decisions$/;
+/** Document family records accept only `language`, which selects the expressions they embed. */
+const familyDetailRoute = /^(?:adopted-texts|committee-documents|plenary-documents)\/[^/]+$/;
 
+/**
+ * One deadline covers every request, queue wait and backoff of a domain operation, inside the
+ * 60-second default request timeout of MCP SDK clients.
+ */
+export const operationTimeoutMs = 40_000;
+/** Default per-attempt bound; the operation deadline caps it further. */
+const attemptTimeoutMs = 15_000;
 /** One budget shared by every request in a domain operation. */
 export interface Operation {
   callerSignal: AbortSignal;
   deadlineAt: number;
   signal: AbortSignal;
 }
-/** Injectable transport and pacing clock; wait must reject when its signal aborts. */
+/**
+ * Injectable transport, pacing clock and timers; wait must reject when its signal aborts, and
+ * timeout returns a signal that aborts after `ms` (default `AbortSignal.timeout`).
+ */
 export interface ClientOptions {
   fetch: typeof globalThis.fetch;
   now?: () => number;
+  timeout?: (ms: number) => AbortSignal;
   wait?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 /** Parsed response, distinguishing empty and missing before reading a body. */
@@ -97,20 +110,22 @@ const metadata = z
 export class EuParliamentClient {
   readonly now: () => number;
   private readonly fetcher: typeof globalThis.fetch;
+  private readonly timeout: (ms: number) => AbortSignal;
   private readonly wait: (ms: number, signal: AbortSignal) => Promise<void>;
   private nextStart = 0;
   private pending = 0;
   constructor(options: ClientOptions) {
     this.fetcher = options.fetch;
     this.now = options.now ?? Date.now;
+    this.timeout = options.timeout ?? ((ms) => AbortSignal.timeout(ms));
     this.wait = options.wait ?? ((ms, signal) => delay(ms, undefined, { signal }));
   }
   /** Starts the 40-second deadline before acquisition or queueing. */
   operation(callerSignal: AbortSignal): Operation {
     return {
       callerSignal,
-      signal: AbortSignal.any([callerSignal, AbortSignal.timeout(40_000)]),
-      deadlineAt: this.now() + 40_000,
+      signal: AbortSignal.any([callerSignal, this.timeout(operationTimeoutMs)]),
+      deadlineAt: this.now() + operationTimeoutMs,
     };
   }
   private check(operation: Operation): void {
@@ -145,15 +160,26 @@ export class EuParliamentClient {
       throw cause;
     }
   }
-  /** Parses a fully read JSON-LD envelope against the noun schema. */
+  /**
+   * Parses a fully read JSON-LD envelope against the noun schema. `attemptLimitMs` bounds each
+   * attempt, headers and body, before the operation deadline caps it; a single bulk read passes
+   * `operationTimeoutMs` to spend whatever the deadline leaves. `attempts` bounds the transient
+   * retries; a best-effort read passes 1.
+   */
   async get<T>(
     path: string,
     query: Record<string, string | number | undefined>,
     schema: z.ZodType<T>,
     operation: Operation,
+    {
+      attemptLimitMs = attemptTimeoutMs,
+      attempts = 3,
+    }: { attemptLimitMs?: number; attempts?: number } = {},
   ): Promise<Envelope<T>> {
     if (!/^[A-Za-z0-9_/-]+$/.test(path)) throw new Error('Unsupported Parliament endpoint');
-    const allowed = allowlists.get(path) ?? (detailRoute.test(path) ? [] : undefined);
+    const allowed =
+      allowlists.get(path) ??
+      (familyDetailRoute.test(path) ? ['language'] : detailRoute.test(path) ? [] : undefined);
     if (!allowed) throw new Error('Unsupported Parliament endpoint');
     const url = new URL(`api/v2/${path}`, origin);
     for (const [key, value] of Object.entries(query)) {
@@ -165,7 +191,7 @@ export class EuParliamentClient {
       await this.pace(operation);
       const attemptSignal = AbortSignal.any([
         operation.signal,
-        AbortSignal.timeout(Math.min(15_000, operation.deadlineAt - this.now())),
+        this.timeout(Math.min(attemptLimitMs, operation.deadlineAt - this.now())),
       ]);
       let retryAfterMs: number | undefined;
       try {
@@ -250,7 +276,7 @@ export class EuParliamentClient {
                 cause.code === JsonRpcErrorCode.ServiceUnavailable)
             : cause instanceof TypeError ||
               (cause instanceof Error && (cause.name === 'TimeoutError' || attemptSignal.aborted));
-        if (!transient || attempt === 2) {
+        if (!transient || attempt === attempts - 1) {
           if (cause instanceof McpError) throw cause;
           if (attemptSignal.aborted)
             throw timeout('Parliament request timed out after bounded retries.', undefined, {

@@ -1,4 +1,4 @@
-/** @fileoverview Shared `limit` schema: advertised caps, whole-number checks and the clamp switch. */
+/** @fileoverview Shared `limit` schema (advertised caps, whole-number checks, clamp switch) and field-path text. */
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +13,7 @@ import { listReferenceTool } from '../../../src/mcp-server/tools/definitions/lis
 import { searchDocumentsTool } from '../../../src/mcp-server/tools/definitions/search-documents.tool.js';
 import { searchMepsTool } from '../../../src/mcp-server/tools/definitions/search-meps.tool.js';
 import { searchSpeechesTool } from '../../../src/mcp-server/tools/definitions/search-speeches.tool.js';
+import { formatResult } from '../../../src/mcp-server/tools/utils/eu-parliament-tool.js';
 import {
   contractText,
   expectSuccessTwin,
@@ -165,5 +166,39 @@ describe('shared limit input', () => {
       structuredContent: { error: { code: JsonRpcErrorCode.InvalidParams } },
     });
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('field-path rendering', () => {
+  it('renders each leaf as its own paragraph, quoting strings and linking URLs', () => {
+    expect(
+      formatResult({
+        mode: 'decisions',
+        decisions: [
+          {
+            decision_id: 'D-1',
+            document_ids: ['A-1'],
+            recording_document_ids: [],
+            favor: 2,
+            source_url: 'https://data.europarl.europa.eu/eli/dl/event/D-1',
+          },
+        ],
+        page: { offset: 0, has_more: false },
+      }),
+    ).toEqual([
+      {
+        type: 'text',
+        text: [
+          'result.mode: ` "decisions" `',
+          'result.decisions[0].decision_id: ` "D-1" `',
+          'result.decisions[0].document_ids[0]: ` "A-1" `',
+          'result.decisions[0].recording_document_ids: []',
+          'result.decisions[0].favor: 2',
+          'result.decisions[0].source_url: [` "https://data.europarl.europa.eu/eli/dl/event/D-1" `](<https://data.europarl.europa.eu/eli/dl/event/D-1>)',
+          'result.page.offset: 0',
+          'result.page.has_more: false',
+        ].join('\n\n'),
+      },
+    ]);
   });
 });

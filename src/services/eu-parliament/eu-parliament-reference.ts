@@ -3,7 +3,7 @@
  * @module services/eu-parliament/eu-parliament-reference
  */
 import { validationError } from '@cyanheads/mcp-ts-core/errors';
-import { type LocalizedText, pageCaps } from './eu-parliament-normalization.js';
+import { type LocalizedText, pageCaps, pageRowBudgetChars } from './eu-parliament-normalization.js';
 
 /**
  * Canonical input codes copied from the public OpenAPI, plus verified group tokens. Country lists
@@ -163,6 +163,15 @@ export function normalizeCode(
   }
   return canonical;
 }
+const documentFamilies = ['adopted_texts', 'committee', 'plenary'] as const;
+/**
+ * The document family whose work-type table lists a published work type, matched on its last path
+ * segment (`def/ep-document-types/TEXT_ADOPTED`); undefined outside the three families.
+ */
+export function documentFamily(workType: string | undefined) {
+  const code = workType?.slice(workType.lastIndexOf('/') + 1) ?? '';
+  return documentFamilies.find((family) => (codes[family] as readonly string[]).includes(code));
+}
 /** Reference topics supported by the nine-tool surface. */
 export const referenceTopics = [
   'committees',
@@ -247,7 +256,7 @@ export function referenceEntries(
         {
           code: 'organization',
           description:
-            'Decimal organization ID, org/ prefix, or exact https://data.europarl.europa.eu/org/ URI; resolve supported membership organization IDs with topic organizations and organization_ids.',
+            'Decimal ID or case-sensitive code (IMCO, S-D, ep-9, EU_PARLIAMENT): letters, digits, hyphens and underscores, bare, after org/, or in the exact https://data.europarl.europa.eu/org/ URI. Resolve organizations from memberships, procedure participants, document creators and terms with topic organizations and organization_ids; labels such as S&D are not identifiers.',
         },
         {
           code: 'activity',
@@ -279,7 +288,7 @@ export function referenceEntries(
         {
           code: 'speeches',
           description:
-            'Ninth- and tenth-term speech metadata and source links; search defaults to term 10. Published labels are not transcripts; coverage is not guaranteed for other terms.',
+            'Ninth- and tenth-term speech metadata and source links; search defaults to term 10. Term-9 records start in July 2021; earlier term-9 sitting dates return none. Published labels are not transcripts; coverage is not guaranteed for other terms.',
         },
         {
           code: 'meps',
@@ -289,11 +298,11 @@ export function referenceEntries(
         {
           code: 'votes',
           description:
-            'Discover sittings, page compact decisions, read a rich decision, then page recorded or intended positions. Names require explicit roster_term and reflect that published roster, never historical affiliation.',
+            'Discover sittings, page compact decisions, read a rich decision, then page recorded or intended positions. Sittings data starts in 2014; earlier years return no sittings. Decisions start in 2019: 2014–2018 sittings list but return no decisions, and not every later sitting has them. Names require explicit roster_term and reflect that published roster, never historical affiliation.',
         },
         {
           code: 'paging',
-          description: `Page caps: ${pageCapList}. A larger limit returns the cap with a notice; a server set to EUPARL_CLAMP_LIMITS=false rejects a limit above its tool's largest cap; a smaller collection cap in the same tool still clamps with a notice. Organization lookups page the supplied IDs without a snapshot. Speeches, procedures and adopted texts expose a 10000-result search window: a page reaching past it narrows to the results left, with a notice, and an offset of 10000 or more is rejected. Capped totals are lower bounds. At the window boundary has_more may remain true without next_offset; narrow supported filters. Local continuation requires returned snapshot; collection is reacquired and drift causes snapshot_changed. No retained cache.`,
+          description: `Page caps: ${pageCapList}. A larger limit returns the cap with a notice; a server set to EUPARL_CLAMP_LIMITS=false rejects a limit above its tool's largest cap; a smaller collection cap in the same tool still clamps with a notice. A decisions page also ends at whole decisions before their rendered rows pass ${pageRowBudgetChars} characters, with a notice; its first decision always returns whole, page.limit keeps the requested limit, and next_offset resumes at the first decision left out. Organization lookups page the supplied IDs without a snapshot. Speeches, adopted texts and procedures without process_type expose a 10000-result search window: a page reaching past it narrows to the results left, with a notice, and an offset of 10000 or more is rejected. Capped totals are lower bounds. At the window boundary has_more may remain true without next_offset; narrow supported filters. Parliament serves unfiltered procedure pages from two orderings, so they can repeat or omit procedures; a process_type listing is acquired whole and paged in procedure_id order, and its snapshot is optional. Other local continuation requires the returned snapshot; the collection is reacquired and drift causes snapshot_changed. No retained cache.`,
         },
         {
           code: 'questions',

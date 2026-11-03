@@ -339,10 +339,32 @@ describe('euparl_list_questions contract', () => {
     );
     expect(
       expectSuccessTwin(await runToolContract(listQuestionsTool, { offset: 300 })),
-    ).toMatchObject({ items: [], page: { offset: 300, has_more: false } });
+    ).toMatchObject({
+      items: [],
+      page: { offset: 300, has_more: false },
+      notice:
+        'The page at offset 300 returned no questions. Restart at offset 0 or return to the previous page.',
+    });
     expect(
       expectSuccessTwin(await runToolContract(listQuestionsTool, { offset: 1000 })),
-    ).toMatchObject({ items: [], page: { offset: 1000, returned: 0, has_more: false } });
+    ).toMatchObject({
+      items: [],
+      page: { offset: 1000, returned: 0, has_more: false },
+      notice:
+        'The page at offset 1000 returned no questions. Restart at offset 0 or return to the previous page.',
+    });
+  });
+
+  it('keeps the no-match guidance for an empty list at offset 0', async () => {
+    installToolHttp(() => new Response(null, { status: 204 }));
+    expect(
+      expectSuccessTwin(await runToolContract(listQuestionsTool, { year: 2025 })),
+    ).toMatchObject({
+      items: [],
+      page: { offset: 0, returned: 0, has_more: false },
+      notice:
+        'No questions matched. Remove work_type or change year; call euparl_list_reference with topic question_types.',
+    });
   });
 
   it.each([204, 404])('renders HTTP %i detail miss with year-list guidance', async (status) => {

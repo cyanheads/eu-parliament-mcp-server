@@ -45,7 +45,9 @@ const documentDetailSchema = documentSummarySchema
       .describe('All published creator references, without inferred authorship.'),
     procedure_ids: z
       .array(z.string().describe('Canonical related procedure identifier.'))
-      .describe('Procedure IDs from explicit source relationships; use euparl_get_procedure.'),
+      .describe(
+        'Procedure IDs from explicit source relations, then those an adopted text, plenary or committee document publishes on its family record, without repeats; use euparl_get_procedure.',
+      ),
     parent_document_ids: z
       .array(z.string().describe('Canonical parent work identifier.'))
       .describe(
@@ -76,7 +78,7 @@ const documentDetailSchema = documentSummarySchema
 export const searchDocumentsTool = tool('euparl_search_documents', {
   title: 'Search parliamentary documents',
   description:
-    'Search adopted texts, committee documents, or plenary documents, then retrieve metadata and source-file links with mode get and document_id. Get accepts IDs from procedures, speeches, votes, questions and answers without a source family; parent_document_ids lead from subdivisions to parent files. Detail preserves adopted_document_ids, based_on_document_ids and public_register_ref; follow published document relations with mode get, while preserving ordinary missing-record and upstream-error outcomes for unavailable targets. Document relations never imply procedure links. Only adopted_texts supports text, title, sitting dates and related_process_id. Committee supports term but no year; plenary supports year but no term. Use euparl_list_reference topic document_types for family-specific work_type codes. Detail returns links, not extracted full text. Adopted texts expose at most 10000 search results; continue with page.next_offset when present, otherwise narrow supported filters.',
+    'Search adopted texts, committee documents, or plenary documents, then retrieve metadata and source-file links with mode get and document_id. Get accepts IDs from procedures, speeches, votes, questions and answers without a source family; parent_document_ids lead from subdivisions to parent files. Detail preserves adopted_document_ids, based_on_document_ids and public_register_ref; follow published document relations with mode get, while preserving ordinary missing-record and upstream-error outcomes for unavailable targets. Detail procedure_ids also read the procedure an adopted text, plenary or committee document publishes on its family record; adopted and based-on document relations never imply procedure links. Only adopted_texts supports text, title, sitting dates and related_process_id. Committee supports term but no year; plenary supports year but no term. Use euparl_list_reference topic document_types for family-specific work_type codes. Detail returns links, not extracted full text. Adopted texts expose at most 10000 search results; continue with page.next_offset when present, otherwise narrow supported filters.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({

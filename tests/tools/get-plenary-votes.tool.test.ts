@@ -243,7 +243,9 @@ describe('euparl_get_plenary_votes contract', () => {
       }),
     );
     expect(empty).toMatchObject({ decisions: [], totalCount: 0 });
-    expect(empty.notice).toContain('No decisions matched document_id');
+    expect(empty.notice).toBe(
+      'No decisions matched document_id in the complete sitting. Remove document_id to inspect all published decisions.',
+    );
     expect(fetcher).toHaveBeenCalledTimes(5);
   });
   it('discovers sittings and forwards only year and page parameters', async () => {
@@ -290,6 +292,36 @@ describe('euparl_get_plenary_votes contract', () => {
       format: 'application/ld+json',
     });
   });
+  it('dates sittings published only under the typed-literal key with their written calendar day', async () => {
+    // 2014–2019 meeting rows: xsd:dateTime at local midnight, +01:00 in winter and +02:00 in summer.
+    installToolHttp(() =>
+      envelopeResponse([
+        {
+          id: 'eli/dl/event/MTG-PL-2019-01-14',
+          'eli-dl:activity_date': { '@value': '2019-01-14T00:00:00+01:00', type: 'xsd:dateTime' },
+        },
+        {
+          id: 'eli/dl/event/MTG-PL-2019-07-02',
+          'eli-dl:activity_date': { '@value': '2019-07-02T00:00:00+02:00', type: 'xsd:dateTime' },
+        },
+      ]),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, { mode: 'sittings', year: 2019 }),
+    );
+    expect(data.sittings).toEqual([
+      {
+        sitting_id: 'MTG-PL-2019-01-14',
+        date: '2019-01-14',
+        source_url: 'https://data.europarl.europa.eu/eli/dl/event/MTG-PL-2019-01-14',
+      },
+      {
+        sitting_id: 'MTG-PL-2019-07-02',
+        date: '2019-07-02',
+        source_url: 'https://data.europarl.europa.eu/eli/dl/event/MTG-PL-2019-07-02',
+      },
+    ]);
+  });
 
   it.each([
     '2025-01-15',
@@ -305,6 +337,8 @@ describe('euparl_get_plenary_votes contract', () => {
         label: { value: 'Example amendment', language: 'en' },
         document_ids: ['A-10-2025-900001'],
         recording_document_ids: ['PV-10-2025-01-15-RCV-ITM-001'],
+        partial_document_ids: [],
+        vote_item_ids: [],
         date: '2025-01-15',
         order: '1.0',
         method: 'def/ep-decision-methods/VOTE_ELECTRONIC_ROLLCALL',
@@ -417,6 +451,8 @@ describe('euparl_get_plenary_votes contract', () => {
       voter_counts: [{ position: 'abstention', count: 0 }],
       document_ids: [],
       recording_document_ids: [],
+      partial_document_ids: [],
+      vote_item_ids: [],
       source_url: 'https://data.europarl.europa.eu/eli/dl/event/MTG-PL-2025-01-15-DEC-900001',
     });
   });
@@ -452,7 +488,7 @@ describe('euparl_get_plenary_votes contract', () => {
       unresolved: 1,
     });
     expect(data.notice).toBe(
-      'Names are published identities in the selected term roster, not proof of spelling or affiliation on the vote date. Some voter identities are unresolved. Call euparl_get_mep with the returned mep_id.',
+      'Names are published identities in the selected term roster, not proof of spelling or affiliation on the vote date. Some voter identities are unresolved. roster_term must be the term containing the sitting date (voter_resolution.sitting_date); if it is not, retry with that term. Call euparl_get_mep with any mep_id still unresolved.',
     );
     expect(fetcher).toHaveBeenCalledTimes(3);
     const rosterUrl = new URL(String(fetcher.mock.calls[1]?.[0]));
@@ -497,6 +533,8 @@ describe('euparl_get_plenary_votes contract', () => {
                 decision_id: 'EXAMPLE-SECOND',
                 document_ids: [],
                 recording_document_ids: [],
+                partial_document_ids: [],
+                vote_item_ids: [],
                 voter_counts: [],
                 source_url: 'https://data.europarl.europa.eu/eli/dl/event/EXAMPLE-SECOND',
               },
@@ -593,6 +631,9 @@ describe('euparl_get_plenary_votes contract', () => {
       resolved: 2,
       unresolved: 0,
     });
+    expect(first.notice).toBe(
+      'Names are published identities in the selected term roster, not proof of spelling or affiliation on the vote date. Continue with offset 1 and the returned snapshot.',
+    );
     changed = true;
     expectErrorTwin(
       await runToolContract(getPlenaryVotesTool, {
@@ -629,6 +670,8 @@ describe('euparl_get_plenary_votes contract', () => {
       voter_counts: [{ position: 'favor', count: 1 }],
       document_ids: [],
       recording_document_ids: [],
+      partial_document_ids: [],
+      vote_item_ids: [],
       source_url: 'https://data.europarl.europa.eu/eli/dl/event/MTG-PL-2025-01-15-DEC-900001',
     });
     const voters = expectSuccessTwin(
@@ -661,6 +704,19 @@ describe('euparl_get_plenary_votes contract', () => {
     expect(past).toMatchObject({
       sittings: [],
       page: { offset: 1000, returned: 0, has_more: false },
+      notice:
+        'The page at offset 1000 returned no sittings. Restart at offset 0 or return to the previous page.',
+    });
+  });
+  it('keeps the no-sittings guidance for an empty year at offset 0', async () => {
+    installToolHttp(() => new Response(null, { status: 204 }));
+    expect(
+      expectSuccessTwin(
+        await runToolContract(getPlenaryVotesTool, { mode: 'sittings', year: 2009 }),
+      ),
+    ).toMatchObject({
+      sittings: [],
+      page: { offset: 0, returned: 0, has_more: false },
       notice: 'No sittings matched this year. Try another year.',
     });
   });
@@ -716,6 +772,8 @@ describe('euparl_get_plenary_votes contract', () => {
               decision_id: 'EXAMPLE-100',
               document_ids: [],
               recording_document_ids: [],
+              partial_document_ids: [],
+              vote_item_ids: [],
               voter_counts: [],
               source_url: 'https://data.europarl.europa.eu/eli/dl/event/EXAMPLE-100',
             },
@@ -942,4 +1000,485 @@ describe('euparl_get_plenary_votes contract', () => {
     );
     expect(fetcher).toHaveBeenCalledTimes(3);
   });
+});
+
+const decisionPage = z.object({
+  decisions: z.array(z.object({ decision_id: z.string() })),
+  page: z.object({
+    offset: z.number(),
+    limit: z.number(),
+    returned: z.number(),
+    has_more: z.boolean(),
+    next_offset: z.number().optional(),
+    snapshot: z.string(),
+  }),
+  notice: z.string().optional(),
+});
+type DecisionPage = z.infer<typeof decisionPage>;
+
+/** Follow page.next_offset and the snapshot from the first page until has_more is false. */
+async function walkDecisions(input: Record<string, unknown>) {
+  const pages: { data: DecisionPage; structured: Record<string, unknown>; text: string }[] = [];
+  let next = input;
+  while (pages.length < 20) {
+    const result = await runToolContract(getPlenaryVotesTool, next);
+    const structured = expectSuccessTwin(result);
+    const data = decisionPage.parse(structured);
+    pages.push({ data, structured, text: contractText(result) });
+    if (!data.page.has_more) return pages;
+    expect(data.page.next_offset).toBeDefined();
+    next = { ...input, offset: data.page.next_offset, snapshot: data.page.snapshot };
+  }
+  throw new Error('Decision walk did not end within 20 pages.');
+}
+/** Characters the rendered rows spend: each `result.decisions[i].` paragraph plus its separator. */
+function rowChars(text: string): number {
+  return text
+    .split('\n\n')
+    .filter((paragraph) => paragraph.startsWith('result.decisions['))
+    .reduce((sum, paragraph) => sum + paragraph.length + 2, 0);
+}
+/** A decision whose decided-on array sets its rendered size, about 68 characters per document. */
+const sizedDecision = (index: number, documents: number) => ({
+  id: `eli/dl/event/MTG-PL-2024-03-13-DEC-${index}`,
+  activity_id: `MTG-PL-2024-03-13-DEC-${index}`,
+  decided_on_a_realization_of: Array.from(
+    { length: documents },
+    (_, item) => `eli/dl/doc/A-9-2024-0001-AM-${String(item).padStart(4, '0')}`,
+  ),
+});
+const sizedSitting = [420, 420, 420, 700, 120, 1400, 50].map((documents, index) =>
+  sizedDecision(index, documents),
+);
+const budgetNotice = (returned: number) =>
+  `The 92000-character budget for decision rows ended this page after ${returned} whole decision${returned === 1 ? '' : 's'}.`;
+
+describe('euparl_get_plenary_votes decisions row budget', () => {
+  it('ends pages at whole decisions within 92000 row characters and resumes without repeats or gaps', async () => {
+    installToolHttp(() => envelopeResponse(sizedSitting));
+    const pages = await walkDecisions({ sitting_id: '2024-03-13', limit: 100 });
+    expect(pages.map(({ data }) => data.decisions.map(({ decision_id }) => decision_id))).toEqual(
+      [[0, 1, 2], [3, 4], [5], [6]].map((ids) => ids.map((id) => `MTG-PL-2024-03-13-DEC-${id}`)),
+    );
+    const snapshot = pages[0]?.data.page.snapshot;
+    expect(pages.map(({ data }) => data.page)).toEqual([
+      { offset: 0, limit: 100, returned: 3, has_more: true, next_offset: 3, snapshot },
+      { offset: 3, limit: 100, returned: 2, has_more: true, next_offset: 5, snapshot },
+      { offset: 5, limit: 100, returned: 1, has_more: true, next_offset: 6, snapshot },
+      { offset: 6, limit: 100, returned: 1, has_more: false, snapshot },
+    ]);
+    pages.forEach(({ data, structured, text }, index) => {
+      expect(text.length).toBeLessThanOrEqual(100_000);
+      expect(text).toContain('result.page.limit: 100');
+      expect(structured.totalCount).toBe(7);
+      if (data.page.has_more) {
+        expect(text).toContain(`result.page.next_offset: ${data.page.next_offset}`);
+        expect(data.notice).toBe(
+          `${budgetNotice(data.page.returned)} Continue with offset ${data.page.next_offset} and the returned snapshot.`,
+        );
+        expect(structured).toMatchObject({ truncated: true, shown: data.page.returned, cap: 100 });
+      } else expect(structured).not.toHaveProperty('notice');
+      if (data.page.returned > 1) expect(rowChars(text)).toBeLessThanOrEqual(92_000);
+      expect(index).toBeLessThan(4);
+    });
+    const oversized = pages[2]!.text;
+    expect(rowChars(oversized)).toBeGreaterThan(92_000);
+    expect(oversized).toContain(
+      'result.decisions[0].document_ids[1399]: ` "A-9-2024-0001-AM-1399" `',
+    );
+  });
+
+  it('lets the count end a page whose rows fit, with no budget notice', async () => {
+    installToolHttp(() => envelopeResponse(sizedSitting));
+    const first = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, { sitting_id: '2024-03-13', limit: 2 }),
+    );
+    expect(first).toMatchObject({
+      page: { limit: 2, returned: 2, next_offset: 2 },
+      notice: 'Continue with offset 2 and the returned snapshot.',
+    });
+  });
+
+  it('keeps a full budgeted page with every notice inside 100000 characters of content[]', async () => {
+    const typical = (index: number) => {
+      const report = 100 + Math.floor(index / 8);
+      return {
+        ...decisionRecord,
+        id: `eli/dl/event/MTG-PL-2024-03-13-DEC-${166000 + index}`,
+        activity_id: `MTG-PL-2024-03-13-DEC-${166000 + index}`,
+        activity_date: '2024-03-13',
+        activity_label: {
+          en: `A9-0${report}/2024 – Example Rapporteur – Amendment ${index} to the motion for a resolution on an example file`,
+        },
+        decided_on_a_realization_of:
+          index % 8 === 7 ? [] : [`eli/dl/doc/A-9-2024-0${report}-AM-${index}`],
+        recorded_in_a_realization_of: [`eli/dl/doc/PV-9-2024-03-13-RCV-ITM-${index}`],
+        inverse_consists_of: [`eli/dl/event/MTG-PL-2024-03-13-VOT-ITM-${940000 + report}`],
+      };
+    };
+    installToolHttp(() =>
+      envelopeResponse(Array.from({ length: 160 }, (_, index) => typical(index))),
+    );
+    const result = await runToolContract(getPlenaryVotesTool, {
+      sitting_id: '2024-03-13',
+      document_id: 'A-9-2024',
+      language: 'pl',
+      limit: 500,
+    });
+    const structured = expectSuccessTwin(result);
+    const { decisions, page, notice } = decisionPage.parse(structured);
+    const text = contractText(result);
+    expect(structured.totalCount).toBe(140);
+    expect(page).toMatchObject({ limit: 100, has_more: true, next_offset: decisions.length });
+    expect(decisions.length).toBeGreaterThan(50);
+    expect(decisions.length).toBeLessThan(100);
+    for (const part of [
+      'Requested limit normalized to the effective maximum of 100 decisions.',
+      'Requested language pl unavailable; returned published en text.',
+      'document_id left out other decisions of the vote items it matched: MTG-PL-2024-03-13-VOT-ITM-940100 (1 of 8 left out),',
+      'and 15 more vote items (15 decisions left out; each decision row lists its vote_item_ids).',
+      budgetNotice(decisions.length),
+      `Continue with offset ${decisions.length} and the returned snapshot.`,
+    ])
+      expect(notice).toContain(part);
+    expect(rowChars(text)).toBeLessThanOrEqual(92_000);
+    expect(text.length - rowChars(text)).toBeLessThanOrEqual(8_000);
+    expect(text.length).toBeLessThanOrEqual(100_000);
+  });
+
+  it('charges part-of and vote-item rows their exact rendered size: rows at 92000 stay, one character more cuts', async () => {
+    /** Size comes from the part-of and vote-item arrays; the label pads a row by exactly `pad` characters. */
+    const related = (index: number, pad: number) => ({
+      id: `eli/dl/event/MTG-PL-2024-03-13-DEC-${index}`,
+      activity_id: `MTG-PL-2024-03-13-DEC-${index}`,
+      activity_label: { en: `L${'x'.repeat(pad)}` },
+      decided_on_a_part_of_a_realization_of: Array.from(
+        { length: 250 },
+        (_, item) => `eli/dl/doc/A-9-2024-0001-AM-${String(item).padStart(4, '0')}`,
+      ),
+      inverse_consists_of: Array.from(
+        { length: 250 },
+        (_, item) => `eli/dl/event/MTG-PL-2024-03-13-VOT-ITM-${900000 + item}`,
+      ),
+    });
+    /** Rendered characters of row `index`: its paragraphs plus the blank line before each. */
+    const rowText = (text: string, index: number) =>
+      text
+        .split('\n\n')
+        .filter((paragraph) => paragraph.startsWith(`result.decisions[${index}].`))
+        .reduce((sum, paragraph) => sum + paragraph.length + 2, 0);
+    const firstPage = async (sitting: unknown[]) => {
+      installToolHttp(() => envelopeResponse(sitting));
+      const result = await runToolContract(getPlenaryVotesTool, {
+        sitting_id: '2024-03-13',
+        limit: 100,
+      });
+      return { data: decisionPage.parse(expectSuccessTwin(result)), text: contractText(result) };
+    };
+    // The rendered content[] is the oracle: measure two unpadded rows on a page the budget leaves whole.
+    const measured = await firstPage([related(0, 0), related(1, 0)]);
+    expect(measured.data.page).toMatchObject({ returned: 2, has_more: false });
+    expect(measured.text).toContain(
+      'result.decisions[1].vote_item_ids[249]: ` "MTG-PL-2024-03-13-VOT-ITM-900249" `',
+    );
+    const pad = 92_000 - rowText(measured.text, 0) - rowText(measured.text, 1);
+    expect(pad).toBeGreaterThan(0);
+    const exact = await firstPage([related(0, 0), related(1, pad), related(2, 0)]);
+    expect(rowText(exact.text, 0) + rowText(exact.text, 1)).toBe(92_000);
+    expect(exact.data.page).toMatchObject({ returned: 2, has_more: true, next_offset: 2 });
+    const over = await firstPage([related(0, 0), related(1, pad + 1), related(2, 0)]);
+    expect(over.data.page).toMatchObject({ returned: 1, has_more: true, next_offset: 1 });
+    expect(over.data.notice).toBe(
+      `${budgetNotice(1)} Continue with offset 1 and the returned snapshot.`,
+    );
+  });
+});
+
+const voteItem = (number: number) => `eli/dl/event/MTG-PL-2025-12-17-VOT-ITM-${number}`;
+const decision1217 = (number: number, relations: Record<string, unknown>) => ({
+  id: `eli/dl/event/MTG-PL-2025-12-17-DEC-${number}`,
+  activity_id: `MTG-PL-2025-12-17-DEC-${number}`,
+  activity_date: '2025-12-17',
+  ...relations,
+});
+/** Shapes published on 2025-12-17: decided-on, part-of and recording relations under vote items. */
+const sitting1217 = [
+  decision1217(182634, {
+    activity_label: { en: 'A10-0244/2025 – Andrzej Buła – Am 1' },
+    decided_on_a_realization_of: 'eli/dl/doc/A-10-2025-0244-AM-001',
+    inverse_consists_of: [voteItem(978508)],
+  }),
+  decision1217(182635, {
+    activity_label: { en: 'A10-0244/2025 – Andrzej Buła – Am 2' },
+    decided_on_a_realization_of: 'eli/dl/doc/A-10-2025-0244-AM-002',
+    inverse_consists_of: [voteItem(978508)],
+  }),
+  decision1217(182797, {
+    activity_label: {
+      en: 'A10-0244/2025 – Andrzej Buła – Motion for a resolution (as a whole)',
+    },
+    recorded_in_a_realization_of: 'eli/dl/doc/PV-10-2025-12-17-RCV-ITM-021',
+    inverse_consists_of: [voteItem(978508)],
+  }),
+  decision1217(182800, {
+    decided_on_a_realization_of: 'eli/dl/doc/A-10-2025-0195-AM-001',
+    inverse_consists_of: [voteItem(978310)],
+  }),
+  decision1217(182811, {
+    activity_label: { en: 'Text as a whole' },
+    decided_on_a_part_of_a_realization_of: 'eli/dl/doc/A-10-2025-0195-AM-27',
+    inverse_consists_of: [voteItem(978310)],
+  }),
+  decision1217(182840, {
+    activity_label: { en: 'Recital 17' },
+    decided_on_a_part_of_a_realization_of: 'eli/dl/doc/A-10-2025-0195-AM-27',
+    inverse_consists_of: [voteItem(978310)],
+  }),
+  decision1217(182855, { inverse_consists_of: [voteItem(978310)] }),
+];
+const ids = (data: Record<string, unknown>) =>
+  decisionPage.parse(data).decisions.map(({ decision_id }) => decision_id.slice(-6));
+const steering = (items: string) =>
+  `document_id left out other decisions of the vote items it matched: ${items}. Pass a vote item as vote_item_id without document_id to read all of its decisions.`;
+
+describe('euparl_get_plenary_votes part-of and vote-item relations', () => {
+  it('matches document_id through part-of relations and names the vote items it left decisions out of', async () => {
+    installToolHttp(() => envelopeResponse(sitting1217));
+    const report = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        sitting_id: '2025-12-17',
+        document_id: 'A-10-2025-0195',
+        limit: 100,
+      }),
+    );
+    expect(ids(report)).toEqual(['182800', '182811', '182840']);
+    expect(report.totalCount).toBe(3);
+    expect(report.notice).toBe(steering('MTG-PL-2025-12-17-VOT-ITM-978310 (1 of 4 left out)'));
+    expect(z.array(z.unknown()).parse(report.decisions)[1]).toEqual({
+      decision_id: 'MTG-PL-2025-12-17-DEC-182811',
+      label: { value: 'Text as a whole', language: 'en' },
+      document_ids: [],
+      recording_document_ids: [],
+      partial_document_ids: ['A-10-2025-0195-AM-27'],
+      vote_item_ids: ['MTG-PL-2025-12-17-VOT-ITM-978310'],
+      date: '2025-12-17',
+      voter_counts: [],
+      source_url: 'https://data.europarl.europa.eu/eli/dl/event/MTG-PL-2025-12-17-DEC-182811',
+    });
+    const amendments = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        sitting_id: '2025-12-17',
+        document_id: 'A-10-2025-0244',
+      }),
+    );
+    expect(ids(amendments)).toEqual(['182634', '182635']);
+    expect(amendments.notice).toBe(steering('MTG-PL-2025-12-17-VOT-ITM-978508 (1 of 3 left out)'));
+    const rich = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        sitting_id: '2025-12-17',
+        mode: 'decision',
+        decision_id: 'MTG-PL-2025-12-17-DEC-182840',
+      }),
+    );
+    expect(rich.decision).toMatchObject({
+      document_ids: [],
+      partial_document_ids: ['A-10-2025-0195-AM-27'],
+      vote_item_ids: ['MTG-PL-2025-12-17-VOT-ITM-978310'],
+    });
+  });
+
+  it.each([
+    'MTG-PL-2025-12-17-VOT-ITM-978508',
+    'eli/dl/event/MTG-PL-2025-12-17-VOT-ITM-978508',
+    'https://data.europarl.europa.eu/eli/dl/event/MTG-PL-2025-12-17-VOT-ITM-978508',
+  ])('selects every decision of vote item %s', async (vote_item_id) => {
+    const fetcher = installToolHttp(() => envelopeResponse(sitting1217));
+    const data = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, { sitting_id: '2025-12-17', vote_item_id }),
+    );
+    expect(ids(data)).toEqual(['182634', '182635', '182797']);
+    expect(data).toMatchObject({
+      totalCount: 3,
+      appliedFilters: { vote_item_id: 'MTG-PL-2025-12-17-VOT-ITM-978508' },
+    });
+    expect(data).not.toHaveProperty('notice');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('intersects vote_item_id with document_id and keeps it in the snapshot scope', async () => {
+    installToolHttp(() => envelopeResponse(sitting1217));
+    const input = {
+      sitting_id: '2025-12-17',
+      vote_item_id: 'MTG-PL-2025-12-17-VOT-ITM-978310',
+      document_id: 'A-10-2025-0195-AM-27',
+      limit: 1,
+    };
+    const first = expectSuccessTwin(await runToolContract(getPlenaryVotesTool, input));
+    expect(ids(first)).toEqual(['182811']);
+    expect(first).toMatchObject({
+      totalCount: 2,
+      appliedFilters: {
+        document_id: 'A-10-2025-0195-AM-27',
+        vote_item_id: 'MTG-PL-2025-12-17-VOT-ITM-978310',
+      },
+      notice: 'Continue with offset 1 and the returned snapshot.',
+    });
+    const snapshot = snapshotOf(first);
+    expect(
+      ids(
+        expectSuccessTwin(
+          await runToolContract(getPlenaryVotesTool, { ...input, offset: 1, snapshot }),
+        ),
+      ),
+    ).toEqual(['182840']);
+    const { vote_item_id: _dropped, ...withoutVoteItem } = input;
+    expectErrorTwin(
+      await runToolContract(getPlenaryVotesTool, { ...withoutVoteItem, offset: 1, snapshot }),
+      'snapshot_changed',
+      snapshotHint,
+      JsonRpcErrorCode.Conflict,
+    );
+  });
+
+  it('caps the steering notice at five named vote items and counts the rest', async () => {
+    installToolHttp(() =>
+      envelopeResponse(
+        Array.from({ length: 14 }, (_, index) =>
+          decision1217(190000 + index, {
+            ...(index % 2 === 0 && {
+              decided_on_a_realization_of: `eli/dl/doc/A-10-2025-0300-AM-${index}`,
+            }),
+            inverse_consists_of: [voteItem(979000 + Math.floor(index / 2))],
+          }),
+        ),
+      ),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        sitting_id: '2025-12-17',
+        document_id: 'A-10-2025-0300',
+      }),
+    );
+    expect(data.notice).toBe(
+      steering(
+        `${[0, 1, 2, 3, 4].map((item) => `MTG-PL-2025-12-17-VOT-ITM-97900${item} (1 of 2 left out)`).join(', ')}, and 2 more vote items (2 decisions left out; each decision row lists its vote_item_ids)`,
+      ),
+    );
+  });
+
+  it.each([
+    { mode: 'sittings', year: 2025 },
+    { ...selected, mode: 'decision' },
+    { ...selected, mode: 'voters', position: 'favor' },
+  ] as const)('rejects vote_item_id outside decisions mode %j before HTTP', async (input) => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    expectErrorTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        ...input,
+        vote_item_id: 'MTG-PL-2025-01-15-VOT-ITM-1',
+      }),
+      'invalid_mode_fields',
+      modeHint,
+      JsonRpcErrorCode.ValidationError,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'MTG-PL-2025-12-17-VOT-ITM-978508',
+    'https://data.europarl.europa.eu/eli/dl/event/MTG-PL-2025-12-17-VOT-ITM-978508',
+  ])('rejects vote item %s dated off the sitting before HTTP', async (vote_item_id) => {
+    const fetcher = installToolHttp(() => envelopeResponse(sitting1217));
+    expectErrorTwin(
+      await runToolContract(getPlenaryVotesTool, { sitting_id: '2025-12-16', vote_item_id }),
+      'invalid_filter',
+      'Retry with sitting_id 2025-12-17, the date in vote_item_id.',
+      JsonRpcErrorCode.ValidationError,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('rejects a vote item outside the public event namespace at the schema', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    const result = await runToolContract(getPlenaryVotesTool, {
+      sitting_id: '2025-12-17',
+      vote_item_id: 'https://evil.example/eli/dl/event/MTG-PL-2025-12-17-VOT-ITM-1',
+    });
+    expect(result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: JsonRpcErrorCode.InvalidParams } },
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ document_id: 'A-9-2023-0188' }, 'document_id'],
+    [{ vote_item_id: 'MTG-PL-2023-06-14-VOT-ITM-939243' }, 'vote_item_id'],
+    [
+      { document_id: 'A-9-2023-0188', vote_item_id: 'MTG-PL-2023-06-14-VOT-ITM-939243' },
+      'document_id and vote_item_id',
+    ],
+  ] as const)(
+    'points %j to decision labels on a sitting without report or vote-item relations',
+    async (filters, names) => {
+      installToolHttp(() =>
+        envelopeResponse([
+          {
+            id: 'eli/dl/event/MTG-PL-2023-06-14-DEC-1',
+            activity_id: 'MTG-PL-2023-06-14-DEC-1',
+            activity_label: { en: 'A9-0188/2023 – Example Rapporteur – Am 808' },
+            recorded_in_a_realization_of: 'eli/dl/doc/PV-9-2023-06-14-RCV-ITM-001',
+          },
+        ]),
+      );
+      const data = expectSuccessTwin(
+        await runToolContract(getPlenaryVotesTool, { sitting_id: '2023-06-14', ...filters }),
+      );
+      expect(data).toMatchObject({ decisions: [], totalCount: 0 });
+      expect(data.notice).toBe(
+        `No decision in this sitting publishes a decided-on, part-of or vote-item relation, so a report or vote item cannot select its decisions. Remove ${names} and find the report's citation (its document label, such as A9-0188/2023) in decision labels.`,
+      );
+    },
+  );
+
+  it.each([
+    [
+      { document_id: 'A-10-2025-0999' },
+      "No decisions matched document_id in the complete sitting. A vote can decide on no document: pass the procedure's PLENARY_VOTE_RESULTS event id as vote_item_id, or remove document_id to inspect all published decisions.",
+    ],
+    [
+      { vote_item_id: 'MTG-PL-2025-12-17-VOT-ITM-970000' },
+      'No decision in this sitting belongs to vote_item_id. Remove vote_item_id to inspect all published decisions.',
+    ],
+    [
+      { vote_item_id: 'MTG-PL-2025-12-17-VOT-ITM-978508', document_id: 'A-10-2025-0195' },
+      "No decision of vote_item_id matched document_id. Remove document_id to read the vote item's 3 decisions.",
+    ],
+  ] as const)('names the filter that matched nothing in %j', async (filters, notice) => {
+    installToolHttp(() => envelopeResponse(sitting1217));
+    const data = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, { sitting_id: '2025-12-17', ...filters }),
+    );
+    expect(data).toMatchObject({ decisions: [], totalCount: 0, notice });
+  });
+
+  it.each([
+    [404, { document_id: 'A-8-2018-0400' }],
+    [404, { vote_item_id: 'MTG-PL-2018-12-12-VOT-ITM-000001' }],
+    [204, { vote_item_id: 'MTG-PL-2018-12-12-VOT-ITM-000001', document_id: 'A-8-2018-0400' }],
+  ] as const)(
+    'routes a filtered HTTP %i sitting %j to sitting discovery',
+    async (status, filters) => {
+      installToolHttp(() => new Response(null, { status }));
+      const data = expectSuccessTwin(
+        await runToolContract(getPlenaryVotesTool, { sitting_id: '2018-12-12', ...filters }),
+      );
+      expect(data).toMatchObject({
+        decisions: [],
+        totalCount: 0,
+        notice:
+          'No decision data was published for this sitting. Call euparl_get_plenary_votes with mode sittings and year to discover available sittings.',
+      });
+    },
+  );
 });

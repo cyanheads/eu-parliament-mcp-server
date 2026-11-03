@@ -12,7 +12,11 @@ import {
   normalizeName,
   normalizeProcedure,
   normalizeQuestion,
+  normalizeSpeech,
+  type Page,
+  type PageWindow,
   pageWindow,
+  procedureIds,
   upstreamPage,
 } from '../../../src/services/eu-parliament/eu-parliament-normalization.js';
 import {
@@ -20,6 +24,7 @@ import {
   documentSchema,
   procedureSchema,
   questionSchema,
+  speechSchema,
 } from '../../../src/services/eu-parliament/eu-parliament-schemas.js';
 import {
   decisionRecord,
@@ -35,13 +40,31 @@ describe('Parliament normalization', () => {
     },
   );
   it.each([
-    'org/ep-10',
+    ['org/ep-10', 'ep-10'],
+    ['org/IMCO', 'IMCO'],
+    ['org/S-D', 'S-D'],
+    ['CJ40', 'CJ40'],
+    ['org/EU_PARLIAMENT', 'EU_PARLIAMENT'],
+    ['https://data.europarl.europa.eu/org/GUE-NGL', 'GUE-NGL'],
+    [' DLAT ', 'DLAT'],
+    ['imco', 'imco'],
+    ['org/EP-9', 'EP-9'],
+  ])('keeps organization code %s as %s without changing its case', (id, code) => {
+    expect(canonicalId(id, 'organization')).toBe(code);
+  });
+  it.each([
     'https://evil.example/org/5144',
     '5144?x=y',
     'org/../5144',
     'https://data.europarl.europa.eu.evil/org/5144',
     '%35',
     '5144\n1',
+    'S&D',
+    'GUE/NGL',
+    'The Left',
+    'org/',
+    '-IMCO',
+    'org/IMCO/',
   ])('rejects unsupported organization identity %s', (id) => {
     expect(() => canonicalId(id, 'organization')).toThrow();
   });
@@ -52,9 +75,80 @@ describe('Parliament normalization', () => {
       voter_counts: [],
       document_ids: [],
       recording_document_ids: [],
+      partial_document_ids: [],
+      vote_item_ids: [],
       source_url: 'https://data.europarl.europa.eu/eli/dl/event/DEC-1',
     });
   });
+  it('keeps part-of and vote-item relations apart from decided-on documents, in published order', () => {
+    const relations = {
+      decided_on_a_part_of_a_realization_of: 'eli/dl/doc/A-10-2025-0195-AM-27',
+      inverse_consists_of: [
+        'eli/dl/event/MTG-PL-2025-12-17-VOT-ITM-978310',
+        { id: 'https://data.europarl.europa.eu/eli/dl/event/MTG-PL-2025-12-17-VOT-ITM-978299' },
+      ],
+    };
+    const raw = decisionSchema.parse({ ...decisionRecord, ...relations });
+    const expected = {
+      document_ids: ['A-10-2025-900001'],
+      recording_document_ids: ['PV-10-2025-01-15-RCV-ITM-001'],
+      partial_document_ids: ['A-10-2025-0195-AM-27'],
+      vote_item_ids: ['MTG-PL-2025-12-17-VOT-ITM-978310', 'MTG-PL-2025-12-17-VOT-ITM-978299'],
+    };
+    expect(normalizeDecisionSummary(raw)).toMatchObject(expected);
+    expect(normalizeDecision(raw, 'en', [])).toMatchObject(expected);
+    expect(
+      normalizeDecisionSummary(
+        decisionSchema.parse({
+          id: decisionRecord.id,
+          decided_on_a_part_of_a_realization_of: ['eli/dl/doc/B-1', { id: 'eli/dl/doc/A-2' }],
+          inverse_consists_of: 'eli/dl/event/MTG-PL-2025-12-17-VOT-ITM-1',
+        }),
+      ),
+    ).toMatchObject({
+      document_ids: [],
+      partial_document_ids: ['B-1', 'A-2'],
+      vote_item_ids: ['MTG-PL-2025-12-17-VOT-ITM-1'],
+    });
+  });
+
+  it('normalizes a record dated only by the typed literal to the same date as a plain activity_date record', () => {
+    const dated = (record: Record<string, unknown>, plain: boolean) => ({
+      ...record,
+      ...(plain
+        ? { activity_date: '2019-07-18' }
+        : {
+            'eli-dl:activity_date': { '@value': '2019-07-18T00:00:00+02:00', type: 'xsd:dateTime' },
+          }),
+    });
+    const [plainDecision, typedDecision] = [true, false].map((plain) =>
+      normalizeDecisionSummary(decisionSchema.parse(dated({ id: 'eli/dl/event/DEC-1' }, plain))),
+    );
+    expect(typedDecision).toEqual(plainDecision);
+    expect(typedDecision).toMatchObject({ date: '2019-07-18' });
+    const [plainSpeech, typedSpeech] = [true, false].map((plain) =>
+      normalizeSpeech(speechSchema.parse(dated({ id: 'eli/dl/event/S-1' }, plain)), 'en', []),
+    );
+    expect(typedSpeech).toEqual(plainSpeech);
+    expect(typedSpeech).toMatchObject({ date: '2019-07-18' });
+    const [plainProcedure, typedProcedure] = [true, false].map((plain) =>
+      normalizeProcedure(
+        procedureSchema.parse({
+          id: 'eli/dl/proc/2019-0001',
+          consists_of: [dated({ id: 'eli/dl/event/EV-1' }, plain)],
+          had_participation: dated({ id: 'eli/dl/participation/P-1' }, plain),
+        }),
+        'en',
+        [],
+      ),
+    );
+    expect(typedProcedure).toEqual(plainProcedure);
+    expect(typedProcedure).toMatchObject({
+      events: [{ id: 'EV-1', date: '2019-07-18' }],
+      participants: [{ id: 'eli/dl/participation/P-1', date: '2019-07-18' }],
+    });
+  });
+
   it('keeps sparse documents free of inferred procedure links, titles and files', () => {
     const document = normalizeDocument(documentSchema.parse({ id: 'eli/dl/doc/TA-1' }), 'en', []);
     expect(document).toMatchObject({
@@ -65,6 +159,32 @@ describe('Parliament normalization', () => {
     });
     expect(document).not.toHaveProperty('title');
     expect(document).not.toHaveProperty('public_register_ref');
+  });
+  it('takes only procedure entries of a relation, canonical and in published order', () => {
+    expect(
+      procedureIds([
+        'eli/dl/event/MTG-PL-2024-03-13-PVCRE-ITM-8-2',
+        { id: 'eli/dl/proc/2021-0106' },
+        'https://data.europarl.europa.eu/eli/dl/proc/2016-0224B',
+        'org/IMCO',
+        'eli/dl/doc/A-9-2023-0188',
+      ]),
+    ).toEqual(['2021-0106', '2016-0224B']);
+    expect(procedureIds('eli/dl/proc/2024-2716')).toEqual(['2024-2716']);
+    expect(procedureIds(undefined)).toEqual([]);
+  });
+  it('lists family procedure relations after generic ones without repeating any', () => {
+    const document = normalizeDocument(
+      documentSchema.parse({
+        id: 'eli/dl/doc/TA-1',
+        refers_to: ['eli/dl/proc/2020-0001', 'eli/dl/proc/2020-0001'],
+        is_about: { id: 'https://data.europarl.europa.eu/eli/dl/proc/2020-0002' },
+      }),
+      'en',
+      [],
+      ['2020-0003', '2020-0001', '2019-0005', '2020-0003'],
+    );
+    expect(document.procedure_ids).toEqual(['2020-0001', '2020-0002', '2020-0003', '2019-0005']);
   });
   it('canonicalizes document relation shapes in published order without implying procedure links', () => {
     const document = normalizeDocument(
@@ -314,7 +434,10 @@ describe('Parliament normalization', () => {
     expect(snapshot).toMatch(/^[a-f0-9]{64}$/);
     const second = localPage(items, { offset: 1, limit: 1, snapshot }, { term: 10 });
     expect(second.items).toEqual([{ id: 'second' }]);
-    expect(() => localPage(items, { offset: 1, limit: 20 }, { term: 10 })).toThrow();
+    // Whether continuation requires a snapshot is the caller's contract, checked before acquisition.
+    const unchecked = localPage(items, { offset: 1, limit: 20 }, { term: 10 });
+    expect(unchecked.items).toEqual([{ id: 'second' }, { id: 'third' }]);
+    expect(unchecked.page.snapshot).toBe(snapshot);
     expect(() =>
       localPage(
         [...items.slice(0, 2), { id: 'changed unseen third' }],
@@ -381,6 +504,66 @@ describe('Parliament normalization', () => {
       limit: 20,
       returned: 2,
       has_more: false,
+    });
+  });
+  it('stops a budgeted page at whole items once rendered rows pass 92000 characters', () => {
+    const sizes = [40_000, 52_000, 1, 91_999, 2, 92_001, 5];
+    const items = sizes.map((size, id) => ({ id, size }));
+    const calls: [id: number, index: number][] = [];
+    const chars = (item: { id: number; size: number }, index: number) => {
+      calls.push([item.id, index]);
+      return item.size;
+    };
+    const pages: { ids: number[]; calls: typeof calls; page: Page }[] = [];
+    let window: PageWindow = { offset: 0, limit: 100 };
+    for (;;) {
+      calls.length = 0;
+      const result = localPage(items, window, { scope: 1 }, chars);
+      pages.push({ ids: result.items.map(({ id }) => id), calls: [...calls], page: result.page });
+      if (!result.page.has_more) break;
+      window = {
+        offset: result.page.next_offset!,
+        limit: 100,
+        snapshot: result.page.snapshot!,
+      };
+    }
+    expect(pages.map(({ ids }) => ids)).toEqual([[0, 1], [2, 3], [4], [5], [6]]);
+    expect(pages[1]?.calls).toEqual([
+      [2, 0],
+      [3, 1],
+      [4, 2],
+    ]);
+    expect(pages.map(({ page }) => page)).toEqual(
+      [0, 2, 4, 5, 6].map((offset, index) => ({
+        offset,
+        limit: 100,
+        returned: [2, 2, 1, 1, 1][index],
+        has_more: index < 4,
+        ...(index < 4 && { next_offset: [2, 4, 5, 6][index] }),
+        snapshot: pages[0]?.page.snapshot,
+      })),
+    );
+    expect(localPage(items, { offset: 0, limit: 1 }, { scope: 1 }, chars).page).toMatchObject({
+      limit: 1,
+      returned: 1,
+      next_offset: 1,
+    });
+    expect(
+      localPage(
+        items,
+        { offset: 7, limit: 100, snapshot: pages[0]!.page.snapshot! },
+        { scope: 1 },
+        chars,
+      ),
+    ).toMatchObject({ items: [], page: { returned: 0, has_more: false } });
+  });
+  it('keeps the window limit on a final short page', () => {
+    const items = Array.from({ length: 5 }, (_, id) => ({ id }));
+    const { snapshot } = localPage(items, { offset: 0, limit: 3 }, {}).page;
+    expect(localPage(items, { offset: 3, limit: 3, ...(snapshot && { snapshot }) }, {})).toEqual({
+      items: [{ id: 3 }, { id: 4 }],
+      total: 5,
+      page: { offset: 3, limit: 3, returned: 2, has_more: false, snapshot },
     });
   });
   it('normalizes non-ASCII name tokens without dropping word boundaries', () => {

@@ -57,7 +57,10 @@ const nounPrefixes = {
 };
 type Noun = keyof typeof nounPrefixes;
 type Reference = string | { id: string };
-/** Strips only a verified public URI and known noun prefix. */
+/**
+ * Strips only a verified public URI and known noun prefix. Organizations accept decimal IDs and
+ * Parliament's case-sensitive codes (`IMCO`, `S-D`, `ep-9`, `EU_PARLIAMENT`) without rewriting case.
+ */
 export function canonicalId(value: string, noun: Noun): string {
   let id = value.trim();
   if (id.startsWith(publicOrigin)) id = id.slice(publicOrigin.length);
@@ -70,11 +73,7 @@ export function canonicalId(value: string, noun: Noun): string {
       });
     return `${match[1]}-${match[2]}`;
   }
-  if (
-    !(noun === 'person' || noun === 'organization'
-      ? /^\d+$/.test(id)
-      : /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(id))
-  )
+  if (!(noun === 'person' ? /^\d+$/.test(id) : /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(id)))
     throw validationError(
       `Invalid ${noun} identifier. Use a canonical identifier returned by a discovery tool.`,
       { reason: 'invalid_filter' },
@@ -94,6 +93,15 @@ function references(value: Reference | Reference[] | undefined): string[] {
 }
 function canonicalIds(value: Reference | Reference[] | undefined, noun: Noun): string[] {
   return references(value).map((id) => canonicalId(id, noun));
+}
+/** Canonical IDs of a relation's `eli/dl/proc/` entries in published order; other nouns drop out. */
+export function procedureIds(value: Reference | Reference[] | undefined): string[] {
+  return canonicalIds(
+    references(value).filter(
+      (id) => id.startsWith('eli/dl/proc/') || id.startsWith(`${publicOrigin}eli/dl/proc/`),
+    ),
+    'procedure',
+  );
 }
 /** Published activity identifier, else the canonical form of the record URI. */
 export function activityId(raw: { id: string; activity_id?: string | undefined }): string {
@@ -161,22 +169,33 @@ export function normalizeDocumentSummary(raw: RawDocument) {
     source_url: sourceUrl(raw.id),
   };
 }
-/** Generic work detail preserves only explicitly published relations. */
-export function normalizeDocument(raw: RawDocument, language: string, notices: string[]) {
+/**
+ * Generic work detail preserves only explicitly published relations. `familyProcedureIds` come
+ * from the family record and follow the generic record's own, without repeats.
+ */
+export function normalizeDocument(
+  raw: RawDocument,
+  language: string,
+  notices: string[],
+  familyProcedureIds: string[] = [],
+) {
   const expressionTitles: Record<string, string> = Object.create(null);
   for (const expression of raw.is_realized_by ?? [])
     Object.assign(expressionTitles, expression.title);
   const maps = raw.title_dcterms ?? expressionTitles;
-  const procedures = [...references(raw.refers_to), ...references(raw.is_about)].filter(
-    (id) => id.startsWith('eli/dl/proc/') || id.startsWith(`${publicOrigin}eli/dl/proc/`),
-  );
   return {
     ...normalizeDocumentSummary(raw),
     ...field('title', localized(maps, language, notices)),
     ...field('date', raw.document_date),
     ...field('term_id', raw.parliamentary_term),
     creator_ids: references(raw.creator),
-    procedure_ids: procedures.map((id) => canonicalId(id, 'procedure')),
+    procedure_ids: [
+      ...new Set([
+        ...procedureIds(raw.refers_to),
+        ...procedureIds(raw.is_about),
+        ...familyProcedureIds,
+      ]),
+    ],
     parent_document_ids: canonicalIds(raw.is_part_of, 'document'),
     adopted_document_ids: canonicalIds(raw.adopts, 'document'),
     based_on_document_ids: canonicalIds(raw.based_on, 'document'),
@@ -219,7 +238,7 @@ export function normalizeMep(raw: RawMep) {
   };
 }
 /** Code-unit order, independent of locale. */
-function compareText(a: string, b: string): number {
+export function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 /** Dated records ascending, undated after them, then by id, then by the whole record: a total order. */
@@ -333,6 +352,8 @@ export function normalizeDecisionSummary(
     ...field('label', localized(raw.activity_label, language, notices)),
     document_ids: canonicalIds(raw.decided_on_a_realization_of, 'document'),
     recording_document_ids: canonicalIds(raw.recorded_in_a_realization_of, 'document'),
+    partial_document_ids: canonicalIds(raw.decided_on_a_part_of_a_realization_of, 'document'),
+    vote_item_ids: canonicalIds(raw.inverse_consists_of, 'activity'),
     ...field('date', raw.activity_date),
     ...field('start_time', raw.activity_start_date),
     ...field('order', raw.activity_order),
@@ -349,6 +370,8 @@ export function normalizeDecisionSummary(
     source_url: sourceUrl(raw.id),
   };
 }
+/** Compact decision row. */
+export type DecisionSummary = ReturnType<typeof normalizeDecisionSummary>;
 /** Rich single decision; all selected text remains whole. */
 export function normalizeDecision(
   raw: RawDecision,
@@ -399,13 +422,18 @@ export function normalizeName(value: string): string {
     .replace(/[^\p{L}\p{N}\s]/gu, ' ');
 }
 /**
- * Whole-item page cap per collection, at most 92,000 characters divided by the heaviest measured
- * `content[]` row (the larger surface), rounded down to a multiple of 25 (of 5 below 100). Claude
- * Code's default output budget truncates a result at 100,000 characters, and `page` renders after
- * the items, so a longer page loses its `next_offset`; the other 8,000 hold the header, page
- * block, notices and filter echo, measured at 1,400–2,400. Voters and sittings sit below that
- * bound. Decisions exceed it at 100: one row can carry hundreds of document IDs, so no count
- * bounds them. Organizations stop at 20 because each ID is one paced request inside the
+ * Characters of rendered rows one page may spend. Claude Code's default output budget truncates a
+ * result at 100,000 characters, and `page` renders after the items, so a longer page loses its
+ * `next_offset`; the other 8,000 hold the header, page block, notices and filter echo, measured
+ * at 1,400–2,400 on capped collections and 400–700 on budgeted decisions pages.
+ */
+export const pageRowBudgetChars = 92_000;
+/**
+ * Whole-item page cap per collection, at most `pageRowBudgetChars` divided by the heaviest
+ * measured `content[]` row (the larger surface), rounded down to a multiple of 25 (of 5 below
+ * 100). Voters and sittings sit below that bound. No count bounds decisions (a typical row renders
+ * about 1,500 characters and one can carry hundreds of document IDs), so their pages also stop at
+ * the row budget. Organizations stop at 20 because each ID is one paced request inside the
  * 40-second deadline.
  */
 export const pageCaps = {
@@ -450,23 +478,38 @@ export function pageWindow(
         : limit,
   };
 }
-/** Local snapshots include normalized scope and every returned field before slicing. */
+/**
+ * Local snapshots include normalized scope and every returned field before slicing. A supplied
+ * snapshot must match; whether continuation requires one is the caller's contract, checked before
+ * the collection is acquired. With `rowChars` (the characters an item renders at its page index),
+ * the page also ends at the last whole item that keeps its rows within `pageRowBudgetChars`,
+ * always keeping the first so continuation progresses; `page.limit` stays the window's limit.
+ */
 export function localPage<T>(
   items: T[],
   input: PageWindow,
   scope: unknown,
+  rowChars?: (item: T, index: number) => number,
 ): { items: T[]; page: Page; total: number } {
   const { offset, limit } = input;
-  if (offset > 0 && !input.snapshot)
-    throw validationError('Local continuation requires the previous page snapshot.', {
-      reason: 'invalid_mode_fields',
-    });
   const snapshot = createHash('sha256').update(JSON.stringify({ scope, items })).digest('hex');
   if (input.snapshot !== undefined && input.snapshot !== snapshot)
     throw conflict('The complete collection changed. Restart at offset 0 without snapshot.', {
       reason: 'snapshot_changed',
     });
-  const selected = items.slice(offset, offset + limit);
+  const window = items.slice(offset, offset + limit);
+  let fitting = window.length;
+  if (rowChars) {
+    let used = 0;
+    for (const [index, item] of window.entries()) {
+      used += rowChars(item, index);
+      if (index > 0 && used > pageRowBudgetChars) {
+        fitting = index;
+        break;
+      }
+    }
+  }
+  const selected = window.slice(0, fitting);
   return {
     items: selected,
     total: items.length,
