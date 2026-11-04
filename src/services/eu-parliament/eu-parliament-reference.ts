@@ -3,7 +3,7 @@
  * @module services/eu-parliament/eu-parliament-reference
  */
 import { validationError } from '@cyanheads/mcp-ts-core/errors';
-import { type LocalizedText, pageCaps, pageRowBudgetChars } from './eu-parliament-normalization.js';
+import { type LocalizedText, pageCaps } from './eu-parliament-normalization.js';
 
 /**
  * Canonical input codes copied from the public OpenAPI, plus verified group tokens. Country lists
@@ -201,6 +201,7 @@ export interface ReferenceEntry {
   start_date?: string;
 }
 const pageCapList = Object.values(pageCaps)
+  .filter(({ maximum }) => maximum < Number.MAX_SAFE_INTEGER)
   .map(({ maximum, noun }) => `${maximum} ${noun}`)
   .join(', ');
 /** Static tables have no upstream totals or snapshot requirement. */
@@ -266,7 +267,7 @@ export function referenceEntries(
         {
           code: 'question',
           description:
-            'E-term-year-six-digit-sequence, or E-six-digit-sequence/year citation; P, O, G and K prefixes work the same way; omitted term verifies canonical candidates for all overlapping terms, including both adjacent terms in election years.',
+            'E-term-year-six-digit-sequence, known document prefix/public URI, or E-sequence/year citation; E, P, O, G and K prefixes are case-insensitive and one-to-six-digit sequences are padded to six. Omitted term verifies canonical candidates for all overlapping terms, including both adjacent terms in election years.',
         },
         ...rows(
           codes.language,
@@ -302,7 +303,7 @@ export function referenceEntries(
         },
         {
           code: 'paging',
-          description: `Page caps: ${pageCapList}. A larger limit returns the cap with a notice; a server set to EUPARL_CLAMP_LIMITS=false rejects a limit above its tool's largest cap; a smaller collection cap in the same tool still clamps with a notice. A decisions page also ends at whole decisions before their rendered rows pass ${pageRowBudgetChars} characters, with a notice; its first decision always returns whole, page.limit keeps the requested limit, and next_offset resumes at the first decision left out. Organization lookups page the supplied IDs without a snapshot. Speeches, adopted texts and procedures without process_type expose a 10000-result search window: a page reaching past it narrows to the results left, with a notice, and an offset of 10000 or more is rejected. Capped totals are lower bounds. At the window boundary has_more may remain true without next_offset; narrow supported filters. Parliament serves unfiltered procedure pages from two orderings, so they can repeat or omit procedures; a process_type listing is acquired whole and paged in procedure_id order, and its snapshot is optional. Other local continuation requires the returned snapshot; the collection is reacquired and drift causes snapshot_changed. No retained cache.`,
+          description: `Acquisition bounds: ${pageCapList}. Whole-acquired local collections, including process_type procedures and static reference tables, return the requested count or remaining rows without an output-size cap. Limits above the safe-integer range normalize to 9007199254740991. A larger bounded-mode limit narrows with a notice; EUPARL_CLAMP_LIMITS=false rejects values above a tool's largest bound only when all its modes are bounded. Organization lookups page supplied IDs without a snapshot. Non-keyword adopted texts use doc-id:asc; speeches use sitting-date:asc,numbering:asc; both acquire aligned 100-row pages independently of caller geometry within one deadline. Keyword searches retain relevance order and can repeat or omit records. Speeches, adopted texts and unfiltered procedures expose a 10000-result window; limits narrow to remaining results and offsets of 10000 or more fail. Capped totals are lower bounds; has_more can remain true without next_offset at the window. Unfiltered procedures can repeat or omit records; process_type listings are acquired whole and sorted by procedure_id with optional snapshot. Other local continuation requires the snapshot; drift fails snapshot_changed before slicing. Past-end local pages disclose the exact collection size. No retained cache.`,
         },
         {
           code: 'questions',

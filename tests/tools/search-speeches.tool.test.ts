@@ -13,8 +13,6 @@ import { documentRecord, envelopeResponse } from '../helpers/eu-parliament-fixtu
 
 const invalidHint =
   'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
-const modeHint =
-  'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.';
 const label = 'Published `label` **text** https://example.org\nnext line';
 const speech = {
   id: 'eli/dl/event/SPEECH-1',
@@ -96,7 +94,7 @@ describe('euparl_search_speeches contract', () => {
       const fetcher = installToolHttp(() => new Response(null, { status: 204 }));
       const data = expectSuccessTwin(await runToolContract(searchSpeechesTool, input));
       expect(data).toMatchObject({ items: [], appliedFilters: { term } });
-      expect(data.notice).toBe(
+      expect(data.notice).toContain(
         `No speech records matched in ${named}. Term 9 ran 2019-07-02 to 2024-07-15 and term 10 began 2024-07-16; ${lever}. Speech records do not cover every date of a term; euparl_list_reference topic coverage gives the dates they cover. Otherwise broaden sitting_date or remove person_id; call euparl_list_reference with topic activity_types.`,
       );
       expect(fetcher).toHaveBeenCalledTimes(1);
@@ -163,7 +161,15 @@ describe('euparl_search_speeches contract', () => {
     );
   });
   it('renders window uncertainty without inaccessible continuation or an exact capped total', async () => {
-    installToolHttp(() => new Response(JSON.stringify({ data: [speech], meta: { total: 10000 } })));
+    installToolHttp(
+      () =>
+        new Response(
+          JSON.stringify({
+            data: Array.from({ length: 100 }, (_, i) => ({ ...speech, id: `eli/dl/event/S-${i}` })),
+            meta: { total: 10000 },
+          }),
+        ),
+    );
     const result = await runToolContract(searchSpeechesTool, { offset: 9999, limit: 1 });
     const data = expectSuccessTwin(result);
     expect(data).toMatchObject({ page: { has_more: true, returned: 1 }, truncated: true });
@@ -181,7 +187,7 @@ describe('euparl_search_speeches contract', () => {
     expect(narrowed.notice).toContain(
       'Requested limit normalized to 10: offset plus limit cannot pass the 10000-result search window.',
     );
-    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('10');
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('100');
     const result = await runToolContract(searchSpeechesTool, { offset: 10000, limit: 20 });
     expectErrorTwin(
       result,
@@ -331,7 +337,7 @@ describe('euparl_search_speeches contract', () => {
     ]);
   });
 
-  it('preserves cap notice through continuation and renders the terminal page', async () => {
+  it('preserves requested page size through continuation and renders the terminal page', async () => {
     // One row more than the cap, sliced by the requested window as the upstream does.
     const pool = [
       ...Array.from({ length: 80 }, (_, i) => ({ id: `eli/dl/event/S-${i}` })),
@@ -341,17 +347,15 @@ describe('euparl_search_speeches contract', () => {
       const offset = Number(url.searchParams.get('offset'));
       return envelopeResponse(pool.slice(offset, offset + Number(url.searchParams.get('limit'))));
     });
-    const first = expectSuccessTwin(await runToolContract(searchSpeechesTool, { limit: 101 }));
+    const first = expectSuccessTwin(await runToolContract(searchSpeechesTool, { limit: 80 }));
     expect(first).toMatchObject({
       truncated: true,
       shown: 80,
       cap: 80,
       page: { next_offset: 80, limit: 80 },
     });
-    expect(first.notice).toBe(
-      'Requested limit normalized to the effective maximum of 80 speeches. Continue with offset 80.',
-    );
-    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('80');
+    expect(first.notice).toBe('Continue with offset 80.');
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('100');
     expect(
       expectSuccessTwin(await runToolContract(searchSpeechesTool, { offset: 80 })),
     ).toMatchObject({ items: [{ speech_id: 'LAST' }], page: { returned: 1, has_more: false } });
@@ -401,20 +405,28 @@ describe('euparl_search_speeches contract', () => {
   });
 
   it.each([
-    { mode: 'get' },
-    { mode: 'get', speech_id: 'S', text: 'x' },
-    { mode: 'get', speech_id: 'S', person_id: '1' },
-    { mode: 'get', speech_id: 'S', term: 9 },
-    { mode: 'get', speech_id: 'S', offset: 1 },
-    { mode: 'get', speech_id: 'S', limit: 1 },
-    { speech_id: 'S' },
-  ] as const)('rejects mode fields %j before network', async (input) => {
+    [{ mode: 'get' }, 'Supply speech_id for the selected mode.'],
+    [
+      { mode: 'get', speech_id: 'S', text: 'x' },
+      'Remove text, or select a mode that accepts text.',
+    ],
+    [
+      { mode: 'get', speech_id: 'S', person_id: '1' },
+      'Remove person_id, or select a mode that accepts person_id.',
+    ],
+    [{ mode: 'get', speech_id: 'S', term: 9 }, 'Remove term, or select a mode that accepts term.'],
+    [
+      { mode: 'get', speech_id: 'S', offset: 1 },
+      'Remove snapshot and use offset 0 with the default limit 20 for detail mode.',
+    ],
+    [
+      { mode: 'get', speech_id: 'S', limit: 1 },
+      'Remove snapshot and use offset 0 with the default limit 20 for detail mode.',
+    ],
+    [{ speech_id: 'S' }, 'Remove speech_id, or select a mode that accepts speech_id.'],
+  ] as const)('rejects mode fields %j before network', async (input, hint) => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
-    expectErrorTwin(
-      await runToolContract(searchSpeechesTool, input),
-      'invalid_mode_fields',
-      modeHint,
-    );
+    expectErrorTwin(await runToolContract(searchSpeechesTool, input), 'invalid_mode_fields', hint);
     expect(fetcher).not.toHaveBeenCalled();
   });
 

@@ -1,10 +1,7 @@
 /** @fileoverview HTTP-boundary checks for Parliament transport and operation budgets. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import {
-  EuParliamentClient,
-  operationTimeoutMs,
-} from '../../../src/services/eu-parliament/eu-parliament-client.js';
+import { EuParliamentClient } from '../../../src/services/eu-parliament/eu-parliament-client.js';
 import { envelopeResponse } from '../../helpers/eu-parliament-fixtures.js';
 
 const record = z.object({ identifier: z.string() });
@@ -14,6 +11,25 @@ const instantWait = async () => {};
 afterEach(() => vi.useRealTimers());
 
 describe('EuParliamentClient', () => {
+  it.each([
+    ['adopted-texts', 'doc-id:asc'],
+    ['speeches', 'sitting-date:asc,numbering:asc'],
+  ])('forwards the verified %s sorting key', async (path, sort) => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(envelopeResponse([{ identifier: 'example' }]));
+    const client = new EuParliamentClient({ fetch: fetcher, wait: instantWait });
+    await client.get(path!, { 'sort-by': sort }, record, client.operation(signal()));
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('sort-by')).toBe(sort);
+    await expect(
+      client.get(
+        'parliamentary-questions',
+        { 'sort-by': sort },
+        record,
+        client.operation(signal()),
+      ),
+    ).rejects.toThrow('Unsupported query parameter: sort-by');
+  });
   it.each([204, 404])(
     'checks cancellation before accepting an HTTP %i empty response',
     async (status) => {
@@ -287,7 +303,7 @@ describe('EuParliamentClient', () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
-  describe('per-attempt bound on the fake clock', () => {
+  describe('operation deadline on the fake clock', () => {
     /** Aborts like AbortSignal.timeout, on the faked setTimeout. */
     const fakeTimeout = (ms: number) => {
       const controller = new AbortController();
@@ -345,27 +361,28 @@ describe('EuParliamentClient', () => {
     };
     const bulkQuery = { offset: 0, limit: 10_000, 'process-type': 'RSP' };
 
-    it('cuts a normal route at its 15-second attempt bound and retries inside the deadline', async () => {
-      vi.useFakeTimers();
-      vi.setSystemTime(0);
-      const { client, starts, aborts } = answersAfter(20_000);
-      const outcome = client
-        .get('meps', {}, record, client.operation(signal()))
-        .catch((caught: unknown) => caught);
-      await vi.advanceTimersByTimeAsync(40_000);
-      expect(await outcome).toMatchObject({ message: expect.stringMatching(/deadline/) });
-      expect(starts).toEqual([0, 16_000, 33_000]);
-      expect(aborts).toEqual([15_000, 31_000, 40_000]);
-    });
+    it.each([20_000, 39_000])(
+      'allows a normal read taking %i ms to finish in one attempt',
+      async (durationMs) => {
+        vi.useFakeTimers();
+        vi.setSystemTime(0);
+        const { client, starts, aborts } = answersAfter(durationMs);
+        const outcome = client
+          .get('meps', {}, record, client.operation(signal()))
+          .catch((caught: unknown) => caught);
+        await vi.advanceTimersByTimeAsync(40_000);
+        expect(await outcome).toEqual({ status: 'ok', data: [{ identifier: 'complete' }] });
+        expect(starts).toEqual([0]);
+        expect(aborts).toEqual([]);
+      },
+    );
 
     it('lets the bulk read run past 15 seconds and finish in one attempt inside the deadline', async () => {
       vi.useFakeTimers();
       vi.setSystemTime(0);
       const { client, starts, aborts } = answersAfter(20_000);
       const outcome = client
-        .get('procedures', bulkQuery, record, client.operation(signal()), {
-          attemptLimitMs: operationTimeoutMs,
-        })
+        .get('procedures', bulkQuery, record, client.operation(signal()))
         .catch((caught: unknown) => caught);
       await vi.advanceTimersByTimeAsync(40_000);
       expect(await outcome).toMatchObject({ status: 'ok', data: [{ identifier: 'complete' }] });
@@ -373,14 +390,49 @@ describe('EuParliamentClient', () => {
       expect(aborts).toEqual([]);
     });
 
+    it('allows the response body to complete after 15 seconds within the same deadline', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(
+        async (_url, init) =>
+          new Response(
+            new ReadableStream({
+              start(stream) {
+                const onAbort = () => {
+                  clearTimeout(timer);
+                  stream.error(init?.signal?.reason);
+                };
+                const timer = setTimeout(() => {
+                  init?.signal?.removeEventListener('abort', onAbort);
+                  stream.enqueue(
+                    new TextEncoder().encode('{"data":[{"identifier":"body-complete"}]}'),
+                  );
+                  stream.close();
+                }, 20_000);
+                init?.signal?.addEventListener('abort', onAbort, { once: true });
+              },
+            }),
+          ),
+      );
+      const client = new EuParliamentClient({
+        fetch: fetcher,
+        timeout: fakeTimeout,
+        wait: fakeWait,
+      });
+      const pending = client
+        .get('meps', {}, record, client.operation(signal()))
+        .catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect(await pending).toEqual({ status: 'ok', data: [{ identifier: 'body-complete' }] });
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    });
+
     it('still settles a bulk read that outlasts the operation at the 40-second deadline', async () => {
       vi.useFakeTimers();
       vi.setSystemTime(0);
       const { client, starts, aborts } = answersAfter(45_000);
       const outcome = client
-        .get('procedures', bulkQuery, record, client.operation(signal()), {
-          attemptLimitMs: operationTimeoutMs,
-        })
+        .get('procedures', bulkQuery, record, client.operation(signal()))
         .catch((caught: unknown) => caught);
       await vi.advanceTimersByTimeAsync(45_000);
       expect(await outcome).toMatchObject({ message: expect.stringMatching(/deadline/) });
@@ -394,9 +446,7 @@ describe('EuParliamentClient', () => {
       const controller = new AbortController();
       const { client, starts, aborts } = answersAfter(30_000);
       const outcome = client
-        .get('procedures', bulkQuery, record, client.operation(controller.signal), {
-          attemptLimitMs: operationTimeoutMs,
-        })
+        .get('procedures', bulkQuery, record, client.operation(controller.signal))
         .catch((caught: unknown) => caught);
       setTimeout(() => controller.abort(new DOMException('Caller stopped', 'AbortError')), 18_000);
       await vi.advanceTimersByTimeAsync(40_000);

@@ -58,7 +58,7 @@ const speechSchema = z
 export const searchSpeechesTool = tool('euparl_search_speeches', {
   title: 'Search parliamentary speeches',
   description:
-    'Search speech activities in parliamentary term 9 or 10, default 10, or retrieve one with mode get and speech_id. Text and title search return activity metadata, not transcripts. Follow document_ids with euparl_search_documents mode get and any returned parent_document_ids to source files. Use euparl_list_reference topic activity_types for activity_type codes. Get rejects search filters and nondefault paging. Search exposes at most 10000 results; continue with page.next_offset when present, otherwise narrow text, title, person_id, activity_type or sitting dates.',
+    'Search speech activities in parliamentary term 9 or 10, default 10, or retrieve one with mode get and speech_id. Text and title search return activity metadata, not transcripts. Follow document_ids with euparl_search_documents mode get and any returned parent_document_ids to source files. Use euparl_list_reference topic activity_types for activity_type codes. Get rejects search filters and nondefault paging. Non-keyword lists use sitting-date:asc,numbering:asc and aligned 100-row upstream pages independently of caller limit. Keyword searches retain relevance order and can repeat or omit records across pages. Search exposes at most 10000 results; continue with page.next_offset when present, otherwise narrow text, title, person_id, activity_type or sitting dates.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -95,7 +95,7 @@ export const searchSpeechesTool = tool('euparl_search_speeches', {
       sitting_date_end: optionalString().describe(
         'Search-only inclusive end date YYYY-MM-DD; requires sitting_date and cannot precede it.',
       ),
-      ...pagingInputFields('speeches'),
+      ...pagingInputFields('speeches', 'keyword_speeches'),
     })
     .strict(),
   output: z

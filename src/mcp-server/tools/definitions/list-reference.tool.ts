@@ -59,7 +59,7 @@ const entrySchema = z
 /** Discover supported filters, identifier syntax and coverage limitations. */
 export const listReferenceTool = tool('euparl_list_reference', {
   title: 'List parliamentary reference data',
-  description: `List parliamentary codes, identifier formats, historical committees and political groups, or coverage limitations. Choose organizations with organization_ids to resolve the organization IDs other tools return, decimal (org/5154) or code (org/IMCO, org/S-D, org/ep-9), into published names and dates; ordered per-item found false means no detail was published, as for a code in the wrong case. Organization lookups page the supplied IDs with an effective maximum of ${pageCaps.organizations.maximum} per call; repeat the same ID list with page.next_offset. Other topics retain historical coverage and an effective maximum of ${pageCaps.reference.maximum} per page. These lists do not require snapshots; missing end dates do not establish current status.`,
+  description: `List parliamentary codes, identifier formats, historical committees and political groups, or coverage limitations. Choose organizations with organization_ids to resolve the organization IDs other tools return, decimal (org/5154) or code (org/IMCO, org/S-D, org/ep-9), into published names and dates; ordered per-item found false means no detail was published, as for a code in the wrong case. Organization lookups page the supplied IDs with an effective maximum of ${pageCaps.organizations.maximum} per call; repeat the same ID list with page.next_offset. Live committees and political groups retain historical coverage and an acquisition bound of ${pageCaps.reference.maximum} per page; static reference topics return the requested count or remaining entries without an output-size cap. These lists do not require snapshots; missing end dates do not establish current status.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -80,7 +80,7 @@ export const listReferenceTool = tool('euparl_list_reference', {
         .describe(
           `Required nonempty list only for organizations; order and duplicates retained, with at most ${pageCaps.organizations.maximum} looked up per page.`,
         ),
-      ...pagingInputFields('reference', 'organizations'),
+      ...pagingInputFields('reference', 'static_reference', 'organizations'),
     })
     .strict(),
   output: z

@@ -15,8 +15,6 @@ import { envelopeResponse, mepRecord } from '../helpers/eu-parliament-fixtures.j
 
 const invalidHint =
   'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
-const modeHint =
-  'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.';
 const snapshotHint =
   'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.';
 const rejectedHint =
@@ -196,7 +194,7 @@ describe('euparl_get_mep contract', () => {
     );
   });
 
-  it('caps memberships at whole items and continues past the cap', async () => {
+  it('pages memberships at whole items and continues', async () => {
     installToolHttp(() =>
       envelopeResponse([
         {
@@ -209,7 +207,7 @@ describe('euparl_get_mep contract', () => {
       await runToolContract(getMepTool, {
         mep_id: '900000001',
         section: 'memberships',
-        limit: 1000,
+        limit: 225,
       }),
     );
     expect(first.memberships).toHaveLength(225);
@@ -218,9 +216,7 @@ describe('euparl_get_mep contract', () => {
       cap: 225,
       page: { limit: 225, next_offset: 225 },
     });
-    expect(first.notice).toBe(
-      'Requested limit normalized to the effective maximum of 225 memberships. Continue with offset 225 and the returned snapshot.',
-    );
+    expect(first.notice).toBe('Continue with offset 225 and the returned snapshot.');
     const last = expectSuccessTwin(
       await runToolContract(getMepTool, {
         mep_id: '900000001',
@@ -260,19 +256,22 @@ describe('euparl_get_mep contract', () => {
     expect(data).not.toHaveProperty('citizenship');
   });
 
-  it.each([{ offset: 1 }, { section: 'memberships', offset: 1 }] as const)(
-    'rejects invalid continuation %j before HTTP',
-    async (input) => {
-      const fetcher = installToolHttp(() => envelopeResponse([]));
-      expectErrorTwin(
-        await runToolContract(getMepTool, { mep_id: '900000001', ...input }),
-        'invalid_mode_fields',
-        modeHint,
-        JsonRpcErrorCode.ValidationError,
-      );
-      expect(fetcher).not.toHaveBeenCalled();
-    },
-  );
+  it.each([
+    [{ offset: 1 }, 'Use offset 0 for overview, or select memberships for continuation.'],
+    [
+      { section: 'memberships', offset: 1 },
+      'Pass the previous page.snapshot with the same filters, or restart at offset 0 without snapshot.',
+    ],
+  ] as const)('rejects invalid continuation %j before HTTP', async (input, hint) => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    expectErrorTwin(
+      await runToolContract(getMepTool, { mep_id: '900000001', ...input }),
+      'invalid_mode_fields',
+      hint,
+      JsonRpcErrorCode.ValidationError,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
 
   it('rejects unsupported language with declared recovery', async () => {
     installToolHttp(() => envelopeResponse([]));

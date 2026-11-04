@@ -34,6 +34,7 @@ const allowlists = new Map<string, readonly string[]>([
       'sitting-date-end',
       'related-process-id',
       'view',
+      'sort-by',
     ],
   ],
   ['committee-documents', [...lists, 'work-type', 'parliamentary-term']],
@@ -50,6 +51,7 @@ const allowlists = new Map<string, readonly string[]>([
       'sitting-date',
       'sitting-date-end',
       'parliamentary-term',
+      'sort-by',
     ],
   ],
   [
@@ -74,8 +76,6 @@ const familyDetailRoute = /^(?:adopted-texts|committee-documents|plenary-documen
  * 60-second default request timeout of MCP SDK clients.
  */
 export const operationTimeoutMs = 40_000;
-/** Default per-attempt bound; the operation deadline caps it further. */
-const attemptTimeoutMs = 15_000;
 /** One budget shared by every request in a domain operation. */
 export interface Operation {
   callerSignal: AbortSignal;
@@ -161,20 +161,16 @@ export class EuParliamentClient {
     }
   }
   /**
-   * Parses a fully read JSON-LD envelope against the noun schema. `attemptLimitMs` bounds each
-   * attempt, headers and body, before the operation deadline caps it; a single bulk read passes
-   * `operationTimeoutMs` to spend whatever the deadline leaves. `attempts` bounds the transient
-   * retries; a best-effort read passes 1.
+   * Parses a fully read JSON-LD envelope against the noun schema. Each attempt may spend the
+   * remaining operation deadline on headers and body. `attempts` bounds retries after fast
+   * transient failures; a best-effort read passes 1.
    */
   async get<T>(
     path: string,
     query: Record<string, string | number | undefined>,
     schema: z.ZodType<T>,
     operation: Operation,
-    {
-      attemptLimitMs = attemptTimeoutMs,
-      attempts = 3,
-    }: { attemptLimitMs?: number; attempts?: number } = {},
+    { attempts = 3 }: { attempts?: number } = {},
   ): Promise<Envelope<T>> {
     if (!/^[A-Za-z0-9_/-]+$/.test(path)) throw new Error('Unsupported Parliament endpoint');
     const allowed =
@@ -189,14 +185,10 @@ export class EuParliamentClient {
     url.searchParams.set('format', 'application/ld+json');
     for (let attempt = 0; ; attempt++) {
       await this.pace(operation);
-      const attemptSignal = AbortSignal.any([
-        operation.signal,
-        this.timeout(Math.min(attemptLimitMs, operation.deadlineAt - this.now())),
-      ]);
       let retryAfterMs: number | undefined;
       try {
         const response = await this.fetcher(url, {
-          signal: attemptSignal,
+          signal: operation.signal,
           headers: {
             Accept: 'application/ld+json',
             'User-Agent': `eu-parliament-mcp-server/${packageMetadata.version}`,
@@ -205,7 +197,6 @@ export class EuParliamentClient {
         if (response.status === 204 || response.status === 404) {
           await response.body?.cancel();
           this.check(operation);
-          attemptSignal.throwIfAborted();
           return { status: response.status === 204 ? 'empty' : 'missing', data: [] };
         }
         if (!response.ok) {
@@ -236,7 +227,6 @@ export class EuParliamentClient {
         }
         const text = await response.text();
         this.check(operation);
-        attemptSignal.throwIfAborted();
         let value: unknown;
         try {
           value = JSON.parse(text);
@@ -275,10 +265,10 @@ export class EuParliamentClient {
               (cause.data?.retryable !== false &&
                 cause.code === JsonRpcErrorCode.ServiceUnavailable)
             : cause instanceof TypeError ||
-              (cause instanceof Error && (cause.name === 'TimeoutError' || attemptSignal.aborted));
+              (cause instanceof Error && cause.name === 'TimeoutError');
         if (!transient || attempt === attempts - 1) {
           if (cause instanceof McpError) throw cause;
-          if (attemptSignal.aborted)
+          if (cause instanceof Error && cause.name === 'TimeoutError')
             throw timeout('Parliament request timed out after bounded retries.', undefined, {
               cause,
             });

@@ -18,8 +18,6 @@ import {
 
 const invalidHint =
   'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
-const modeHint =
-  'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.';
 const snapshotHint =
   'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.';
 const stalledHint =
@@ -691,13 +689,13 @@ describe('euparl_get_plenary_votes contract', () => {
         : Response.json({ data: [{ id: 'eli/dl/event/MTG-PL-2025-01-15' }], meta: { total: 1 } }),
     );
     const first = expectSuccessTwin(
-      await runToolContract(getPlenaryVotesTool, { mode: 'sittings', year: 2025, limit: 1000 }),
+      await runToolContract(getPlenaryVotesTool, { mode: 'sittings', year: 2025, limit: 1001 }),
     );
     expect(first).toMatchObject({
-      page: { limit: 100, returned: 1, has_more: false },
-      notice: 'Requested limit normalized to the effective maximum of 100 sittings.',
+      page: { limit: 1000, returned: 1, has_more: false },
+      notice: 'Requested limit normalized to the effective maximum of 1000 sittings.',
     });
-    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('100');
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('1000');
     const past = expectSuccessTwin(
       await runToolContract(getPlenaryVotesTool, { mode: 'sittings', year: 2025, offset: 1000 }),
     );
@@ -724,7 +722,7 @@ describe('euparl_get_plenary_votes contract', () => {
   it.each([
     ['decisions', 100],
     ['voters', 1000],
-  ] as const)('caps %s at %i without losing the final item', async (mode, cap) => {
+  ] as const)('pages %s at %i without losing the final item', async (mode, cap) => {
     installToolHttp(() =>
       envelopeResponse(
         mode === 'decisions'
@@ -747,7 +745,7 @@ describe('euparl_get_plenary_votes contract', () => {
         ? { sitting_id: selected.sitting_id, mode }
         : { ...selected, mode, position: 'favor' };
     const first = expectSuccessTwin(
-      await runToolContract(getPlenaryVotesTool, { ...input, limit: 5000 }),
+      await runToolContract(getPlenaryVotesTool, { ...input, limit: cap }),
     );
     expect(first[mode]).toHaveLength(cap);
     expect(first).toMatchObject({
@@ -755,9 +753,7 @@ describe('euparl_get_plenary_votes contract', () => {
       cap,
       page: { limit: cap, next_offset: cap },
     });
-    expect(first.notice).toBe(
-      `Requested limit normalized to the effective maximum of ${cap} ${mode}. Continue with offset ${cap} and the returned snapshot.`,
-    );
+    expect(first.notice).toBe(`Continue with offset ${cap} and the returned snapshot.`);
     const last = expectSuccessTwin(
       await runToolContract(getPlenaryVotesTool, {
         ...input,
@@ -857,30 +853,68 @@ describe('euparl_get_plenary_votes contract', () => {
   );
 
   it.each([
-    {},
-    { mode: 'sittings' },
-    { mode: 'sittings', year: 2025, document_id: 'A-1' },
-    { mode: 'sittings', year: 2025, mep_id: '1' },
-    { sitting_id: '2025-01-15', mep_id: '1' },
-    { ...selected, mode: 'voters', position: 'favor', mep_id: '1' },
-    { ...selected, mode: 'decision', document_id: 'A-1' },
-    { ...selected, mode: 'voters', position: 'favor', document_id: 'A-1' },
-    { mode: 'sittings', year: 2025, sitting_id: '2025-01-15' },
-    { sitting_id: '2025-01-15', year: 2025 },
-    { ...selected },
-    { ...selected, mode: 'decision', limit: 1 },
-    { ...selected, mode: 'decision', snapshot: 'invalid' },
-    { ...selected, mode: 'voters' },
-    { ...selected, mode: 'voters', position: 'favor', resolve_names: true },
-    { ...selected, mode: 'voters', position: 'favor', roster_term: 9 },
-    { sitting_id: '2025-01-15', offset: 1 },
-    { sitting_id: '2025-01-15', resolve_names: true, roster_term: 9 },
-  ] as const)('rejects incompatible mode fields %j before HTTP', async (input) => {
+    [{}, 'Supply sitting_id for the selected mode.'],
+    [{ mode: 'sittings' }, 'Supply a four-digit year for mode sittings.'],
+    [
+      { mode: 'sittings', year: 2025, document_id: 'A-1' },
+      'Remove document_id, or select a mode that accepts document_id.',
+    ],
+    [
+      { mode: 'sittings', year: 2025, mep_id: '1' },
+      'Remove mep_id, or use mode decisions or decision for member positions.',
+    ],
+    [
+      { ...selected, mode: 'voters', position: 'favor', mep_id: '1' },
+      'Remove mep_id, or use mode decisions or decision for member positions.',
+    ],
+    [
+      { ...selected, mode: 'decision', document_id: 'A-1' },
+      'Remove document_id, or select a mode that accepts document_id.',
+    ],
+    [
+      { ...selected, mode: 'voters', position: 'favor', document_id: 'A-1' },
+      'Remove document_id, or select a mode that accepts document_id.',
+    ],
+    [
+      { mode: 'sittings', year: 2025, sitting_id: '2025-01-15' },
+      'Remove sitting_id, or select a mode that accepts sitting_id.',
+    ],
+    [{ sitting_id: '2025-01-15', year: 2025 }, 'Remove year, or select a mode that accepts year.'],
+    [{ ...selected }, 'Remove decision_id, or select a mode that accepts decision_id.'],
+    [
+      { ...selected, mode: 'decision', limit: 1 },
+      'Remove snapshot and use offset 0 with the default limit 20 for detail mode.',
+    ],
+    [
+      { ...selected, mode: 'decision', snapshot: 'invalid' },
+      'Remove snapshot and use offset 0 with the default limit 20 for detail mode.',
+    ],
+    [
+      { ...selected, mode: 'voters' },
+      'Supply position: favor, against, abstention, intended_favor, intended_against, or intended_abstention.',
+    ],
+    [
+      { ...selected, mode: 'voters', position: 'favor', resolve_names: true },
+      'Supply roster_term for the sitting date when resolve_names is true.',
+    ],
+    [
+      { ...selected, mode: 'voters', position: 'favor', roster_term: 9 },
+      'Remove roster_term, or set resolve_names true in voters mode.',
+    ],
+    [
+      { sitting_id: '2025-01-15', offset: 1 },
+      'Pass the previous page.snapshot with the same filters, or restart at offset 0 without snapshot.',
+    ],
+    [
+      { sitting_id: '2025-01-15', resolve_names: true, roster_term: 9 },
+      'Remove resolve_names and roster_term, or use mode voters with decision_id and position.',
+    ],
+  ] as const)('rejects incompatible mode fields %j before HTTP', async (input, hint) => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
     expectErrorTwin(
       await runToolContract(getPlenaryVotesTool, input),
       'invalid_mode_fields',
-      modeHint,
+      hint,
       JsonRpcErrorCode.ValidationError,
     );
     expect(fetcher).not.toHaveBeenCalled();
@@ -1031,14 +1065,7 @@ async function walkDecisions(input: Record<string, unknown>) {
   }
   throw new Error('Decision walk did not end within 20 pages.');
 }
-/** Characters the rendered rows spend: each `result.decisions[i].` paragraph plus its separator. */
-function rowChars(text: string): number {
-  return text
-    .split('\n\n')
-    .filter((paragraph) => paragraph.startsWith('result.decisions['))
-    .reduce((sum, paragraph) => sum + paragraph.length + 2, 0);
-}
-/** A decision whose decided-on array sets its rendered size, about 68 characters per document. */
+/** Decisions with large relation arrays must remain whole on both surfaces. */
 const sizedDecision = (index: number, documents: number) => ({
   id: `eli/dl/event/MTG-PL-2024-03-13-DEC-${index}`,
   activity_id: `MTG-PL-2024-03-13-DEC-${index}`,
@@ -1046,150 +1073,45 @@ const sizedDecision = (index: number, documents: number) => ({
     { length: documents },
     (_, item) => `eli/dl/doc/A-9-2024-0001-AM-${String(item).padStart(4, '0')}`,
   ),
+  decided_on_a_part_of_a_realization_of: Array.from(
+    { length: 250 },
+    (_, item) => `eli/dl/doc/A-9-2024-0002-AM-${item}`,
+  ),
+  inverse_consists_of: Array.from({ length: 250 }, (_, item) => `eli/dl/event/VOTE-${item}`),
 });
-const sizedSitting = [420, 420, 420, 700, 120, 1400, 50].map((documents, index) =>
-  sizedDecision(index, documents),
-);
-const budgetNotice = (returned: number) =>
-  `The 92000-character budget for decision rows ended this page after ${returned} whole decision${returned === 1 ? '' : 's'}.`;
 
-describe('euparl_get_plenary_votes decisions row budget', () => {
-  it('ends pages at whole decisions within 92000 row characters and resumes without repeats or gaps', async () => {
-    installToolHttp(() => envelopeResponse(sizedSitting));
-    const pages = await walkDecisions({ sitting_id: '2024-03-13', limit: 100 });
-    expect(pages.map(({ data }) => data.decisions.map(({ decision_id }) => decision_id))).toEqual(
-      [[0, 1, 2], [3, 4], [5], [6]].map((ids) => ids.map((id) => `MTG-PL-2024-03-13-DEC-${id}`)),
+describe('euparl_get_plenary_votes caller-sized decisions', () => {
+  it('walks changing page sizes past the former character budget without gaps or lost relations', async () => {
+    const sitting = Array.from({ length: 107 }, (_, i) =>
+      i < 2 ? sizedDecision(i, 420) : { id: `eli/dl/event/MTG-PL-2024-03-13-DEC-${i}` },
     );
-    const snapshot = pages[0]?.data.page.snapshot;
-    expect(pages.map(({ data }) => data.page)).toEqual([
-      { offset: 0, limit: 100, returned: 3, has_more: true, next_offset: 3, snapshot },
-      { offset: 3, limit: 100, returned: 2, has_more: true, next_offset: 5, snapshot },
-      { offset: 5, limit: 100, returned: 1, has_more: true, next_offset: 6, snapshot },
-      { offset: 6, limit: 100, returned: 1, has_more: false, snapshot },
-    ]);
-    pages.forEach(({ data, structured, text }, index) => {
-      expect(text.length).toBeLessThanOrEqual(100_000);
-      expect(text).toContain('result.page.limit: 100');
-      expect(structured.totalCount).toBe(7);
-      if (data.page.has_more) {
-        expect(text).toContain(`result.page.next_offset: ${data.page.next_offset}`);
-        expect(data.notice).toBe(
-          `${budgetNotice(data.page.returned)} Continue with offset ${data.page.next_offset} and the returned snapshot.`,
-        );
-        expect(structured).toMatchObject({ truncated: true, shown: data.page.returned, cap: 100 });
-      } else expect(structured).not.toHaveProperty('notice');
-      if (data.page.returned > 1) expect(rowChars(text)).toBeLessThanOrEqual(92_000);
-      expect(index).toBeLessThan(4);
-    });
-    const oversized = pages[2]!.text;
-    expect(rowChars(oversized)).toBeGreaterThan(92_000);
-    expect(oversized).toContain(
-      'result.decisions[0].document_ids[1399]: ` "A-9-2024-0001-AM-1399" `',
-    );
-  });
-
-  it('lets the count end a page whose rows fit, with no budget notice', async () => {
-    installToolHttp(() => envelopeResponse(sizedSitting));
-    const first = expectSuccessTwin(
-      await runToolContract(getPlenaryVotesTool, { sitting_id: '2024-03-13', limit: 2 }),
-    );
-    expect(first).toMatchObject({
-      page: { limit: 2, returned: 2, next_offset: 2 },
-      notice: 'Continue with offset 2 and the returned snapshot.',
-    });
-  });
-
-  it('keeps a full budgeted page with every notice inside 100000 characters of content[]', async () => {
-    const typical = (index: number) => {
-      const report = 100 + Math.floor(index / 8);
-      return {
-        ...decisionRecord,
-        id: `eli/dl/event/MTG-PL-2024-03-13-DEC-${166000 + index}`,
-        activity_id: `MTG-PL-2024-03-13-DEC-${166000 + index}`,
-        activity_date: '2024-03-13',
-        activity_label: {
-          en: `A9-0${report}/2024 – Example Rapporteur – Amendment ${index} to the motion for a resolution on an example file`,
-        },
-        decided_on_a_realization_of:
-          index % 8 === 7 ? [] : [`eli/dl/doc/A-9-2024-0${report}-AM-${index}`],
-        recorded_in_a_realization_of: [`eli/dl/doc/PV-9-2024-03-13-RCV-ITM-${index}`],
-        inverse_consists_of: [`eli/dl/event/MTG-PL-2024-03-13-VOT-ITM-${940000 + report}`],
-      };
-    };
-    installToolHttp(() =>
-      envelopeResponse(Array.from({ length: 160 }, (_, index) => typical(index))),
-    );
-    const result = await runToolContract(getPlenaryVotesTool, {
+    installToolHttp(() => envelopeResponse(sitting));
+    const firstResult = await runToolContract(getPlenaryVotesTool, {
       sitting_id: '2024-03-13',
-      document_id: 'A-9-2024',
-      language: 'pl',
-      limit: 500,
+      limit: 103,
     });
-    const structured = expectSuccessTwin(result);
-    const { decisions, page, notice } = decisionPage.parse(structured);
-    const text = contractText(result);
-    expect(structured.totalCount).toBe(140);
-    expect(page).toMatchObject({ limit: 100, has_more: true, next_offset: decisions.length });
-    expect(decisions.length).toBeGreaterThan(50);
-    expect(decisions.length).toBeLessThan(100);
-    for (const part of [
-      'Requested limit normalized to the effective maximum of 100 decisions.',
-      'Requested language pl unavailable; returned published en text.',
-      'document_id left out other decisions of the vote items it matched: MTG-PL-2024-03-13-VOT-ITM-940100 (1 of 8 left out),',
-      'and 15 more vote items (15 decisions left out; each decision row lists its vote_item_ids).',
-      budgetNotice(decisions.length),
-      `Continue with offset ${decisions.length} and the returned snapshot.`,
-    ])
-      expect(notice).toContain(part);
-    expect(rowChars(text)).toBeLessThanOrEqual(92_000);
-    expect(text.length - rowChars(text)).toBeLessThanOrEqual(8_000);
-    expect(text.length).toBeLessThanOrEqual(100_000);
-  });
-
-  it('charges part-of and vote-item rows their exact rendered size: rows at 92000 stay, one character more cuts', async () => {
-    /** Size comes from the part-of and vote-item arrays; the label pads a row by exactly `pad` characters. */
-    const related = (index: number, pad: number) => ({
-      id: `eli/dl/event/MTG-PL-2024-03-13-DEC-${index}`,
-      activity_id: `MTG-PL-2024-03-13-DEC-${index}`,
-      activity_label: { en: `L${'x'.repeat(pad)}` },
-      decided_on_a_part_of_a_realization_of: Array.from(
-        { length: 250 },
-        (_, item) => `eli/dl/doc/A-9-2024-0001-AM-${String(item).padStart(4, '0')}`,
-      ),
-      inverse_consists_of: Array.from(
-        { length: 250 },
-        (_, item) => `eli/dl/event/MTG-PL-2024-03-13-VOT-ITM-${900000 + item}`,
-      ),
-    });
-    /** Rendered characters of row `index`: its paragraphs plus the blank line before each. */
-    const rowText = (text: string, index: number) =>
-      text
-        .split('\n\n')
-        .filter((paragraph) => paragraph.startsWith(`result.decisions[${index}].`))
-        .reduce((sum, paragraph) => sum + paragraph.length + 2, 0);
-    const firstPage = async (sitting: unknown[]) => {
-      installToolHttp(() => envelopeResponse(sitting));
-      const result = await runToolContract(getPlenaryVotesTool, {
+    const first = expectSuccessTwin(firstResult);
+    expect(first.decisions).toHaveLength(103);
+    expect(first.page).toMatchObject({ limit: 103, returned: 103, next_offset: 103 });
+    expect(contractText(firstResult).length).toBeGreaterThan(100_000);
+    expect(contractText(firstResult)).toContain('result.decisions[1].document_ids[419]');
+    expect(contractText(firstResult)).toContain('result.decisions[1].partial_document_ids[249]');
+    expect(contractText(firstResult)).toContain('result.decisions[1].vote_item_ids[249]');
+    const last = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
         sitting_id: '2024-03-13',
-        limit: 100,
-      });
-      return { data: decisionPage.parse(expectSuccessTwin(result)), text: contractText(result) };
-    };
-    // The rendered content[] is the oracle: measure two unpadded rows on a page the budget leaves whole.
-    const measured = await firstPage([related(0, 0), related(1, 0)]);
-    expect(measured.data.page).toMatchObject({ returned: 2, has_more: false });
-    expect(measured.text).toContain(
-      'result.decisions[1].vote_item_ids[249]: ` "MTG-PL-2024-03-13-VOT-ITM-900249" `',
+        limit: 7,
+        offset: 103,
+        snapshot: snapshotOf(first),
+      }),
     );
-    const pad = 92_000 - rowText(measured.text, 0) - rowText(measured.text, 1);
-    expect(pad).toBeGreaterThan(0);
-    const exact = await firstPage([related(0, 0), related(1, pad), related(2, 0)]);
-    expect(rowText(exact.text, 0) + rowText(exact.text, 1)).toBe(92_000);
-    expect(exact.data.page).toMatchObject({ returned: 2, has_more: true, next_offset: 2 });
-    const over = await firstPage([related(0, 0), related(1, pad + 1), related(2, 0)]);
-    expect(over.data.page).toMatchObject({ returned: 1, has_more: true, next_offset: 1 });
-    expect(over.data.notice).toBe(
-      `${budgetNotice(1)} Continue with offset 1 and the returned snapshot.`,
+    expect(last.decisions).toHaveLength(4);
+    expect(last.page).toMatchObject({ limit: 7, returned: 4, has_more: false });
+    expect(last).not.toHaveProperty('notice');
+    const walked = await walkDecisions({ sitting_id: '2024-03-13', limit: 1000 });
+    expect(walked).toHaveLength(1);
+    expect(walked[0]?.data.decisions.map(({ decision_id }) => decision_id)).toEqual(
+      Array.from({ length: 107 }, (_, i) => `MTG-PL-2024-03-13-DEC-${i}`),
     );
   });
 });
@@ -1378,7 +1300,7 @@ describe('euparl_get_plenary_votes part-of and vote-item relations', () => {
         vote_item_id: 'MTG-PL-2025-01-15-VOT-ITM-1',
       }),
       'invalid_mode_fields',
-      modeHint,
+      'Remove vote_item_id, or select a mode that accepts vote_item_id.',
       JsonRpcErrorCode.ValidationError,
     );
     expect(fetcher).not.toHaveBeenCalled();
@@ -1436,7 +1358,7 @@ describe('euparl_get_plenary_votes part-of and vote-item relations', () => {
       );
       expect(data).toMatchObject({ decisions: [], totalCount: 0 });
       expect(data.notice).toBe(
-        `No decision in this sitting publishes a decided-on, part-of or vote-item relation, so a report or vote item cannot select its decisions. Remove ${names} and find the report's citation (its document label, such as A9-0188/2023) in decision labels.`,
+        `No decision in this sitting publishes a decided-on, part-of or vote-item relation, so a report or vote item cannot select its decisions. Remove ${names} and use label_contains with the report's citation (its document label, such as A9-0188/2023). Matching label text does not establish a final vote.`,
       );
     },
   );
@@ -1479,6 +1401,218 @@ describe('euparl_get_plenary_votes part-of and vote-item relations', () => {
         notice:
           'No decision data was published for this sitting. Call euparl_get_plenary_votes with mode sittings and year to discover available sittings.',
       });
+    },
+  );
+  it('characterizes omitted member projection and intact relations', async () => {
+    installToolHttp(() => envelopeResponse([decisionRecord]));
+    const data = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, { sitting_id: '2025-01-15' }),
+    );
+    expect(data.decisions).toEqual([
+      expect.objectContaining({ decision_id: 'MTG-PL-2025-01-15-DEC-900001' }),
+    ]);
+    expect(data.decisions).toEqual([
+      expect.not.objectContaining({ mep_position: expect.anything() }),
+    ]);
+  });
+  it('projects members and selects literal normalized labels before paging', async () => {
+    const fetcher = installToolHttp(() =>
+      envelopeResponse([
+        { ...decisionRecord, activity_label: { en: 'Report A9–0179/2022 (text   AS A WHOLE)' } },
+        { ...decisionRecord, activity_id: 'OTHER', activity_label: { en: 'Other' } },
+      ]),
+    );
+    const wire = await runToolContract(getPlenaryVotesTool, {
+      sitting_id: '2025-01-15',
+      mep_id: 'person/900000001',
+      label_contains: ' A9-0179/2022   (TEXT as a whole) ',
+      limit: 1,
+    });
+    const data = expectSuccessTwin(wire);
+    expect(data).toMatchObject({
+      totalCount: 1,
+      appliedFilters: { mep_id: '900000001', label_contains: 'a9-0179/2022 (text as a whole)' },
+      decisions: [
+        {
+          label: { value: 'Report A9–0179/2022 (text   AS A WHOLE)' },
+          mep_position: { recorded: { positions: ['favor'], availability: 'published' } },
+        },
+      ],
+      page: { has_more: false },
+    });
+    expect(contractText(wire)).toContain('mep_position.recorded');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    { document_id: 'A-1' },
+    { vote_item_id: 'MTG-PL-2025-01-15-VOT-ITM-1' },
+    { document_id: 'A-1', vote_item_id: 'MTG-PL-2025-01-15-VOT-ITM-1' },
+  ])(
+    'names the label filter when relations matched but the label excluded them %j',
+    async (filters) => {
+      installToolHttp(() =>
+        envelopeResponse([
+          {
+            ...decisionRecord,
+            activity_label: { en: 'Report' },
+            decided_on_a_realization_of: 'eli/dl/doc/A-1',
+            inverse_consists_of: 'eli/dl/event/MTG-PL-2025-01-15-VOT-ITM-1',
+          },
+        ]),
+      );
+      const data = expectSuccessTwin(
+        await runToolContract(getPlenaryVotesTool, {
+          sitting_id: '2025-01-15',
+          ...filters,
+          label_contains: 'different',
+        }),
+      );
+      expect(data).toMatchObject({
+        decisions: [],
+        totalCount: 0,
+        notice:
+          'No published decision label matched label_contains within the selected document and vote-item filters. Remove or change label_contains; matching text does not establish a final vote.',
+      });
+    },
+  );
+  it.each([
+    [
+      {},
+      {
+        positions: [],
+        unavailable_positions: ['favor', 'against', 'abstention'],
+        availability: 'unavailable',
+      },
+    ],
+    [
+      { had_voter_favor: [] },
+      { positions: [], unavailable_positions: ['against', 'abstention'], availability: 'partial' },
+    ],
+    [
+      { had_voter_favor: [], had_voter_against: [], had_voter_abstention: [] },
+      { positions: [], unavailable_positions: [], availability: 'published' },
+    ],
+    [
+      { had_voter_favor: ['person/1'], had_voter_against: ['person/1'], had_voter_abstention: [] },
+      { positions: ['favor', 'against'], unavailable_positions: [], availability: 'published' },
+    ],
+  ])('preserves member availability and conflicts %j', async (voters, recorded) => {
+    installToolHttp(() =>
+      envelopeResponse([
+        { id: decisionRecord.id, ...voters, had_voter_intended_abstention: ['person/1'] },
+      ]),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, { sitting_id: '2025-01-15', mep_id: '1' }),
+    );
+    expect(data.decisions).toEqual([
+      expect.objectContaining({
+        mep_position: {
+          recorded,
+          intended: {
+            positions: ['abstention'],
+            unavailable_positions: ['favor', 'against'],
+            availability: 'partial',
+          },
+        },
+      }),
+    ]);
+  });
+  it.each([
+    ['a9−0179/2022', { en: 'A9—0179/2022' }, 1],
+    ['as   A whole', { en: '(text as a whole)' }, 1],
+    ['[.*]', { en: 'literal [.*] label' }, 1],
+    ['[.*]', { en: 'other text' }, 0],
+    ['report', undefined, 0],
+    ['rapport', { fr: 'Rapport' }, 1],
+    ['  ', undefined, 1],
+  ] as const)(
+    'matches label %s literally with source language preserved',
+    async (label_contains, activity_label, totalCount) => {
+      installToolHttp(() => envelopeResponse([{ id: decisionRecord.id, activity_label }]));
+      const data = expectSuccessTwin(
+        await runToolContract(getPlenaryVotesTool, { sitting_id: '2025-01-15', label_contains }),
+      );
+      expect(data.totalCount).toBe(totalCount);
+      expect(data.decisions).toHaveLength(totalCount);
+      if (label_contains.trim() === '')
+        expect(data.appliedFilters).not.toHaveProperty('label_contains');
+      if (activity_label && 'fr' in activity_label)
+        expect(data).toMatchObject({
+          decisions: [{ label: { language: 'fr', value: 'Rapport' } }],
+        });
+    },
+  );
+  it('combines filters before paging, scopes normalized selectors and handles an offset past the end', async () => {
+    installToolHttp(() =>
+      envelopeResponse(
+        Array.from({ length: 3 }, (_, index) => ({
+          ...decisionRecord,
+          activity_id: `DEC-${index}`,
+          activity_label: { en: index === 0 ? 'other' : 'Report – final' },
+          inverse_consists_of: 'eli/dl/event/MTG-PL-2025-01-15-VOT-ITM-1',
+          decided_on_a_realization_of: 'eli/dl/doc/A-1',
+        })),
+      ),
+    );
+    const filters = {
+      sitting_id: '2025-01-15',
+      document_id: 'A-1',
+      vote_item_id: 'MTG-PL-2025-01-15-VOT-ITM-1',
+      mep_id: '1',
+      label_contains: ' report - FINAL ',
+      limit: 1,
+    };
+    const first = expectSuccessTwin(await runToolContract(getPlenaryVotesTool, filters));
+    expect(first).toMatchObject({
+      totalCount: 2,
+      decisions: [{ decision_id: 'DEC-1' }],
+      page: { next_offset: 1 },
+    });
+    const snapshot = (first.page as { snapshot: string }).snapshot;
+    const second = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, {
+        ...filters,
+        label_contains: 'REPORT — final',
+        mep_id: 'person/1',
+        snapshot,
+        offset: 1,
+      }),
+    );
+    expect(second).toMatchObject({
+      decisions: [{ decision_id: 'DEC-2' }],
+      page: { has_more: false, snapshot },
+    });
+    const past = expectSuccessTwin(
+      await runToolContract(getPlenaryVotesTool, { ...filters, snapshot, offset: 10 }),
+    );
+    expect(past).toMatchObject({
+      decisions: [],
+      totalCount: 2,
+      page: { returned: 0, has_more: false },
+    });
+    for (const changed of [{ mep_id: '2' }, { label_contains: 'report' }]) {
+      expectErrorTwin(
+        await runToolContract(getPlenaryVotesTool, { ...filters, ...changed, snapshot, offset: 1 }),
+        'snapshot_changed',
+        'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.',
+      );
+    }
+  });
+  it.each([
+    { mode: 'sittings', year: 2025 },
+    { mode: 'decision', sitting_id: '2025-01-15', decision_id: 'DEC-1' },
+    { mode: 'voters', sitting_id: '2025-01-15', decision_id: 'DEC-1', position: 'favor' },
+  ] as const)(
+    'rejects meaningful label selection outside decisions before HTTP %j',
+    async (input) => {
+      const fetcher = installToolHttp(() => envelopeResponse([]));
+      expectErrorTwin(
+        await runToolContract(getPlenaryVotesTool, { ...input, label_contains: 'report' }),
+        'invalid_mode_fields',
+        'Remove label_contains, or select a mode that accepts label_contains.',
+      );
+      expect(fetcher).not.toHaveBeenCalled();
     },
   );
 });

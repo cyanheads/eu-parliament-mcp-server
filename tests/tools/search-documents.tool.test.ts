@@ -13,8 +13,6 @@ import { documentRecord, envelopeResponse } from '../helpers/eu-parliament-fixtu
 
 const invalidHint =
   'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
-const modeHint =
-  'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.';
 
 describe('euparl_search_documents contract', () => {
   it('follows published adoption identities and preserves unavailable based-on targets as errors', async () => {
@@ -82,8 +80,16 @@ describe('euparl_search_documents contract', () => {
   });
   it('limits adopted-text search windows while retaining deep plenary search', async () => {
     const fetcher = installToolHttp(
-      () =>
-        new Response(JSON.stringify({ data: [{ id: 'eli/dl/doc/LAST' }], meta: { total: 10000 } })),
+      (url) =>
+        new Response(
+          JSON.stringify({
+            data: Array.from(
+              { length: url.pathname.includes('plenary-documents') ? 1 : 100 },
+              (_, i) => ({ id: `eli/dl/doc/LAST-${i}` }),
+            ),
+            meta: { total: 10000 },
+          }),
+        ),
     );
     const data = expectSuccessTwin(
       await runToolContract(searchDocumentsTool, {
@@ -102,7 +108,7 @@ describe('euparl_search_documents contract', () => {
     expect(narrowed.notice).toContain(
       'Requested limit normalized to 10: offset plus limit cannot pass the 10000-result search window.',
     );
-    expect(new URL(String(fetcher.mock.calls[1]?.[0])).searchParams.get('limit')).toBe('10');
+    expect(new URL(String(fetcher.mock.calls[1]?.[0])).searchParams.get('limit')).toBe('100');
     expectErrorTwin(
       await runToolContract(searchDocumentsTool, { offset: 10000, limit: 20 }),
       'invalid_filter',
@@ -112,7 +118,7 @@ describe('euparl_search_documents contract', () => {
       await runToolContract(searchDocumentsTool, { source: 'plenary', offset: 9990, limit: 20 }),
     );
     expect(plenary).toMatchObject({
-      items: [{ document_id: 'LAST' }],
+      items: [{ document_id: 'LAST-0' }],
       totalCount: 10000,
       page: { limit: 20 },
     });
@@ -396,7 +402,7 @@ describe('euparl_search_documents contract', () => {
     });
     const first = expectSuccessTwin(
       await runToolContract(searchDocumentsTool, {
-        limit: 1000,
+        limit: 225,
         text: '',
         title: ' ',
         work_type: '',
@@ -410,10 +416,8 @@ describe('euparl_search_documents contract', () => {
       shown: 225,
       cap: 225,
     });
-    expect(first.notice).toBe(
-      'Requested limit normalized to the effective maximum of 225 documents. Continue with offset 225.',
-    );
-    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('225');
+    expect(first.notice).toBe('Continue with offset 225.');
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('100');
     expect(
       expectSuccessTwin(await runToolContract(searchDocumentsTool, { offset: 225 })),
     ).toMatchObject({
@@ -428,7 +432,7 @@ describe('euparl_search_documents contract', () => {
       notice:
         'The page at offset 500 returned no documents. Restart at offset 0 or return to the previous page.',
     });
-    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(fetcher).toHaveBeenCalledTimes(5);
     installToolHttp(() => envelopeResponse([documentRecord]));
     const fallback = expectSuccessTwin(
       await runToolContract(searchDocumentsTool, {
@@ -457,21 +461,35 @@ describe('euparl_search_documents contract', () => {
   });
 
   it.each([
-    { source: 'committee', year: 2025 },
-    { source: 'plenary', term: 10 },
-    { source: 'committee', text: 'ignored' },
-    { source: 'plenary', title: 'ignored' },
-    { source: 'committee', sitting_date: '2025-01-01' },
-    { source: 'plenary', related_process_id: '2025-0001' },
-    { work_type: 'UNKNOWN' },
-    { language: 'xx' },
-  ] as const)('rejects unsupported filter %j before network', async (input) => {
+    [
+      { source: 'committee', year: 2025 },
+      'Remove year for committee documents; use term and work_type to narrow this family.',
+    ],
+    [
+      { source: 'plenary', term: 10 },
+      'Remove term for plenary documents; use year and work_type to narrow this family.',
+    ],
+    [
+      { source: 'committee', text: 'ignored' },
+      'Use source adopted_texts for text, title, sitting_date, sitting_date_end or related_process_id, or remove those filters.',
+    ],
+    [
+      { source: 'plenary', title: 'ignored' },
+      'Use source adopted_texts for text, title, sitting_date, sitting_date_end or related_process_id, or remove those filters.',
+    ],
+    [
+      { source: 'committee', sitting_date: '2025-01-01' },
+      'Use source adopted_texts for text, title, sitting_date, sitting_date_end or related_process_id, or remove those filters.',
+    ],
+    [
+      { source: 'plenary', related_process_id: '2025-0001' },
+      'Use source adopted_texts for text, title, sitting_date, sitting_date_end or related_process_id, or remove those filters.',
+    ],
+    [{ work_type: 'UNKNOWN' }, invalidHint],
+    [{ language: 'xx' }, invalidHint],
+  ] as const)('rejects unsupported filter %j before network', async (input, hint) => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
-    expectErrorTwin(
-      await runToolContract(searchDocumentsTool, input),
-      'invalid_filter',
-      invalidHint,
-    );
+    expectErrorTwin(await runToolContract(searchDocumentsTool, input), 'invalid_filter', hint);
     expect(fetcher).not.toHaveBeenCalled();
   });
 
@@ -496,18 +514,23 @@ describe('euparl_search_documents contract', () => {
   );
 
   it.each([
-    { mode: 'get' },
-    { mode: 'get', document_id: 'D', source: 'committee' },
-    { mode: 'get', document_id: 'D', limit: 1 },
-    { mode: 'get', document_id: 'D', offset: 1 },
-    { document_id: 'D' },
-  ] as const)('rejects incompatible mode %j before network', async (input) => {
+    [{ mode: 'get' }, 'Supply document_id for the selected mode.'],
+    [
+      { mode: 'get', document_id: 'D', source: 'committee' },
+      'Remove source, or select a mode that accepts source.',
+    ],
+    [
+      { mode: 'get', document_id: 'D', limit: 1 },
+      'Remove snapshot and use offset 0 with the default limit 20 for detail mode.',
+    ],
+    [
+      { mode: 'get', document_id: 'D', offset: 1 },
+      'Remove snapshot and use offset 0 with the default limit 20 for detail mode.',
+    ],
+    [{ document_id: 'D' }, 'Remove document_id, or select a mode that accepts document_id.'],
+  ] as const)('rejects incompatible mode %j before network', async (input, hint) => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
-    expectErrorTwin(
-      await runToolContract(searchDocumentsTool, input),
-      'invalid_mode_fields',
-      modeHint,
-    );
+    expectErrorTwin(await runToolContract(searchDocumentsTool, input), 'invalid_mode_fields', hint);
     expect(fetcher).not.toHaveBeenCalled();
   });
 

@@ -18,8 +18,6 @@ import {
 
 const invalidHint =
   'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
-const modeHint =
-  'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.';
 const snapshotHint =
   'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.';
 const stalledHint =
@@ -254,7 +252,11 @@ describe('euparl_search_meps contract', () => {
   });
 
   it.each([
-    [{ term: 10, mandate_date: '2024-03-13' }, 'invalid_mode_fields', modeHint],
+    [
+      { term: 10, mandate_date: '2024-03-13' },
+      'invalid_mode_fields',
+      'Supply term or mandate_date, not both: term selects a term roster, mandate_date the members seated on that date.',
+    ],
     [
       { mandate_date: '2026-11-02' },
       'invalid_filter',
@@ -339,13 +341,13 @@ describe('euparl_search_meps contract', () => {
     );
   });
 
-  it('caps whole records and preserves special name data on both surfaces', async () => {
+  it('pages whole records and preserves special name data on both surfaces', async () => {
     const rows = Array.from({ length: 301 }, (_, index) => ({
       id: `person/${900000000 + index}`,
       label: index === 0 ? '**name** `code`\n[link](https://example.org) \\ end' : 'Example',
     }));
     installToolHttp(() => envelopeResponse(rows));
-    const data = expectSuccessTwin(await runToolContract(searchMepsTool, { term: 9, limit: 1000 }));
+    const data = expectSuccessTwin(await runToolContract(searchMepsTool, { term: 9, limit: 300 }));
     expect(data.items).toHaveLength(300);
     expect(data.items).toEqual(
       expect.arrayContaining([
@@ -357,9 +359,7 @@ describe('euparl_search_meps contract', () => {
       page: { limit: 300, next_offset: 300 },
       cap: 300,
     });
-    expect(data.notice).toBe(
-      'Requested limit normalized to the effective maximum of 300 MEPs. Continue with offset 300 and the returned snapshot.',
-    );
+    expect(data.notice).toBe('Continue with offset 300 and the returned snapshot.');
   });
 
   it.each([
@@ -383,7 +383,7 @@ describe('euparl_search_meps contract', () => {
     expectErrorTwin(
       await runToolContract(searchMepsTool, { offset: 1 }),
       'invalid_mode_fields',
-      modeHint,
+      'Pass the previous page.snapshot with the same filters, or restart at offset 0 without snapshot.',
       JsonRpcErrorCode.ValidationError,
     );
     expect(fetcher).not.toHaveBeenCalled();
@@ -466,5 +466,14 @@ describe('euparl_search_meps contract', () => {
       JsonRpcErrorCode.RateLimited,
     );
     expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+  it('supplies local snapshot correction on both error surfaces before HTTP', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    expectErrorTwin(
+      await runToolContract(searchMepsTool, { offset: 3 }),
+      'invalid_mode_fields',
+      'Pass the previous page.snapshot with the same filters, or restart at offset 0 without snapshot.',
+    );
+    expect(fetcher).not.toHaveBeenCalled();
   });
 });

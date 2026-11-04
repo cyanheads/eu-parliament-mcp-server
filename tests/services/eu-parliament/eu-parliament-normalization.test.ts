@@ -13,8 +13,6 @@ import {
   normalizeProcedure,
   normalizeQuestion,
   normalizeSpeech,
-  type Page,
-  type PageWindow,
   pageWindow,
   procedureIds,
   upstreamPage,
@@ -453,17 +451,17 @@ describe('Parliament normalization', () => {
     });
   });
   it.each([
-    ['procedures', 300],
-    ['questions', 300],
-    ['documents', 225],
-    ['speeches', 80],
-    ['meps', 300],
-    ['memberships', 225],
-    ['procedure_sections', 125],
-    ['voters', 1000],
-    ['sittings', 100],
-    ['decisions', 100],
-    ['reference', 350],
+    ['procedures', 1000],
+    ['questions', 1000],
+    ['documents', 1000],
+    ['speeches', 5000],
+    ['meps', 5000],
+    ['memberships', 5000],
+    ['procedure_sections', 5000],
+    ['voters', 5000],
+    ['sittings', 1000],
+    ['decisions', 5000],
+    ['reference', 1000],
     ['organizations', 20],
   ] as const)('caps a %s page at %i whole items', (collection, cap) => {
     expect(pageWindow({ limit: 5000 }, collection)).toEqual({ offset: 0, limit: cap });
@@ -471,12 +469,12 @@ describe('Parliament normalization', () => {
     expect(pageWindow({}, collection)).toEqual({ offset: 0, limit: 20 });
   });
   it.each([
-    [{ offset: 9900, limit: 1000 }, 100, 300],
-    [{ offset: 9950, limit: 1000 }, 50, 300],
+    [{ offset: 9900, limit: 1000 }, 100, 1000],
+    [{ offset: 9950, limit: 1000 }, 50, 1000],
     [{ offset: 9990, limit: 20 }, 10, 20],
-    [{ offset: 9700, limit: 1000 }, 300, 300],
+    [{ offset: 9700, limit: 1000 }, 300, 1000],
     [{ offset: 9000, limit: 250 }, 250, 250],
-    [{ offset: 10000, limit: 1000 }, 300, 300],
+    [{ offset: 10000, limit: 1000 }, 1000, 1000],
   ])('narrows %j to %i inside a 10000-result window and %i without one', (input, inside, open) => {
     expect(pageWindow(input, 'procedures', 10_000)).toEqual({
       offset: input.offset,
@@ -506,56 +504,11 @@ describe('Parliament normalization', () => {
       has_more: false,
     });
   });
-  it('stops a budgeted page at whole items once rendered rows pass 92000 characters', () => {
-    const sizes = [40_000, 52_000, 1, 91_999, 2, 92_001, 5];
-    const items = sizes.map((size, id) => ({ id, size }));
-    const calls: [id: number, index: number][] = [];
-    const chars = (item: { id: number; size: number }, index: number) => {
-      calls.push([item.id, index]);
-      return item.size;
-    };
-    const pages: { ids: number[]; calls: typeof calls; page: Page }[] = [];
-    let window: PageWindow = { offset: 0, limit: 100 };
-    for (;;) {
-      calls.length = 0;
-      const result = localPage(items, window, { scope: 1 }, chars);
-      pages.push({ ids: result.items.map(({ id }) => id), calls: [...calls], page: result.page });
-      if (!result.page.has_more) break;
-      window = {
-        offset: result.page.next_offset!,
-        limit: 100,
-        snapshot: result.page.snapshot!,
-      };
-    }
-    expect(pages.map(({ ids }) => ids)).toEqual([[0, 1], [2, 3], [4], [5], [6]]);
-    expect(pages[1]?.calls).toEqual([
-      [2, 0],
-      [3, 1],
-      [4, 2],
-    ]);
-    expect(pages.map(({ page }) => page)).toEqual(
-      [0, 2, 4, 5, 6].map((offset, index) => ({
-        offset,
-        limit: 100,
-        returned: [2, 2, 1, 1, 1][index],
-        has_more: index < 4,
-        ...(index < 4 && { next_offset: [2, 4, 5, 6][index] }),
-        snapshot: pages[0]?.page.snapshot,
-      })),
-    );
-    expect(localPage(items, { offset: 0, limit: 1 }, { scope: 1 }, chars).page).toMatchObject({
-      limit: 1,
-      returned: 1,
-      next_offset: 1,
-    });
-    expect(
-      localPage(
-        items,
-        { offset: 7, limit: 100, snapshot: pages[0]!.page.snapshot! },
-        { scope: 1 },
-        chars,
-      ),
-    ).toMatchObject({ items: [], page: { returned: 0, has_more: false } });
+  it('returns all requested whole items regardless of rendered size', () => {
+    const items = Array.from({ length: 150 }, (_, id) => ({ id, text: 'x'.repeat(1000) }));
+    const result = localPage(items, { offset: 0, limit: 150 }, {});
+    expect(result.items).toEqual(items);
+    expect(result.page).toMatchObject({ limit: 150, returned: 150, has_more: false });
   });
   it('keeps the window limit on a final short page', () => {
     const items = Array.from({ length: 5 }, (_, id) => ({ id }));

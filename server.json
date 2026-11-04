@@ -23,7 +23,7 @@
       "environmentVariables": [
         {
           "name": "EUPARL_CLAMP_LIMITS",
-          "description": "Clamp a limit above its collection's page cap to that cap with a notice. Set false to reject a limit above the tool's largest cap instead.",
+          "description": "Normalize bounded-mode limits with a notice. False rejects limits above a fully bounded tool's largest acquisition bound. Whole-acquired local modes have no output-size cap.",
           "format": "string",
           "isRequired": false,
           "default": "true"
@@ -83,7 +83,7 @@
         },
         {
           "name": "EUPARL_CLAMP_LIMITS",
-          "description": "Clamp a limit above its collection's page cap to that cap with a notice. Set false to reject a limit above the tool's largest cap instead.",
+          "description": "Normalize bounded-mode limits with a notice. False rejects limits above a fully bounded tool's largest acquisition bound. Whole-acquired local modes have no output-size cap.",
           "format": "string",
           "isRequired": false,
           "default": "true"

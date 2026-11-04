@@ -14,8 +14,6 @@ import { envelopeResponse, questionRecord } from '../helpers/eu-parliament-fixtu
 
 const invalidHint =
   'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
-const modeHint =
-  'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.';
 const acceptedForms =
   'Use a canonical question identifier such as E-10-2025-000001 or a human citation such as E-000001/2025, with prefix E, P, O, G or K.';
 const row = (id: string) => ({ id: `eli/dl/doc/${id}`, identifier: id });
@@ -161,17 +159,15 @@ describe('euparl_list_questions contract', () => {
 
   it.each([
     'X-001001/2023',
-    'g-001001/2023',
     'QT-001001/2023',
     'X-10-2025-900001',
-    'e-10-2025-900001',
     'https://data.europarl.europa.eu/eli/dl/doc/X-10-2025-900001',
   ])(
     'rejects unsupported question prefix %s before HTTP, naming the accepted forms',
     async (question_id) => {
       const fetcher = installToolHttp(() => envelopeResponse([]));
       const result = await runToolContract(listQuestionsTool, { mode: 'get', question_id });
-      expectErrorTwin(result, 'invalid_filter', invalidHint);
+      expectErrorTwin(result, 'invalid_filter', acceptedForms);
       expect(contractText(result)).toContain(acceptedForms);
       expect(fetcher).not.toHaveBeenCalled();
     },
@@ -323,27 +319,27 @@ describe('euparl_list_questions contract', () => {
 
   it('renders cap disclosure, second page, and offset beyond the end', async () => {
     installToolHttp((url) =>
-      envelopeResponse(url.searchParams.get('offset') === '0' ? page(1, 300) : []),
+      envelopeResponse(url.searchParams.get('offset') === '0' ? page(1, 1000) : []),
     );
     const first = expectSuccessTwin(
-      await runToolContract(listQuestionsTool, { limit: 1000, work_type: '', language: ' ' }),
+      await runToolContract(listQuestionsTool, { limit: 1001, work_type: '', language: ' ' }),
     );
     expect(first).toMatchObject({
-      page: { next_offset: 300, limit: 300 },
+      page: { next_offset: 1000, limit: 1000 },
       truncated: true,
-      shown: 300,
-      cap: 300,
+      shown: 1000,
+      cap: 1000,
     });
     expect(first.notice).toBe(
-      'Requested limit normalized to the effective maximum of 300 questions. Continue with offset 300.',
+      'Requested limit normalized to the effective maximum of 1000 questions. Continue with offset 1000.',
     );
     expect(
-      expectSuccessTwin(await runToolContract(listQuestionsTool, { offset: 300 })),
+      expectSuccessTwin(await runToolContract(listQuestionsTool, { offset: 1000 })),
     ).toMatchObject({
       items: [],
-      page: { offset: 300, has_more: false },
+      page: { offset: 1000, has_more: false },
       notice:
-        'The page at offset 300 returned no questions. Restart at offset 0 or return to the previous page.',
+        'The page at offset 1000 returned no questions. Restart at offset 0 or return to the previous page.',
     });
     expect(
       expectSuccessTwin(await runToolContract(listQuestionsTool, { offset: 1000 })),
@@ -378,30 +374,38 @@ describe('euparl_list_questions contract', () => {
   });
 
   it.each([
-    { work_type: 'UNKNOWN' },
-    { language: 'xx' },
-    { mode: 'get', question_id: 'E-10-2025-900001', term: 9 },
-    { mode: 'get', question_id: 'not-a-citation' },
-  ] as const)('rejects invalid filter %j', async (input) => {
+    [{ work_type: 'UNKNOWN' }, invalidHint],
+    [{ language: 'xx' }, invalidHint],
+    [{ mode: 'get', question_id: 'E-10-2025-900001', term: 9 }, invalidHint],
+    [{ mode: 'get', question_id: 'not-a-citation' }, acceptedForms],
+  ] as const)('rejects invalid filter %j', async (input, hint) => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
-    expectErrorTwin(await runToolContract(listQuestionsTool, input), 'invalid_filter', invalidHint);
+    expectErrorTwin(await runToolContract(listQuestionsTool, input), 'invalid_filter', hint);
     expect(fetcher).not.toHaveBeenCalled();
   });
 
   it.each([
-    { mode: 'get' },
-    { mode: 'get', question_id: 'E-10-2025-900001', year: 2025 },
-    { mode: 'get', question_id: 'E-10-2025-900001', work_type: 'QUESTION_WRITTEN' },
-    { mode: 'get', question_id: 'E-10-2025-900001', limit: 1 },
-    { question_id: 'E-10-2025-900001' },
-    { term: 10 },
-  ] as const)('rejects incompatible mode %j', async (input) => {
+    [{ mode: 'get' }, 'Supply question_id for the selected mode.'],
+    [
+      { mode: 'get', question_id: 'E-10-2025-900001', year: 2025 },
+      'Remove year, or select a mode that accepts year.',
+    ],
+    [
+      { mode: 'get', question_id: 'E-10-2025-900001', work_type: 'QUESTION_WRITTEN' },
+      'Remove work_type, or select a mode that accepts work_type.',
+    ],
+    [
+      { mode: 'get', question_id: 'E-10-2025-900001', limit: 1 },
+      'Remove snapshot and use offset 0 with the default limit 20 for detail mode.',
+    ],
+    [
+      { question_id: 'E-10-2025-900001' },
+      'Remove question_id, or select a mode that accepts question_id.',
+    ],
+    [{ term: 10 }, 'Remove term, or select a mode that accepts term.'],
+  ] as const)('rejects incompatible mode %j', async (input, hint) => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
-    expectErrorTwin(
-      await runToolContract(listQuestionsTool, input),
-      'invalid_mode_fields',
-      modeHint,
-    );
+    expectErrorTwin(await runToolContract(listQuestionsTool, input), 'invalid_mode_fields', hint);
     expect(fetcher).not.toHaveBeenCalled();
   });
 
@@ -440,5 +444,41 @@ describe('euparl_list_questions contract', () => {
     });
     expect(contractText(result)).toContain('different question identifier');
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    'e-000003/2025',
+    'e-10-2025-000003',
+    'E-10-2025-3',
+    'E-3/2025',
+    'E-0003/2025',
+    'https://data.europarl.europa.eu/E-10-2025-000003',
+  ])('normalizes question alias %s before resolution', async (question_id) => {
+    const fetcher = installToolHttp(() =>
+      envelopeResponse([{ id: 'eli/dl/doc/E-10-2025-000003', identifier: 'E-10-2025-000003' }]),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(listQuestionsTool, { mode: 'get', question_id }),
+    );
+    expect(data).toMatchObject({
+      found: true,
+      appliedFilters: { question_id: 'E-10-2025-000003' },
+    });
+    expect(String(fetcher.mock.calls[0]?.[0])).toContain('/E-10-2025-000003?');
+  });
+  it.each([
+    'X-3/2025',
+    'E-1234567/2025',
+    'E-10-2025-1234567',
+    'E-10-2025-000003-ASW',
+    'https://evil.example/eli/dl/doc/E-10-2025-3',
+    '../E-10-2025-3',
+  ])('rejects invalid question %s with question guidance before HTTP', async (question_id) => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    expectErrorTwin(
+      await runToolContract(listQuestionsTool, { mode: 'get', question_id }),
+      'invalid_filter',
+      'Use a canonical question identifier such as E-10-2025-000001 or a human citation such as E-000001/2025, with prefix E, P, O, G or K.',
+    );
+    expect(fetcher).not.toHaveBeenCalled();
   });
 });

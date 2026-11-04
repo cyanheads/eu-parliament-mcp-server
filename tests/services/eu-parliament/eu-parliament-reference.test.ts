@@ -75,7 +75,7 @@ describe('Parliament reference codes', () => {
   it('exposes actual identifiers and operational coverage rather than unsupported search promises', () => {
     expect(
       referenceEntries('identifiers').find((item) => item.code === 'question')?.description,
-    ).toContain('omitted term verifies canonical candidates for all overlapping terms');
+    ).toContain('Omitted term verifies canonical candidates for all overlapping terms');
     expect(
       referenceEntries('coverage').find((item) => item.code === 'speeches')?.description,
     ).toContain('not transcripts');
@@ -83,19 +83,24 @@ describe('Parliament reference codes', () => {
       referenceEntries('coverage').find((item) => item.code === 'questions')?.description,
     ).toContain('Missing answer links do not prove unanswered');
   });
-  it('states every collection page cap, the clamp switch and the window rule in the paging row', () => {
+  it('states acquisition bounds, local sizing, snapshots and stable search geometry', () => {
     const paging = referenceEntries('coverage').find((item) => item.code === 'paging')?.description;
-    expect(paging).toContain(
-      'Page caps: 300 procedures, 300 questions, 225 documents, 80 speeches, 300 MEPs, 225 memberships, 125 procedure section entries, 1000 voters, 100 sittings, 100 decisions, 350 reference entries, 20 organization lookups.',
-    );
-    expect(paging).toContain('EUPARL_CLAMP_LIMITS=false');
-    expect(paging).toContain('an offset of 10000 or more is rejected');
-    expect(paging).toContain(
-      'A decisions page also ends at whole decisions before their rendered rows pass 92000 characters, with a notice; its first decision always returns whole, page.limit keeps the requested limit, and next_offset resumes at the first decision left out.',
-    );
-    expect(paging).toContain('procedures without process_type expose a 10000-result search window');
-    expect(paging).toContain(
-      'a process_type listing is acquired whole and paged in procedure_id order, and its snapshot is optional',
-    );
+    for (const expected of [
+      '1000 procedures',
+      '1000 questions',
+      '1000 documents',
+      '1000 sittings',
+      '1000 reference entries',
+      '20 organization lookups',
+      'without an output-size cap',
+      'EUPARL_CLAMP_LIMITS=false',
+      'aligned 100-row pages',
+      'relevance order',
+      'offsets of 10000 or more fail',
+      'optional snapshot',
+      'snapshot_changed before slicing',
+    ])
+      expect(paging).toContain(expected);
+    expect(paging).not.toContain('92000');
   });
 });

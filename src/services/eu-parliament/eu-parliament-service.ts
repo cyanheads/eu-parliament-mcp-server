@@ -11,12 +11,12 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import { createCounter, logger, requestContextService } from '@cyanheads/mcp-ts-core/utils';
+import type { z } from 'zod';
 import {
   type ClientOptions,
   type Envelope,
   EuParliamentClient,
   type Operation,
-  operationTimeoutMs,
 } from './eu-parliament-client.js';
 import {
   activityId,
@@ -40,7 +40,6 @@ import {
   type PageWindow,
   type Paging,
   pageCaps,
-  pageRowBudgetChars,
   pageWindow,
   procedureIds,
   sourceUrl,
@@ -54,7 +53,6 @@ import {
   type ReferenceTopic,
   referenceEntries,
 } from './eu-parliament-reference.js';
-import { renderedChars } from './eu-parliament-rendering.js';
 import {
   bodySchema,
   decisionSchema,
@@ -145,6 +143,7 @@ export interface MepInput extends Paging {
 export interface VotesInput extends Paging {
   decision_id?: string;
   document_id?: string;
+  label_contains?: string;
   mep_id?: string;
   mode?: 'sittings' | 'decisions' | 'decision' | 'voters';
   position?: VoterPosition;
@@ -163,8 +162,8 @@ export interface QuestionsInput extends Paging {
   year?: number;
 }
 
-function invalidMode(message: string): never {
-  throw validationError(message, { reason: 'invalid_mode_fields' });
+function invalidMode(message: string, hint = message): never {
+  throw validationError(message, { reason: 'invalid_mode_fields', recovery: { hint } });
 }
 function invalidFilter(message: string, hint?: string): never {
   throw validationError(message, {
@@ -179,19 +178,38 @@ function meaningful(value: unknown): boolean {
 }
 function forbid<T extends Paging>(input: T, keys: (keyof T & string)[]): void {
   for (const key of keys)
-    if (meaningful(input[key])) invalidMode(`${key} is not supported in this mode.`);
+    if (meaningful(input[key]))
+      invalidMode(
+        `${key} is not supported in this mode.`,
+        `Remove ${key}, or select a mode that accepts ${key}.`,
+      );
 }
 function required(value: string | undefined, key: string): string {
-  if (!value?.trim()) invalidMode(`${key} is required in this mode.`);
+  if (!value?.trim())
+    invalidMode(`${key} is required in this mode.`, `Supply ${key} for the selected mode.`);
   return value;
 }
 function detailPaging(input: Paging): void {
   if ((input.offset ?? 0) !== 0 || (input.limit ?? 20) !== 20 || input.snapshot !== undefined)
-    invalidMode('Detail mode does not accept paging or snapshot fields.');
+    invalidMode(
+      'Detail mode does not accept paging or snapshot fields.',
+      'Remove snapshot and use offset 0 with the default limit 20 for detail mode.',
+    );
 }
 function localPaging(input: Paging): void {
   if ((input.offset ?? 0) > 0 && !input.snapshot)
-    invalidMode('Local continuation requires the previous page snapshot.');
+    invalidMode(
+      'Local continuation requires the previous page snapshot.',
+      'Pass the previous page.snapshot with the same filters, or restart at offset 0 without snapshot.',
+    );
+}
+/** Literal label selection folds case, Unicode dash punctuation and repeated whitespace. */
+function normalizeLabel(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[\p{Dash_Punctuation}\u2212]/gu, '-')
+    .replace(/\s+/gu, ' ')
+    .trim();
 }
 function date(value: string): string {
   if (
@@ -231,6 +249,16 @@ function result<T>(
   total?: number,
   available?: boolean,
 ): ServiceResult<T> {
+  const page = (data as { page?: { offset: number; returned: number; snapshot?: string } }).page;
+  const local =
+    page?.snapshot !== undefined ||
+    (filters.topic !== undefined &&
+      filters.topic !== 'committees' &&
+      filters.topic !== 'political_groups');
+  if (local && page?.returned === 0 && total !== undefined && total > 0 && page.offset >= total)
+    notices.push(
+      `The offset ${page.offset} is at or beyond the complete collection of ${total} items. Restart at offset 0 or return to the previous page.`,
+    );
   return {
     data,
     enrichment: {
@@ -393,7 +421,7 @@ function decisionsUnmatched(
       ...(document_id === undefined ? [] : ['document_id']),
       ...(vote_item_id === undefined ? [] : ['vote_item_id']),
     ].join(' and ');
-    return `No decision in this sitting publishes a decided-on, part-of or vote-item relation, so a report or vote item cannot select its decisions. Remove ${names} and find the report's citation (its document label, such as A9-0188/2023) in decision labels.`;
+    return `No decision in this sitting publishes a decided-on, part-of or vote-item relation, so a report or vote item cannot select its decisions. Remove ${names} and use label_contains with the report's citation (its document label, such as A9-0188/2023). Matching label text does not establish a final vote.`;
   }
   if (vote_item_id !== undefined) {
     const held = decisions.filter((decision) => decision.vote_item_ids.includes(vote_item_id));
@@ -413,10 +441,51 @@ export class EuParliamentService {
     this.client = new EuParliamentClient(options);
   }
 
+  /** Fixed 100-row geometry keeps equal-sort-key ordering independent of caller page sizes. */
+  private async alignedSearch<T>(
+    path: string,
+    query: Record<string, string | number | undefined>,
+    schema: z.ZodType<T>,
+    operation: Operation,
+    paging: PageWindow,
+  ): Promise<Envelope<T>> {
+    const size = 100;
+    const data: T[] = [];
+    let total: number | undefined;
+    for (
+      let offset = Math.floor(paging.offset / size) * size;
+      offset < paging.offset + paging.limit;
+      offset += size
+    ) {
+      const response = await this.client.get(
+        path,
+        { ...query, offset, limit: size },
+        schema,
+        operation,
+      );
+      total = response.total ?? total;
+      const start = Math.max(0, paging.offset - offset);
+      data.push(
+        ...response.data.slice(start, Math.min(size, paging.offset + paging.limit - offset)),
+      );
+      if (response.data.length < size || (total !== undefined && offset + size >= total)) {
+        // A short aligned page establishes its end even when the upstream omits a total.
+        if (response.data.length > 0 || offset === 0) total ??= offset + response.data.length;
+        break;
+      }
+    }
+    return { status: data.length ? 'ok' : 'empty', data, ...field('total', total) };
+  }
+
   /** Live bodies page upstream; static tables page without snapshots. */
   async listReference(input: ReferenceInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const collection = input.topic === 'organizations' ? 'organizations' : 'reference';
+    const collection =
+      input.topic === 'organizations'
+        ? 'organizations'
+        : input.topic === 'committees' || input.topic === 'political_groups'
+          ? 'reference'
+          : 'static_reference';
     const paging = scopePage(input, collection);
     const notices = noticesFor(input, paging, collection);
     const normalizeBody = (raw: RawBody) => ({
@@ -435,7 +504,10 @@ export class EuParliamentService {
     });
     if (input.topic === 'organizations') {
       if (!input.organization_ids?.length)
-        invalidMode('organizations requires nonempty organization_ids.');
+        invalidMode(
+          'organizations requires nonempty organization_ids.',
+          'Supply a nonempty organization_ids list for topic organizations.',
+        );
       const ids = input.organization_ids.map((id) => canonicalId(id, 'organization'));
       const items: ReferenceEntry[] = [];
       for (const organization_id of ids.slice(paging.offset, paging.offset + paging.limit)) {
@@ -474,7 +546,10 @@ export class EuParliamentService {
       );
     }
     if (input.organization_ids !== undefined)
-      invalidMode('organization_ids is supported only with topic organizations.');
+      invalidMode(
+        'organization_ids is supported only with topic organizations.',
+        'Remove organization_ids, or use topic organizations to resolve those identifiers.',
+      );
     if (input.topic === 'committees' || input.topic === 'political_groups') {
       const classification =
         input.topic === 'committees' ? 'COMMITTEE_PARLIAMENTARY_STANDING' : 'EU_POLITICAL_GROUP';
@@ -527,7 +602,10 @@ export class EuParliamentService {
     if (process_type === undefined) {
       const paging = scopePage(input, 'procedures', searchResultWindow);
       if (input.snapshot !== undefined)
-        invalidMode('snapshot applies only to a process_type listing.');
+        invalidMode(
+          'snapshot applies only to a process_type listing.',
+          'Remove snapshot, or repeat the call with the process_type of the listing that returned it.',
+        );
       const notices = noticesFor(input, paging, 'procedures');
       const narrowing = 'Narrow process_type to retrieve a smaller procedure set.';
       searchWindow(paging, `${narrowing} ${restartAfterNarrowing}`);
@@ -545,15 +623,13 @@ export class EuParliamentService {
       );
       return result({ items, page: paged.page }, filters, notices, paged.total);
     }
-    const paging = scopePage(input, 'procedures');
-    const notices = noticesFor(input, paging, 'procedures');
-    // The whole-set read (about 1 MB for RSP) may outlast the 15 s attempt bound, never the deadline.
+    const paging = scopePage(input, 'local_procedures');
+    const notices = noticesFor(input, paging, 'local_procedures');
     const response = await this.client.get(
       'procedures',
       { offset: 0, limit: searchResultWindow, 'process-type': process_type },
       procedureSchema,
       operation,
-      { attemptLimitMs: operationTimeoutMs },
     );
     const items = response.data
       .map(procedureRow)
@@ -581,7 +657,10 @@ export class EuParliamentService {
     const procedure_id = canonicalId(input.procedure_id, 'procedure');
     const section = input.section ?? 'overview';
     if (section === 'overview' && paging.offset !== 0)
-      invalidMode('Procedure overview rejects nonzero offset.');
+      invalidMode(
+        'Procedure overview rejects nonzero offset.',
+        'Use offset 0 for overview, or select events, participants or documents for continuation.',
+      );
     if (section !== 'overview') localPaging(input);
     const response = await this.client.get(
       `procedures/${procedure_id}`,
@@ -660,12 +739,19 @@ export class EuParliamentService {
   async searchDocuments(input: DocumentsInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
     const source = input.source ?? 'adopted_texts';
+    const keywords = meaningful(input.text) || meaningful(input.title);
+    const collection =
+      source === 'adopted_texts'
+        ? keywords
+          ? 'keyword_documents'
+          : 'adopted_documents'
+        : 'documents';
     const paging = scopePage(
       input,
-      'documents',
+      collection,
       source === 'adopted_texts' ? searchResultWindow : undefined,
     );
-    const notices = noticesFor(input, paging, 'documents');
+    const notices = noticesFor(input, paging, collection);
     const mode = input.mode ?? 'search';
     if (mode === 'get') {
       forbid(input, [
@@ -723,11 +809,18 @@ export class EuParliamentService {
     )
       invalidFilter(
         'Keyword, sitting-date and related-process filters are available only for adopted_texts.',
+        'Use source adopted_texts for text, title, sitting_date, sitting_date_end or related_process_id, or remove those filters.',
       );
     if (source === 'committee' && input.year !== undefined)
-      invalidFilter('Committee documents do not support year.');
+      invalidFilter(
+        'Committee documents do not support year.',
+        'Remove year for committee documents; use term and work_type to narrow this family.',
+      );
     if (source === 'plenary' && input.term !== undefined)
-      invalidFilter('Plenary documents do not support term.');
+      invalidFilter(
+        'Plenary documents do not support term.',
+        'Remove term for plenary documents; use year and work_type to narrow this family.',
+      );
     const work_type = normalizeCode(input.work_type, source);
     const related_process_id = input.related_process_id
       ? canonicalId(input.related_process_id, 'procedure')
@@ -760,12 +853,20 @@ export class EuParliamentService {
         view: 'list',
       }),
     };
-    const response = await this.client.get(
-      documentEndpoints[source],
-      query,
-      documentSchema,
-      operation,
-    );
+    const response =
+      source === 'adopted_texts' && !keywords
+        ? await this.alignedSearch(
+            documentEndpoints[source],
+            { ...query, 'sort-by': 'doc-id:asc' },
+            documentSchema,
+            operation,
+            paging,
+          )
+        : await this.client.get(documentEndpoints[source], query, documentSchema, operation);
+    if (source === 'adopted_texts' && keywords)
+      notices.push(
+        'Keyword searches retain upstream relevance order; pages can repeat or omit records as ordering changes.',
+      );
     const items = response.data.map(normalizeDocumentSummary);
     if (!items.length)
       notices.push(
@@ -821,8 +922,10 @@ export class EuParliamentService {
   /** Speech results preserve metadata rather than manufacturing transcripts. */
   async searchSpeeches(input: SpeechesInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
-    const paging = scopePage(input, 'speeches', searchResultWindow);
-    const notices = noticesFor(input, paging, 'speeches');
+    const keywords = meaningful(input.text) || meaningful(input.title);
+    const collection = keywords ? 'keyword_speeches' : 'speeches';
+    const paging = scopePage(input, collection, searchResultWindow);
+    const notices = noticesFor(input, paging, collection);
     const mode = input.mode ?? 'search';
     if (mode === 'get') {
       forbid(input, [
@@ -857,23 +960,31 @@ export class EuParliamentService {
     dates(input);
     const activity_type = normalizeCode(input.activity_type, 'activity_type');
     const person_id = input.person_id ? canonicalId(input.person_id, 'person') : undefined;
-    const response = await this.client.get(
-      'speeches',
-      {
-        offset: paging.offset,
-        limit: paging.limit,
-        text: input.text,
-        title: input.title,
-        'person-id': person_id,
-        'activity-type': activity_type,
-        'search-language': paging.language,
-        'parliamentary-term': term,
-        'sitting-date': input.sitting_date,
-        'sitting-date-end': input.sitting_date_end,
-      },
-      speechSchema,
-      operation,
-    );
+    const query = {
+      offset: paging.offset,
+      limit: paging.limit,
+      text: input.text,
+      title: input.title,
+      'person-id': person_id,
+      'activity-type': activity_type,
+      'search-language': paging.language,
+      'parliamentary-term': term,
+      'sitting-date': input.sitting_date,
+      'sitting-date-end': input.sitting_date_end,
+    };
+    const response = keywords
+      ? await this.client.get('speeches', query, speechSchema, operation)
+      : await this.alignedSearch(
+          'speeches',
+          { ...query, 'sort-by': 'sitting-date:asc,numbering:asc' },
+          speechSchema,
+          operation,
+          paging,
+        );
+    if (keywords)
+      notices.push(
+        'Keyword searches retain upstream relevance order; pages can repeat or omit records as ordering changes.',
+      );
     const items = response.data.map((raw) => normalizeSpeech(raw, paging.language, notices));
     if (!items.length)
       notices.push(
@@ -1041,7 +1152,10 @@ export class EuParliamentService {
     const mep_id = canonicalId(input.mep_id, 'person');
     const section = input.section ?? 'overview';
     if (section === 'overview' && paging.offset !== 0)
-      invalidMode('MEP overview rejects nonzero offset.');
+      invalidMode(
+        'MEP overview rejects nonzero offset.',
+        'Use offset 0 for overview, or select memberships for continuation.',
+      );
     if (section !== 'overview') localPaging(input);
     const filters = { mep_id, section, language: paging.language };
     const response = await this.client.get(`meps/${mep_id}`, {}, mepSchema, operation);
@@ -1092,8 +1206,15 @@ export class EuParliamentService {
     const collection = mode === 'sittings' || mode === 'voters' ? mode : 'decisions';
     const paging = scopePage(input, collection);
     const notices = noticesFor(input, paging, collection);
-    if (mode !== 'decisions') forbid(input, ['document_id', 'vote_item_id']);
-    if (mode !== 'decision') forbid(input, ['mep_id']);
+    if (mode !== 'decisions') forbid(input, ['document_id', 'vote_item_id', 'label_contains']);
+    if (mode !== 'decision' && mode !== 'decisions' && meaningful(input.mep_id))
+      invalidMode(
+        'mep_id is supported only in decisions and decision modes.',
+        'Remove mep_id, or use mode decisions or decision for member positions.',
+      );
+    const label_contains = input.label_contains?.trim()
+      ? normalizeLabel(input.label_contains)
+      : undefined;
     const document_id = input.document_id?.trim()
       ? canonicalId(input.document_id, 'document')
       : undefined;
@@ -1102,10 +1223,17 @@ export class EuParliamentService {
       : undefined;
     const mep_id = input.mep_id?.trim() ? canonicalId(input.mep_id, 'person') : undefined;
     if (mode !== 'voters' && (input.resolve_names || input.roster_term !== undefined))
-      invalidMode('Name resolution fields are supported only in voters mode.');
+      invalidMode(
+        'Name resolution fields are supported only in voters mode.',
+        'Remove resolve_names and roster_term, or use mode voters with decision_id and position.',
+      );
     if (mode === 'sittings') {
       forbid(input, ['sitting_id', 'decision_id', 'position', 'snapshot']);
-      if (input.year === undefined) invalidMode('year is required for sittings mode.');
+      if (input.year === undefined)
+        invalidMode(
+          'year is required for sittings mode.',
+          'Supply a four-digit year for mode sittings.',
+        );
       const response = await this.client.get(
         'meetings',
         { offset: paging.offset, limit: paging.limit, year: input.year },
@@ -1156,11 +1284,21 @@ export class EuParliamentService {
         ? undefined
         : canonicalId(required(input.decision_id, 'decision_id'), 'activity');
     if (mode === 'voters') {
-      if (!input.position) invalidMode('position is required for voters mode.');
+      if (!input.position)
+        invalidMode(
+          'position is required for voters mode.',
+          'Supply position: favor, against, abstention, intended_favor, intended_against, or intended_abstention.',
+        );
       if (input.resolve_names && input.roster_term === undefined)
-        invalidMode('resolve_names requires roster_term.');
+        invalidMode(
+          'resolve_names requires roster_term.',
+          'Supply roster_term for the sitting date when resolve_names is true.',
+        );
       if (!input.resolve_names && input.roster_term !== undefined)
-        invalidMode('roster_term requires resolve_names=true.');
+        invalidMode(
+          'roster_term requires resolve_names=true.',
+          'Remove roster_term, or set resolve_names true in voters mode.',
+        );
     }
     if (mode === 'decisions' || mode === 'voters') localPaging(input);
     const response = await this.client.get(
@@ -1177,6 +1315,7 @@ export class EuParliamentService {
       ...field('document_id', document_id),
       ...field('vote_item_id', vote_item_id),
       ...field('mep_id', mep_id),
+      ...field('label_contains', label_contains),
       ...field('position', input.position),
       ...(mode === 'voters' && {
         resolve_names: input.resolve_names ?? false,
@@ -1185,9 +1324,9 @@ export class EuParliamentService {
     };
     if (mode === 'decisions') {
       const decisions = response.data.map((raw) =>
-        normalizeDecisionSummary(raw, paging.language, notices),
+        normalizeDecisionSummary(raw, paging.language, notices, mep_id),
       );
-      const selected = decisions.filter(
+      const related = decisions.filter(
         (decision) =>
           (document_id === undefined ||
             [
@@ -1197,18 +1336,25 @@ export class EuParliamentService {
             ].some((id) => id === document_id || id.startsWith(`${document_id}-`))) &&
           (vote_item_id === undefined || decision.vote_item_ids.includes(vote_item_id)),
       );
-      const page = localPage(selected, paging, filters, (decision, index) =>
-        renderedChars(decision, `result.decisions[${index}]`),
-      );
-      if (!page.total) notices.push(decisionsUnmatched(decisions, document_id, vote_item_id));
-      else if (document_id !== undefined && vote_item_id === undefined) {
+      const selected =
+        label_contains === undefined
+          ? related
+          : related.filter(
+              (decision) =>
+                decision.label !== undefined &&
+                normalizeLabel(decision.label.value).includes(label_contains),
+            );
+      const page = localPage(selected, paging, filters);
+      if (!page.total) {
+        if (label_contains !== undefined && related.length)
+          notices.push(
+            'No published decision label matched label_contains within the selected document and vote-item filters. Remove or change label_contains; matching text does not establish a final vote.',
+          );
+        else notices.push(decisionsUnmatched(decisions, document_id, vote_item_id));
+      } else if (document_id !== undefined && vote_item_id === undefined) {
         const steering = voteItemSteering(decisions, selected);
         if (steering) notices.push(steering);
       }
-      if (page.items.length < Math.min(paging.limit, page.total - paging.offset))
-        notices.push(
-          `The ${pageRowBudgetChars}-character budget for decision rows ended this page after ${plural(page.items.length, 'whole decision')}.`,
-        );
       return result(
         { mode, sitting_id, decisions: page.items, page: page.page },
         filters,
@@ -1334,10 +1480,11 @@ export class EuParliamentService {
     const questionForms =
       'Use a canonical question identifier such as E-10-2025-000001 or a human citation such as E-000001/2025, with prefix E, P, O, G or K.';
     // Published work prefixes: E written, P priority written, O oral, G major and K minor interpellation.
-    const human = /^([EPOGK])-(\d{6})\/(\d{4})$/.exec(citation);
+    const human = /^([EPOGK])-(\d{1,6})\/(\d{4})$/i.exec(citation);
     if (human) {
-      if (input.term !== undefined)
-        question_id = `${human[1]}-${input.term}-${human[3]}-${human[2]}`;
+      const prefix = citation.charAt(0).toUpperCase();
+      const sequence = citation.slice(2, citation.indexOf('/')).padStart(6, '0');
+      if (input.term !== undefined) question_id = `${prefix}-${input.term}-${human[3]}-${sequence}`;
       else {
         const year = Number(human[3]);
         // Elected terms span five years from 1979; election years overlap adjacent terms.
@@ -1348,7 +1495,7 @@ export class EuParliamentService {
         const matches: { id: string; response: Envelope<RawQuestion> }[] = [];
         for (const candidateTerm of terms) {
           operation.signal.throwIfAborted();
-          const id = `${human[1]}-${candidateTerm}-${human[3]}-${human[2]}`;
+          const id = `${prefix}-${candidateTerm}-${human[3]}-${sequence}`;
           const response = await this.client.get(
             `parliamentary-questions/${id}`,
             {},
@@ -1370,11 +1517,19 @@ export class EuParliamentService {
         resolved = matches[0]?.response;
       }
     } else {
-      if (/^[A-Za-z]+-\d{6}\/\d{4}$/.test(citation)) invalidFilter(questionForms);
-      question_id = canonicalId(citation, 'document');
-      const match = /^[EPOGK]-(\d+)-\d{4}-\d{6}$/.exec(question_id);
-      if (!match) invalidFilter(questionForms);
-      if (input.term !== undefined && Number(match[1]) !== input.term)
+      const documentPrefix = 'eli/dl/doc/';
+      const publicOrigin = 'https://data.europarl.europa.eu/';
+      const local = citation.startsWith(publicOrigin)
+        ? citation.slice(publicOrigin.length)
+        : citation;
+      const unwrapped = local.startsWith(documentPrefix)
+        ? local.slice(documentPrefix.length)
+        : local;
+      const match = /^([EPOGK])-(\d+)-(\d{4})-(\d{1,6})$/i.exec(unwrapped);
+      if (!match) invalidFilter(questionForms, questionForms);
+      const sequence = unwrapped.slice(unwrapped.lastIndexOf('-') + 1).padStart(6, '0');
+      question_id = `${unwrapped.charAt(0).toUpperCase()}-${match[2]}-${match[3]}-${sequence}`;
+      if (input.term !== undefined && Number(match[2]) !== input.term)
         invalidFilter('term conflicts with the canonical question identifier.');
     }
     const filters = {

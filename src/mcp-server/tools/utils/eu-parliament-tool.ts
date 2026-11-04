@@ -42,7 +42,7 @@ export const pageSchema = z
       .int()
       .positive()
       .describe(
-        "Effective whole-item page size: the requested limit, clamped to the collection's page cap and, on a 10000-result search, to the results left in the window.",
+        'Effective whole-item page size after acquisition bounds, safe-integer normalization and any search-result window. Local collections retain all requested whole items or remaining rows.',
       ),
     returned: z.number().int().nonnegative().describe('Number of complete items on this page.'),
     has_more: z
@@ -89,29 +89,28 @@ export const linkSchema = z
 const wholeNumber = 'limit must be a whole number.';
 const capList = (collections: readonly PagedCollection[]) =>
   new Intl.ListFormat('en', { type: 'disjunction' }).format(
-    collections.map((collection) => `${pageCaps[collection].maximum} ${pageCaps[collection].noun}`),
+    collections
+      .filter((collection) => pageCaps[collection].maximum < Number.MAX_SAFE_INTEGER)
+      .map((collection) => `${pageCaps[collection].maximum} ${pageCaps[collection].noun}`),
   );
 /**
  * Whole-item `limit` for a tool paging `collections`. With clamping on (the default) a larger
  * value is accepted and the service clamps it to the collection cap, so the schema advertises no
  * `maximum`: `multipleOf(1)` stands in for `.int()`, which Zod 4 emits with
  * `maximum: 9007199254740991`, and the integer refinement catches float noise `multipleOf`
- * tolerates. With EUPARL_CLAMP_LIMITS=false the tool's largest cap is enforced and advertised.
+ * tolerates. With EUPARL_CLAMP_LIMITS=false a fully bounded tool's largest bound is enforced and advertised; mixed tools keep local modes open.
  * The mode is read per call and per `tools/list` emission (the `.meta()` getters), never when
  * the definition module is imported, which happens before `setup()` parses the environment.
  */
 function limitInput(collections: readonly [PagedCollection, ...PagedCollection[]]) {
   const maximum = Math.max(...collections.map((collection) => pageCaps[collection].maximum));
-  const smaller = collections.filter((collection) => pageCaps[collection].maximum < maximum);
-  const clampText = (capped: readonly PagedCollection[]) =>
-    `Pages hold at most ${capList(capped)}; a larger limit returns that many with a notice.`;
   return z
     .number()
     .multipleOf(1, wholeNumber)
     .min(1)
     .refine(Number.isInteger, { message: wholeNumber, when: ({ issues }) => issues.length === 0 })
     .check((payload) => {
-      if (!clampLimits() && payload.value > maximum)
+      if (!clampLimits() && maximum < Number.MAX_SAFE_INTEGER && payload.value > maximum)
         payload.issues.push({
           code: 'too_big',
           origin: 'number',
@@ -123,12 +122,16 @@ function limitInput(collections: readonly [PagedCollection, ...PagedCollection[]
     .default(20)
     .meta({
       get maximum() {
-        return clampLimits() ? undefined : maximum;
+        return clampLimits() || maximum === Number.MAX_SAFE_INTEGER ? undefined : maximum;
       },
       get description() {
-        return clampLimits()
-          ? `Whole items requested; default 20. ${clampText(collections)}`
-          : `Whole items requested; default 20, at most ${maximum}.${smaller.length ? ` ${clampText(smaller)}` : ''}`;
+        const bounded = collections.filter(
+          (collection) => pageCaps[collection].maximum < Number.MAX_SAFE_INTEGER,
+        );
+        const local = collections.some(
+          (collection) => pageCaps[collection].maximum === Number.MAX_SAFE_INTEGER,
+        );
+        return `Whole items requested; default 20. ${local ? 'Whole-acquired local collections return the requested count or remaining rows, without an output-size cap. ' : ''}${bounded.length ? `Bounded-mode acquisition limits: ${capList(bounded)}. ${!clampLimits() && !local ? `Limits above ${maximum} are rejected; smaller mode limits normalize with a notice.` : 'Larger bounded-mode limits normalize with a notice.'} ` : ''}Values above the safe-integer range normalize to 9007199254740991; search windows and bounded modes may narrow further.`;
       },
     });
 }

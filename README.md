@@ -115,7 +115,8 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 ### `euparl_get_plenary_votes` <sub>tool</sub>
 
 - `mode: "sittings"` takes `year` (sittings data starts in 2014; earlier years return no sittings); default `decisions` takes `sitting_id` (a `YYYY-MM-DD` date or `MTG-PL-` ID) and pages summaries with labels, tallies, distinct decided-on, recording and part-of document IDs, and vote item IDs. Decisions start in 2019: 2014–2018 sittings list but return no decisions, and not every later sitting has them. Optional `document_id` filters any document relation by exact ID or hyphen-boundary descendant before paging; optional `vote_item_id` (a procedure's `PLENARY_VOTE_RESULTS` event) selects every decision of one vote item, the route to a report's final vote. A procedure event's vote date can select the sitting. Older sittings publish no vote items or report relations on decisions; there, the report citation appears only in decision labels
-- `decision` adds `decision_id` and returns one rich record with commentary (an ID absent from the sitting fails `decision_not_found`). Optional `mep_id` returns separate recorded/intended positions and publication availability without a roster lookup; an empty match does not prove absence from the vote
+- Optional `label_contains` selects a literal substring of the selected-language decision label, ignoring case, repeated whitespace and dash style. Use a report citation such as `A9-0179/2022` on older sittings without document relations; matching text does not establish a final vote. It combines with document and vote-item filters before paging
+- `decision` adds `decision_id` and returns one rich record with commentary (an ID absent from the sitting fails `decision_not_found`). Optional `mep_id` in `decisions` or `decision` returns separate recorded/intended positions and publication availability without a roster lookup; an empty match does not prove absence from the vote
 - `mode: "voters"` adds `position`: `favor`, `against`, `abstention`, or the `intended_*` corrections, which never replace recorded votes. `available: false` means the array was not published; a published empty array has `available: true`
 - `resolve_names: true` requires `roster_term` (0–10) and joins names from that term's roster only; unresolved IDs stay in the output
 
@@ -126,6 +127,7 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 - Default `mode: "list"` accepts `year` and `work_type`; no keyword, author, or addressee search
 - `mode: "get"` requires `question_id`: a canonical work ID, known document prefix/public URI, or human citation such as `E-000001/2025` (also P, O, and the G/K interpellation prefixes). Optional `term` resolves a citation directly; omission checks the corresponding mandate, including both candidates in election years, and requires one exact match
 - Get rejects list filters and nondefault paging. Detail returns metadata, source files, and published answer references; empty `answers` does not prove the question is unanswered
+- Question prefixes E/P/O/G/K are case-insensitive and sequences of one to six digits are padded to six: `e-3/2025` and `E-10-2025-3` resolve as `E-10-2025-000003`
 
 ## Features
 
@@ -136,18 +138,16 @@ European Parliament-specific:
 - Keyless access to Parliament's public JSON-LD records, with canonical identifiers linking discovery, detail, and source evidence
 - Shared request pacing, bounded retries, and one 40-second deadline per call covering every upstream request and queue wait
 - Shared paging on every list tool: `offset`, `limit` (default 20), and `language` (default `en`, any of the 24 EU languages). Rosters, procedure sections, memberships, decisions, and voters are acquired whole, then paged locally with a `page.snapshot` that continuation must pass back; `snapshot_changed` means restart at offset 0. Procedure listings with `process_type` are acquired whole too, and passing their snapshot back is optional
-- Each collection has its own page cap, sized from measured row bytes so a full page and its continuation fit inside the 100,000 characters Claude Code keeps of a tool result. Decision rows vary too widely for any count to bound, so a decisions page also ends at whole decisions before their rows render past 92,000 characters, with a notice, and continues from `page.next_offset`. A larger `limit` returns the cap with a notice (`EUPARL_CLAMP_LIMITS=false` rejects a `limit` above the tool's largest cap instead):
+- Whole-acquired local collections return the requested count or remaining rows without an output-size cap or character budget. Complete relation arrays are preserved. Upstream request bounds are separate from caller page sizes:
 
-  | Collection | Cap |
-  |:---|---:|
-  | Procedures, questions, MEP roster | 300 |
-  | Documents (all three sources), MEP memberships | 225 |
-  | Procedure events, participants, documents | 125 |
-  | Sittings, decisions | 100 |
-  | Speeches | 80 |
-  | Voters in one position | 1,000 |
-  | Committees, political groups, static reference topics | 350 |
-  | Organization lookups (one paced request each) | 20 |
+  | Collection | Acquisition / caller limit |
+  |:---|:---|
+  | Process-type procedures, MEP rosters, memberships, procedure sections, decisions, voters, static references | Requested count or remaining rows |
+  | Non-keyword adopted texts and speeches | Fixed aligned 100-row upstream pages; caller pages span requests within one deadline |
+  | Unfiltered procedures, questions, committee/plenary documents, keyword adopted texts and speeches, live reference bodies, sittings | 1,000 per request |
+  | Organization lookups (one paced request each) | 20 per call |
+
+  Larger bounded-mode limits normalize with a notice. `EUPARL_CLAMP_LIMITS=false` rejects limits above the largest bound only for tools whose modes are all bounded; smaller mode bounds still normalize. Very large finite limits normalize to the safe-integer range. Non-keyword adopted texts sort by document ID; speeches by sitting date and numbering. Keyword searches retain relevance order and can repeat or omit records. Past-end pages of nonempty local collections disclose the offset, exact total and restart guidance after snapshot validation.
 
 - Speech and adopted-text searches, and procedure listings without `process_type`, expose a 10,000-result window. A page reaching past it narrows to the results left, with a notice; an offset of 10,000 or more is rejected. Narrow supported filters when the window ends; a capped upstream total is disclosed as a lower bound, and `has_more` can remain true without a reachable `next_offset`
 
@@ -201,7 +201,7 @@ For Docker or a source build, see [Running the server](#running-the-server).
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<app-root>/logs` |
 | `STORAGE_PROVIDER_TYPE` | Storage backend: `in-memory`, `filesystem`, `supabase`, `cloudflare-kv/r2/d1`. | `in-memory` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
-| `EUPARL_CLAMP_LIMITS` | Clamp a `limit` above its collection's page cap with a notice; `false` rejects a `limit` above the tool's largest cap (smaller mode caps still clamp). | `true` |
+| `EUPARL_CLAMP_LIMITS` | Normalize bounded-mode limits with a notice; `false` rejects limits above a fully bounded tool's largest acquisition bound. Whole-acquired local modes have no output-size cap. | `true` |
 
 No variables are required; `EUPARL_CLAMP_LIMITS` is the one optional server-specific variable. See [`.env.example`](./.env.example) for common framework overrides.
 

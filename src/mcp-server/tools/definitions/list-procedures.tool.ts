@@ -37,7 +37,7 @@ export const listProceduresTool = tool('euparl_list_procedures', {
       process_type: optionalString().describe(
         'Optional procedure-type code from euparl_list_reference topic procedure_types; case-insensitive and whitespace-trimmed.',
       ),
-      ...pagingInputFields('procedures'),
+      ...pagingInputFields('procedures', 'local_procedures'),
       snapshot: optionalString().describe(
         'Returned page.snapshot of a process_type listing; optional at every offset, and a set that changed since fails snapshot_changed. Rejected without process_type.',
       ),

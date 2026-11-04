@@ -23,15 +23,15 @@ import { envelopeResponse } from '../../helpers/eu-parliament-fixtures.js';
 
 /** Each tool beside the largest page cap among the collections it serves. */
 const tools = [
-  [listProceduresTool, 300],
-  [listQuestionsTool, 300],
-  [searchDocumentsTool, 225],
-  [searchSpeechesTool, 80],
-  [searchMepsTool, 300],
-  [getMepTool, 225],
-  [getProcedureTool, 125],
-  [getPlenaryVotesTool, 1000],
-  [listReferenceTool, 350],
+  [listProceduresTool, undefined],
+  [listQuestionsTool, 1000],
+  [searchDocumentsTool, 10000],
+  [searchSpeechesTool, 10000],
+  [searchMepsTool, undefined],
+  [getMepTool, undefined],
+  [getProcedureTool, undefined],
+  [getPlenaryVotesTool, undefined],
+  [listReferenceTool, undefined],
 ] as const;
 
 /** Test rows named by tool, so a failing row says which tool broke. */
@@ -60,6 +60,21 @@ afterEach(() => {
 });
 
 describe('shared limit input', () => {
+  it.each([searchDocumentsTool, searchSpeechesTool])(
+    '$name keeps keyword relevance and discloses its paging uncertainty on both surfaces',
+    async (definition) => {
+      const fetcher = installToolHttp(() => envelopeResponse([]));
+      const result = await runToolContract(definition, { text: 'climate', offset: 7, limit: 37 });
+      const data = expectSuccessTwin(result);
+      expect(data.notice).toContain(
+        'Keyword searches retain upstream relevance order; pages can repeat or omit records as ordering changes.',
+      );
+      const query = new URL(String(fetcher.mock.calls[0]?.[0])).searchParams;
+      expect(query.get('offset')).toBe('7');
+      expect(query.get('limit')).toBe('37');
+      expect(query.has('sort-by')).toBe(false);
+    },
+  );
   it.each(toolRows)(
     '$name advertises a whole-number limit with no maximum by default',
     ({ definition }) => {
@@ -68,7 +83,7 @@ describe('shared limit input', () => {
         minimum: 1,
         multipleOf: 1,
         default: 20,
-        description: expect.stringContaining('a larger limit returns that many with a notice.'),
+        description: expect.stringContaining('Whole items requested; default 20.'),
       });
     },
   );
@@ -76,35 +91,26 @@ describe('shared limit input', () => {
     '$name advertises its largest cap $maximum as maximum only with EUPARL_CLAMP_LIMITS=false',
     ({ definition, maximum }) => {
       strictMode();
-      expect(advertisedLimit(definition)).toMatchObject({ type: 'number', multipleOf: 1, maximum });
+      if (maximum === undefined) expect(advertisedLimit(definition)).not.toHaveProperty('maximum');
+      else
+        expect(advertisedLimit(definition)).toMatchObject({
+          type: 'number',
+          multipleOf: 1,
+          maximum,
+        });
       vi.unstubAllEnvs();
       initServerConfig();
       expect(advertisedLimit(definition)).not.toHaveProperty('maximum');
     },
   );
-  it('states each mode-specific cap in the advertised description', () => {
-    expect(advertisedLimit(listProceduresTool).description).toBe(
-      'Whole items requested; default 20. Pages hold at most 300 procedures; a larger limit returns that many with a notice.',
-    );
-    expect(advertisedLimit(getPlenaryVotesTool).description).toBe(
-      'Whole items requested; default 20. Pages hold at most 100 sittings, 100 decisions, or 1000 voters; a larger limit returns that many with a notice.',
-    );
-    expect(advertisedLimit(listReferenceTool).description).toBe(
-      'Whole items requested; default 20. Pages hold at most 350 reference entries or 20 organization lookups; a larger limit returns that many with a notice.',
-    );
-    expect(advertisedLimit(searchSpeechesTool).description).toBe(
-      'Whole items requested; default 20. Pages hold at most 80 speeches; a larger limit returns that many with a notice.',
-    );
-    strictMode();
-    expect(advertisedLimit(listProceduresTool).description).toBe(
-      'Whole items requested; default 20, at most 300.',
-    );
-    expect(advertisedLimit(listReferenceTool).description).toBe(
-      'Whole items requested; default 20, at most 350. Pages hold at most 20 organization lookups; a larger limit returns that many with a notice.',
-    );
-    expect(advertisedLimit(getPlenaryVotesTool).description).toBe(
-      'Whole items requested; default 20, at most 1000. Pages hold at most 100 sittings or 100 decisions; a larger limit returns that many with a notice.',
-    );
+  it('distinguishes local modes from verified upstream bounds without Infinity in schemas', () => {
+    expect(advertisedLimit(listProceduresTool).description).toContain('1000 procedures');
+    expect(advertisedLimit(listProceduresTool).description).toContain('without an output-size cap');
+    expect(advertisedLimit(listReferenceTool).description).toContain('20 organization lookups');
+    expect(advertisedLimit(getPlenaryVotesTool).description).toContain('1000 sittings');
+    expect(advertisedLimit(searchSpeechesTool).description).toContain('1000 keyword speeches');
+    for (const { definition } of toolRows)
+      expect(JSON.stringify(advertisedLimit(definition))).not.toContain('Infinity');
   });
   it.each([1.5, 20.000000000000004, 0])(
     'rejects limit %d with one argument issue before HTTP',
@@ -125,46 +131,43 @@ describe('shared limit input', () => {
       expect(fetcher).not.toHaveBeenCalled();
     },
   );
-  it('accepts a limit far above the cap by default and rejects it with EUPARL_CLAMP_LIMITS=false', async () => {
-    const fetcher = installToolHttp(() => envelopeResponse([]));
-    expect(
-      expectSuccessTwin(await runToolContract(listProceduresTool, { limit: 301 })),
-    ).toMatchObject({ page: { limit: 300 } });
+  it.each([1001, 1e100])(
+    'accepts limit %s by default and rejects it in a fully bounded tool with EUPARL_CLAMP_LIMITS=false',
+    async (limit) => {
+      const fetcher = installToolHttp(() => envelopeResponse([]));
+      expect(expectSuccessTwin(await runToolContract(listQuestionsTool, { limit }))).toMatchObject({
+        page: { limit: 1000 },
+      });
+      strictMode();
+      expect(
+        expectSuccessTwin(await runToolContract(listQuestionsTool, { limit: 1000 })),
+      ).toMatchObject({ page: { limit: 1000 } });
+      const rejected = await runToolContract(listQuestionsTool, { limit });
+      expect(rejected).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: JsonRpcErrorCode.InvalidParams } },
+      });
+      expect(contractText(rejected)).toContain('Too big: expected number to be <=1000');
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    },
+  );
+  it('keeps mixed local modes open in strict mode while bounding organization work', async () => {
     strictMode();
-    expect(
-      expectSuccessTwin(await runToolContract(listProceduresTool, { limit: 300 })),
-    ).toMatchObject({ page: { limit: 300 } });
-    const rejected = await runToolContract(listProceduresTool, { limit: 301 });
-    expect(rejected).toMatchObject({
-      isError: true,
-      structuredContent: { error: { code: JsonRpcErrorCode.InvalidParams } },
-    });
-    expect(contractText(rejected)).toContain('Too big: expected number to be <=300');
-    expect(fetcher).toHaveBeenCalledTimes(2);
-  });
-  it('clamps a smaller mode cap with its notice under EUPARL_CLAMP_LIMITS=false', async () => {
-    strictMode();
-    const fetcher = installToolHttp(() =>
-      Response.json({ data: [{ id: 'eli/dl/event/MTG-PL-2025-01-15' }], meta: { total: 1 } }),
+    const fetcher = installToolHttp(() => new Response(null, { status: 404 }));
+    const staticPage = expectSuccessTwin(
+      await runToolContract(listReferenceTool, { topic: 'procedure_types', limit: 1e100 }),
     );
-    expect(
-      expectSuccessTwin(
-        await runToolContract(getPlenaryVotesTool, { mode: 'sittings', year: 2025, limit: 1000 }),
-      ),
-    ).toMatchObject({
-      page: { limit: 100 },
-      notice: 'Requested limit normalized to the effective maximum of 100 sittings.',
-    });
-    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('100');
-    const rejected = await runToolContract(getPlenaryVotesTool, {
-      mode: 'sittings',
-      year: 2025,
-      limit: 1001,
-    });
-    expect(rejected).toMatchObject({
-      isError: true,
-      structuredContent: { error: { code: JsonRpcErrorCode.InvalidParams } },
-    });
+    expect(staticPage.page).toMatchObject({ limit: Number.MAX_SAFE_INTEGER });
+    expect(staticPage.notice).toContain('9007199254740991');
+    const organizations = expectSuccessTwin(
+      await runToolContract(listReferenceTool, {
+        topic: 'organizations',
+        organization_ids: ['1'],
+        limit: 1001,
+      }),
+    );
+    expect(organizations.page).toMatchObject({ limit: 20 });
+    expect(organizations.notice).toContain('effective maximum of 20 organization lookups');
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });

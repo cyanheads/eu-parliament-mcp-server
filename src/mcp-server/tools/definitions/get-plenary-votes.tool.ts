@@ -99,12 +99,6 @@ const decisionFields = {
     ),
   source_url: z.string().describe('Public decision source URL.'),
 };
-const decisionSummarySchema = z
-  .object(decisionFields)
-  .strict()
-  .describe(
-    'Compact decision identity, label, separate document relations, vote items, published tallies and voter-array counts; use mode decision for reference text and comment.',
-  );
 /** Canonical event ID, its known prefix, or its exact public URI. */
 const eventIdPattern =
   /^(?:https:\/\/data\.europarl\.europa\.eu\/eli\/dl\/event\/|eli\/dl\/event\/)?[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -134,7 +128,7 @@ const memberPositionSchema = z
   })
   .strict()
   .describe('Membership in one independent recorded or intended set of voter arrays.');
-const decisionSchema = z
+const decisionSummarySchema = z
   .object({
     ...decisionFields,
     mep_position: z
@@ -147,6 +141,13 @@ const decisionSchema = z
       .describe(
         'Requested member lookup from the complete decision; intended corrections never replace recorded positions.',
       ),
+  })
+  .strict()
+  .describe(
+    'Compact decision identity, label, relations, tallies, voter counts and optional member positions.',
+  );
+const decisionSchema = decisionSummarySchema
+  .extend({
     reference_text: localizedTextSchema
       .optional()
       .describe('Whole published reference text in its actual selected language.'),
@@ -161,7 +162,7 @@ const decisionSchema = z
 export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
   title: 'Explore plenary sittings, decisions, and voters',
   description:
-    "Discover sittings with mode sittings and year; default decisions pages compact summaries with labels, separate decided-on, part-of and recording document relations, and vote items for sitting_id. A decisions page also ends at whole decisions before their rows render past 92000 characters, with a notice. Optional document_id filters decisions before paging by exact document identity or hyphen-boundary descendant; optional vote_item_id, such as a procedure's PLENARY_VOTE_RESULTS event, selects every decision of that vote item. Mode decision requires decision_id and returns one rich record with reference text and commentary; it rejects nondefault paging and snapshot. Optional decision-only mep_id returns independent recorded and intended positions with publication availability, without a roster lookup; empty positions do not prove absence from the vote. Mode voters requires decision_id and one position, paging recorded and intended voters independently. Missing arrays succeed with available false; published empty arrays have available true. Optional resolve_names requires explicit roster_term and joins only published names from that complete term roster, never voting-date affiliations or current-roster substitutes. Some IDs may remain unresolved. Continue local decisions or voters with page.next_offset and snapshot; restart at offset 0 without snapshot after snapshot_changed. Missing sitting decisions succeed empty; absent selected decision fails decision_not_found.",
+    "Discover sittings with mode sittings and year; default decisions pages compact summaries with labels, separate decided-on, part-of and recording document relations, and vote items for sitting_id. Decisions and voters return the requested whole-item count or remaining rows without an output-size cap. Optional decisions-only label_contains selects a literal selected-language label substring, ignoring case, repeated whitespace and dash style without altering published text or establishing a final vote. Optional document_id filters decisions before paging by exact document identity or hyphen-boundary descendant; optional vote_item_id, such as a procedure's PLENARY_VOTE_RESULTS event, selects every decision of that vote item. Mode decision requires decision_id and returns one rich record with reference text and commentary; it rejects nondefault paging and snapshot. Optional decisions or decision mep_id returns independent recorded and intended positions with publication availability, without a roster lookup; empty positions do not prove absence from the vote. Mode voters requires decision_id and one position, paging recorded and intended voters independently. Missing arrays succeed with available false; published empty arrays have available true. Optional resolve_names requires explicit roster_term and joins only published names from that complete term roster, never voting-date affiliations or current-roster substitutes. Some IDs may remain unresolved. Continue local decisions or voters with page.next_offset and snapshot; restart at offset 0 without snapshot after snapshot_changed. Missing sitting decisions succeed empty; absent selected decision fails decision_not_found.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -184,7 +185,10 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
         "Decisions-only vote item filter: canonical MTG-PL-YYYY-MM-DD-VOT-ITM- ID, eli/dl/event/ prefix or exact public event URI, such as a procedure's PLENARY_VOTE_RESULTS event or a returned vote_item_ids entry. Selects every decision of that vote item before paging; its date must match sitting_id.",
       ),
       mep_id: optionalString().describe(
-        'Decision-only member lookup: canonical numeric ID, person/ prefix or exact public person URI. Uses published arrays without a roster join; empty positions do not prove absence from the vote.',
+        'Decisions or decision member lookup: canonical numeric ID, person/ prefix or exact public person URI. Uses published arrays without a roster join; empty positions do not prove absence from the vote.',
+      ),
+      label_contains: optionalString().describe(
+        'Decisions-only literal substring of the selected-language label, ignoring case, repeated whitespace and dash style; combines with document_id and vote_item_id before paging. Matching text does not establish a final vote.',
       ),
       sitting_id: optionalString(
         z
@@ -291,7 +295,7 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
       page: pageSchema
         .optional()
         .describe(
-          'Selected sitting, compact decision, or voter-position page; absent for a rich decision. A decisions page can return fewer than limit before the end: it stops at whole decisions before their rows render past 92000 characters, and next_offset resumes at the first decision left out.',
+          'Selected sitting, compact decision, or voter-position page; absent for a rich decision. Local pages retain the requested count or remaining rows without a character budget; next_offset resumes at the first item left out.',
         ),
       voter_resolution: z
         .object({

@@ -346,6 +346,7 @@ export function normalizeDecisionSummary(
   raw: RawDecision,
   language = 'en',
   notices: string[] = [],
+  mepId?: string,
 ) {
   return {
     decision_id: activityId(raw),
@@ -368,6 +369,12 @@ export function normalizeDecisionSummary(
       return voters === undefined ? [] : [{ position, count: voters.length }];
     }),
     source_url: sourceUrl(raw.id),
+    ...(mepId !== undefined && {
+      mep_position: {
+        recorded: memberPositions(raw, mepId, false),
+        intended: memberPositions(raw, mepId, true),
+      },
+    }),
   };
 }
 /** Compact decision row. */
@@ -379,38 +386,32 @@ export function normalizeDecision(
   notices: string[],
   mepId?: string,
 ) {
-  const memberPositions = (memberId: string, intended: boolean) => {
-    const positions = ['favor', 'against', 'abstention'] as const;
-    const published = positions.map((position) => ({
-      position,
-      voters: decisionVoters(raw, intended ? `intended_${position}` : position),
-    }));
-    const unavailable_positions = published
-      .filter(({ voters }) => voters === undefined)
-      .map(({ position }) => position);
-    return {
-      positions: published
-        .filter(({ voters }) => voters?.includes(memberId))
-        .map(({ position }) => position),
-      unavailable_positions,
-      availability:
-        unavailable_positions.length === 0
-          ? ('published' as const)
-          : unavailable_positions.length === 3
-            ? ('unavailable' as const)
-            : ('partial' as const),
-    };
-  };
   return {
-    ...normalizeDecisionSummary(raw, language, notices),
+    ...normalizeDecisionSummary(raw, language, notices, mepId),
     ...field('reference_text', localized(raw.referenceText, language, notices)),
     ...field('comment', localized(raw.comment, language, notices)),
-    ...(mepId !== undefined && {
-      mep_position: {
-        recorded: memberPositions(mepId, false),
-        intended: memberPositions(mepId, true),
-      },
-    }),
+  };
+}
+function memberPositions(raw: RawDecision, memberId: string, intended: boolean) {
+  const positions = ['favor', 'against', 'abstention'] as const;
+  const published = positions.map((position) => ({
+    position,
+    voters: decisionVoters(raw, intended ? `intended_${position}` : position),
+  }));
+  const unavailable_positions = published
+    .filter(({ voters }) => voters === undefined)
+    .map(({ position }) => position);
+  return {
+    positions: published
+      .filter(({ voters }) => voters?.includes(memberId))
+      .map(({ position }) => position),
+    unavailable_positions,
+    availability:
+      unavailable_positions.length === 0
+        ? ('published' as const)
+        : unavailable_positions.length === 3
+          ? ('unavailable' as const)
+          : ('partial' as const),
   };
 }
 /** Strict all-token matching after Unicode decomposition. */
@@ -421,33 +422,24 @@ export function normalizeName(value: string): string {
     .replace(/\p{M}/gu, '')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ');
 }
-/**
- * Characters of rendered rows one page may spend. Claude Code's default output budget truncates a
- * result at 100,000 characters, and `page` renders after the items, so a longer page loses its
- * `next_offset`; the other 8,000 hold the header, page block, notices and filter echo, measured
- * at 1,400–2,400 on capped collections and 400–700 on budgeted decisions pages.
- */
-export const pageRowBudgetChars = 92_000;
-/**
- * Whole-item page cap per collection, at most `pageRowBudgetChars` divided by the heaviest
- * measured `content[]` row (the larger surface), rounded down to a multiple of 25 (of 5 below
- * 100). Voters and sittings sit below that bound. No count bounds decisions (a typical row renders
- * about 1,500 characters and one can carry hundreds of document IDs), so their pages also stop at
- * the row budget. Organizations stop at 20 because each ID is one paced request inside the
- * 40-second deadline.
- */
+/** Acquisition bounds; MAX_SAFE_INTEGER is only the representable local page position bound. */
 export const pageCaps = {
-  procedures: { maximum: 300, noun: 'procedures' },
-  questions: { maximum: 300, noun: 'questions' },
-  documents: { maximum: 225, noun: 'documents' },
-  speeches: { maximum: 80, noun: 'speeches' },
-  meps: { maximum: 300, noun: 'MEPs' },
-  memberships: { maximum: 225, noun: 'memberships' },
-  procedure_sections: { maximum: 125, noun: 'procedure section entries' },
-  voters: { maximum: 1000, noun: 'voters' },
-  sittings: { maximum: 100, noun: 'sittings' },
-  decisions: { maximum: 100, noun: 'decisions' },
-  reference: { maximum: 350, noun: 'reference entries' },
+  procedures: { maximum: 1000, noun: 'procedures' },
+  local_procedures: { maximum: Number.MAX_SAFE_INTEGER, noun: 'process_type procedures' },
+  questions: { maximum: 1000, noun: 'questions' },
+  documents: { maximum: 1000, noun: 'documents' },
+  adopted_documents: { maximum: 10_000, noun: 'adopted texts' },
+  keyword_documents: { maximum: 1000, noun: 'keyword adopted texts' },
+  speeches: { maximum: 10_000, noun: 'speeches' },
+  keyword_speeches: { maximum: 1000, noun: 'keyword speeches' },
+  meps: { maximum: Number.MAX_SAFE_INTEGER, noun: 'MEPs' },
+  memberships: { maximum: Number.MAX_SAFE_INTEGER, noun: 'memberships' },
+  procedure_sections: { maximum: Number.MAX_SAFE_INTEGER, noun: 'procedure section entries' },
+  voters: { maximum: Number.MAX_SAFE_INTEGER, noun: 'voters' },
+  sittings: { maximum: 1000, noun: 'sittings' },
+  decisions: { maximum: Number.MAX_SAFE_INTEGER, noun: 'decisions' },
+  reference: { maximum: 1000, noun: 'reference entries' },
+  static_reference: { maximum: Number.MAX_SAFE_INTEGER, noun: 'static reference entries' },
   organizations: { maximum: 20, noun: 'organization lookups' },
 } as const;
 /** A paged collection with its own cap. */
@@ -481,15 +473,12 @@ export function pageWindow(
 /**
  * Local snapshots include normalized scope and every returned field before slicing. A supplied
  * snapshot must match; whether continuation requires one is the caller's contract, checked before
- * the collection is acquired. With `rowChars` (the characters an item renders at its page index),
- * the page also ends at the last whole item that keeps its rows within `pageRowBudgetChars`,
- * always keeping the first so continuation progresses; `page.limit` stays the window's limit.
+ * the collection is acquired. Every requested item is retained regardless of rendered size.
  */
 export function localPage<T>(
   items: T[],
   input: PageWindow,
   scope: unknown,
-  rowChars?: (item: T, index: number) => number,
 ): { items: T[]; page: Page; total: number } {
   const { offset, limit } = input;
   const snapshot = createHash('sha256').update(JSON.stringify({ scope, items })).digest('hex');
@@ -497,19 +486,7 @@ export function localPage<T>(
     throw conflict('The complete collection changed. Restart at offset 0 without snapshot.', {
       reason: 'snapshot_changed',
     });
-  const window = items.slice(offset, offset + limit);
-  let fitting = window.length;
-  if (rowChars) {
-    let used = 0;
-    for (const [index, item] of window.entries()) {
-      used += rowChars(item, index);
-      if (index > 0 && used > pageRowBudgetChars) {
-        fitting = index;
-        break;
-      }
-    }
-  }
-  const selected = window.slice(0, fitting);
+  const selected = items.slice(offset, offset + limit);
   return {
     items: selected,
     total: items.length,

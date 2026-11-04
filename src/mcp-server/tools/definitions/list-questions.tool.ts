@@ -96,7 +96,7 @@ export const listQuestionsTool = tool('euparl_list_questions', {
         'List-only question code from euparl_list_reference topic question_types; case-insensitive and whitespace-trimmed.',
       ),
       question_id: optionalString().describe(
-        'Get-only canonical E-{term}-{year}-{six-digit-sequence}, known document prefix/public URI, or human E-NNNNNN/YYYY citation; P, O, G and K prefixes are accepted the same way.',
+        'Get-only canonical E-{term}-{year}-{sequence}, known document prefix/public URI, or human E-sequence/YYYY citation; E/P/O/G/K prefixes are case-insensitive and one-to-six-digit sequences are padded to six.',
       ),
       term: z
         .number()

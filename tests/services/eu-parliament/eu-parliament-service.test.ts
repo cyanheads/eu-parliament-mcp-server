@@ -29,6 +29,131 @@ const makeService = (fetcher: typeof fetch, now?: () => number) =>
 const questionRow = (id: string) => ({ id: `eli/dl/doc/${id}`, identifier: id });
 
 describe('Parliament domain workflows', () => {
+  it.each(['documents', 'speeches'] as const)(
+    'walks 500 %s once with changing caller limits and fixed sorted geometry',
+    async (family) => {
+      const queries: URLSearchParams[] = [];
+      const service = makeService(async (url) => {
+        const query = new URL(String(url)).searchParams;
+        queries.push(query);
+        const offset = Number(query.get('offset'));
+        const limit = Number(query.get('limit'));
+        const prefix = family === 'speeches' ? 'eli/dl/event/' : 'eli/dl/doc/';
+        return Response.json({
+          data: Array.from({ length: Math.max(0, Math.min(limit, 500 - offset)) }, (_, i) => ({
+            id: `${prefix}ID-${offset + i}`,
+          })),
+          meta: { total: 500 },
+        });
+      });
+      const walk = async (limits: number[]) => {
+        const seen: string[] = [];
+        let offset = 0;
+        for (let index = 0; offset < 500; index++) {
+          const input = { offset, limit: limits[index % limits.length]! };
+          const result =
+            family === 'speeches'
+              ? await service.searchSpeeches(input, context())
+              : await service.searchDocuments(input, context());
+          if (result.data.mode !== 'search') throw new Error('Expected search');
+          seen.push(
+            ...result.data.items.map((row) =>
+              'speech_id' in row ? row.speech_id : row.document_id,
+            ),
+          );
+          if (!result.data.page.has_more) break;
+          offset = result.data.page.next_offset!;
+        }
+        return seen;
+      };
+      const expected = Array.from({ length: 500 }, (_, i) => `ID-${i}`);
+      expect(await walk([100])).toEqual(expected);
+      expect(await walk([37, 63, 201, 19, 180])).toEqual(expected);
+      expect(queries.length).toBeGreaterThan(10);
+      for (const query of queries) {
+        expect(query.get('limit')).toBe('100');
+        expect(Number(query.get('offset')) % 100).toBe(0);
+        expect(query.get('sort-by')).toBe(
+          family === 'speeches' ? 'sitting-date:asc,numbering:asc' : 'doc-id:asc',
+        );
+      }
+    },
+  );
+  it('keeps the original operation deadline across aligned pages and returns no partial success', async () => {
+    let now = 0;
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => {
+      now += 20000;
+      return envelopeResponse(
+        Array.from({ length: 100 }, (_, i) => ({ id: `eli/dl/event/S-${i}` })),
+      );
+    });
+    await expect(
+      makeService(fetcher, () => now).searchSpeeches({ limit: 1000 }, context()),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.Timeout });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+  it('slices sorted fixed upstream speech pages across boundaries independently of caller geometry', async () => {
+    const calls: { offset: number; limit: number; sort: string | null }[] = [];
+    const service = makeService(async (url) => {
+      const query = new URL(String(url)).searchParams;
+      const offset = Number(query.get('offset'));
+      const limit = Number(query.get('limit'));
+      calls.push({ offset, limit, sort: query.get('sort-by') });
+      return Response.json({
+        data: Array.from({ length: Math.min(limit, 250 - offset) }, (_, i) => ({
+          id: `eli/dl/event/S-${offset + i}`,
+        })),
+        meta: { total: 250 },
+      });
+    });
+    const page = await service.searchSpeeches({ offset: 97, limit: 110 }, context());
+    if (page.data.mode !== 'search') throw new Error('Expected search');
+    expect(page.data.items.map((row) => row.speech_id)).toEqual(
+      Array.from({ length: 110 }, (_, i) => `S-${97 + i}`),
+    );
+    expect(calls).toEqual(
+      [0, 100, 200].map((offset) => ({
+        offset,
+        limit: 100,
+        sort: 'sitting-date:asc,numbering:asc',
+      })),
+    );
+    expect(page.data.page).toMatchObject({
+      offset: 97,
+      limit: 110,
+      returned: 110,
+      next_offset: 207,
+    });
+  });
+  it('explains local past-end pages with exact totals after validating the snapshot', async () => {
+    const service = makeService(async () => envelopeResponse([{ id: 'eli/dl/proc/2025-0001' }]));
+    const page = await service.listProcedures({ process_type: 'INL', offset: 1 }, context());
+    expect(page.enrichment.notice).toBe(
+      'The offset 1 is at or beyond the complete collection of 1 items. Restart at offset 0 or return to the previous page.',
+    );
+    await expect(
+      service.listProcedures({ process_type: 'INL', offset: 1, snapshot: 'stale' }, context()),
+    ).rejects.toMatchObject({ data: { reason: 'snapshot_changed' } });
+  });
+  it('honors a large local decision page with complete relation arrays', async () => {
+    const ids = Array.from({ length: 500 }, (_, i) => `eli/dl/doc/D-${i}`);
+    const service = makeService(async () =>
+      envelopeResponse(
+        Array.from({ length: 105 }, (_, i) => ({
+          id: `eli/dl/event/D-${i}`,
+          decided_on_a_realization_of: ids,
+        })),
+      ),
+    );
+    const response = await service.getPlenaryVotes(
+      { sitting_id: '2025-01-15', limit: 1000 },
+      context(),
+    );
+    if (response.data.mode !== 'decisions') throw new Error('Expected decisions');
+    expect(response.data.decisions).toHaveLength(105);
+    expect(response.data.decisions?.at(-1)?.document_ids).toHaveLength(500);
+    expect(response.data.page).toMatchObject({ limit: 1000, returned: 105, has_more: false });
+  });
   it.each([1, 20])(
     'paces exactly %i selected organization GETs without hidden enrichment calls',
     async (count) => {
@@ -97,7 +222,7 @@ describe('Parliament domain workflows', () => {
       { sitting_id: '2025-01-15', document_id: 'eli/dl/doc/A-1', limit: 1000 },
       context(),
     );
-    expect(result.data).toMatchObject({ page: { returned: 100, limit: 100, next_offset: 100 } });
+    expect(result.data).toMatchObject({ page: { returned: 101, limit: 1000, has_more: false } });
     expect(result.enrichment).toMatchObject({
       totalCount: 101,
       appliedFilters: { document_id: 'A-1' },
@@ -120,11 +245,11 @@ describe('Parliament domain workflows', () => {
       { offset: 9900, limit: 1000 },
       context(),
     );
-    expect(result.data).toMatchObject({ page: { limit: 80 } });
+    expect(result.data).toMatchObject({ page: { limit: 100 } });
     expect(result.enrichment.notice).toContain(
-      'Requested limit normalized to the effective maximum of 80 speeches.',
+      'Requested limit normalized to 100: offset plus limit cannot pass the 10000-result search window.',
     );
-    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('80');
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('100');
   });
   it('preserves deep question paging without imposing a search window', async () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => envelopeResponse([]));
@@ -184,13 +309,15 @@ describe('Parliament domain workflows', () => {
         `Requested limit normalized to ${effective}: offset plus limit cannot pass the 10000-result search window.`,
       );
       const url = new URL(String(fetcher.mock.calls[0]?.[0]));
-      expect(url.searchParams.get('offset')).toBe(String(offset));
-      expect(url.searchParams.get('limit')).toBe(String(effective));
+      expect(url.searchParams.get('offset')).toBe(
+        String(source === 'procedures' ? offset : Math.floor(offset / 100) * 100),
+      );
+      expect(url.searchParams.get('limit')).toBe(String(source === 'procedures' ? effective : 100));
     },
   );
   describe('listProcedures with process_type', () => {
     const procedureRows = (ids: string[]) => ids.map((id) => ({ id: `eli/dl/proc/${id}` }));
-    it('gives the bulk read the operation deadline while an unfiltered page keeps the 15-second attempt bound', async () => {
+    it('lets both bulk and unfiltered reads complete after 15 seconds within the operation deadline', async () => {
       vi.useFakeTimers();
       vi.setSystemTime(0);
       onTestFinished(() => {
@@ -234,8 +361,8 @@ describe('Parliament domain workflows', () => {
       expect(starts).toEqual([0]);
       const unfiltered = service.listProcedures({}, context()).catch((caught: unknown) => caught);
       await vi.advanceTimersByTimeAsync(40_000);
-      expect(await unfiltered).toMatchObject({ message: expect.stringMatching(/deadline/) });
-      expect(starts.slice(1).map((start) => start - 40_000)).toEqual([0, 15_000, 30_000]);
+      expect(await unfiltered).toMatchObject({ data: { items: [{ procedure_id: '2025-0001' }] } });
+      expect(starts.slice(1).map((start) => start - 40_000)).toEqual([0]);
     });
     it('acquires the set in one offset-0 request and pages it locally in procedure_id order', async () => {
       const fetcher = vi.fn<typeof fetch>().mockImplementation(async () =>
@@ -425,12 +552,12 @@ describe('Parliament domain workflows', () => {
     const service = new FreshService({ fetch: fetcher, wait: async () => {} });
     await service.listProcedures({ limit: 5000 }, context());
     await service.listProcedures({ offset: 9950, limit: 200 }, context());
-    await service.listQuestions({ limit: 301 }, context());
+    await service.listQuestions({ limit: 1001 }, context());
     await service.listQuestions({ limit: 300 }, context());
     const clampLogs = info.mock.calls.filter(([message]) => message.startsWith('Limit clamped'));
     expect(clampLogs.map(([message]) => message)).toEqual([
-      'Limit clamped on procedures: requested 5000, effective 300; later clamps on this collection are counted, not logged.',
-      'Limit clamped on questions: requested 301, effective 300; later clamps on this collection are counted, not logged.',
+      'Limit clamped on procedures: requested 5000, effective 1000; later clamps on this collection are counted, not logged.',
+      'Limit clamped on questions: requested 1001, effective 1000; later clamps on this collection are counted, not logged.',
     ]);
     expect(telemetry.createCounter).toHaveBeenCalledWith(
       'euparl.limit.clamps',
@@ -447,12 +574,15 @@ describe('Parliament domain workflows', () => {
   it.each([10000, undefined])(
     'retains uncertainty at the speech window with total %s',
     async (total) => {
-      const fetcher = vi
-        .fn<typeof fetch>()
-        .mockImplementation(
-          async () =>
-            new Response(JSON.stringify({ data: [{ id: 'eli/dl/event/LAST' }], meta: { total } })),
-        );
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({
+              data: Array.from({ length: 100 }, (_, i) => ({ id: `eli/dl/event/LAST-${i}` })),
+              meta: { total },
+            }),
+          ),
+      );
       const result = await makeService(fetcher).searchSpeeches(
         { offset: 9999, limit: 1 },
         context(),
@@ -479,14 +609,15 @@ describe('Parliament domain workflows', () => {
     },
   );
   it('preserves exact lower speech totals and their terminal page', async () => {
-    const fetcher = vi
-      .fn<typeof fetch>()
-      .mockImplementation(
-        async () =>
-          new Response(
-            JSON.stringify({ data: [{ id: 'eli/dl/event/LAST' }], meta: { total: 5558 } }),
-          ),
-      );
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            data: Array.from({ length: 58 }, (_, i) => ({ id: `eli/dl/event/LAST-${i}` })),
+            meta: { total: 5558 },
+          }),
+        ),
+    );
     const result = await makeService(fetcher).searchSpeeches({ offset: 5557, limit: 1 }, context());
     expect(result.enrichment.totalCount).toBe(5558);
     expect(result.data).toMatchObject({ page: { has_more: false } });
@@ -1005,7 +1136,7 @@ describe('Parliament domain workflows', () => {
     );
 
     it.each([
-      ['its 15-second attempt bound', 0, 700, 15_700],
+      ['the shared deadline after an immediate generic response', 0, 700, 40_000],
       ['the shared 40-second deadline', 39_990, 39_990, 40_000],
     ] as const)(
       'cuts a stalled family read at %s in one attempt and answers from the generic record',
@@ -1019,8 +1150,9 @@ describe('Parliament domain workflows', () => {
         const familyAborts: number[] = [];
         const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
           if (new URL(String(input)).pathname.startsWith('/api/v2/documents/')) {
-            // The generic read lands this late in the operation; moving the clock fires no timer.
-            vi.setSystemTime(genericAnsweredAt);
+            // Advance the operation timer along with the clock before the family request starts.
+            if (genericAnsweredAt)
+              await new Promise<void>((resolve) => setTimeout(resolve, genericAnsweredAt));
             return envelopeResponse([generic('TA-9-2024-0138', 'TEXT_ADOPTED')]);
           }
           familyStarts.push(Date.now());

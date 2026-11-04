@@ -17,8 +17,6 @@ const invalidHint =
 const rejectedHint =
   'Call euparl_list_reference for supported filters and identifiers, then retry with a narrower supported request.';
 const rateHint = 'Wait for the reported retry interval, then repeat the same euparl tool call.';
-const modeHint =
-  'Choose organizations with organization_ids, or omit organization_ids for another reference topic.';
 const body = {
   id: 'org/5144',
   identifier: '5144',
@@ -281,16 +279,28 @@ describe('euparl_list_reference contract', () => {
     expect(contractText(response)).toContain('organization');
   });
   it.each([
-    { topic: 'organizations' as const },
-    { topic: 'organizations' as const, organization_ids: [] },
-    { topic: 'coverage' as const, organization_ids: ['5144'] },
-    { topic: 'coverage' as const, organization_ids: [] },
-  ])('rejects incompatible organization fields before HTTP %j', async (input) => {
+    [
+      { topic: 'organizations' as const },
+      'Supply a nonempty organization_ids list for topic organizations.',
+    ],
+    [
+      { topic: 'organizations' as const, organization_ids: [] },
+      'Supply a nonempty organization_ids list for topic organizations.',
+    ],
+    [
+      { topic: 'coverage' as const, organization_ids: ['5144'] },
+      'Remove organization_ids, or use topic organizations to resolve those identifiers.',
+    ],
+    [
+      { topic: 'coverage' as const, organization_ids: [] },
+      'Remove organization_ids, or use topic organizations to resolve those identifiers.',
+    ],
+  ])('rejects incompatible organization fields before HTTP %j', async (input, hint) => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
     expectErrorTwin(
       await runToolContract(listReferenceTool, input),
       'invalid_mode_fields',
-      modeHint,
+      hint,
       JsonRpcErrorCode.ValidationError,
     );
     expect(fetcher).not.toHaveBeenCalled();
@@ -496,19 +506,23 @@ describe('euparl_list_reference contract', () => {
       expectSuccessTwin(
         await runToolContract(listReferenceTool, { topic: 'procedure_types', offset: 1000 }),
       ),
-    ).toMatchObject({ items: [], page: { returned: 0, has_more: false } });
+    ).toMatchObject({
+      items: [],
+      page: { returned: 0, has_more: false },
+      notice: `The offset 1000 is at or beyond the complete collection of ${first.totalCount} items. Restart at offset 0 or return to the previous page.`,
+    });
   });
 
   it('discloses the effective cap and preserves empty live-list guidance', async () => {
     const fetcher = installToolHttp(() => new Response(null, { status: 204 }));
     const data = expectSuccessTwin(
-      await runToolContract(listReferenceTool, { topic: 'political_groups', limit: 1000 }),
+      await runToolContract(listReferenceTool, { topic: 'political_groups', limit: 1001 }),
     );
-    expect(data).toMatchObject({ items: [], page: { limit: 350, returned: 0, has_more: false } });
+    expect(data).toMatchObject({ items: [], page: { limit: 1000, returned: 0, has_more: false } });
     expect(data.notice).toBe(
-      'Requested limit normalized to the effective maximum of 350 reference entries. No reference entries matched. Call euparl_list_reference with topic identifiers to inspect accepted identifiers.',
+      'Requested limit normalized to the effective maximum of 1000 reference entries. No reference entries matched. Call euparl_list_reference with topic identifiers to inspect accepted identifiers.',
     );
-    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('350');
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('1000');
   });
 
   it('reports an empty live-list page past offset 0 without claiming nothing matched', async () => {
@@ -527,7 +541,7 @@ describe('euparl_list_reference contract', () => {
 
   it('fills a capped live page from more upstream rows than the cap and continues past it', async () => {
     // One row more than the cap, sliced by the requested window as the upstream does.
-    const pool = Array.from({ length: 351 }, (_, i) => ({
+    const pool = Array.from({ length: 1001 }, (_, i) => ({
       ...body,
       id: `org/${i}`,
       identifier: `C${i}`,
@@ -537,23 +551,23 @@ describe('euparl_list_reference contract', () => {
       return envelopeResponse(pool.slice(offset, offset + Number(url.searchParams.get('limit'))));
     });
     const first = expectSuccessTwin(
-      await runToolContract(listReferenceTool, { topic: 'committees', limit: 1000 }),
+      await runToolContract(listReferenceTool, { topic: 'committees', limit: 1001 }),
     );
     expect(first).toMatchObject({
-      page: { limit: 350, returned: 350, has_more: true, next_offset: 350 },
+      page: { limit: 1000, returned: 1000, has_more: true, next_offset: 1000 },
       truncated: true,
-      shown: 350,
-      cap: 350,
+      shown: 1000,
+      cap: 1000,
     });
     expect(first.notice).toBe(
-      'Requested limit normalized to the effective maximum of 350 reference entries. Continue with offset 350.',
+      'Requested limit normalized to the effective maximum of 1000 reference entries. Continue with offset 1000.',
     );
-    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('350');
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('1000');
     expect(
       expectSuccessTwin(
-        await runToolContract(listReferenceTool, { topic: 'committees', offset: 350 }),
+        await runToolContract(listReferenceTool, { topic: 'committees', offset: 1000 }),
       ),
-    ).toMatchObject({ items: [{ code: 'C350' }], page: { returned: 1, has_more: false } });
+    ).toMatchObject({ items: [{ code: 'C1000' }], page: { returned: 1, has_more: false } });
   });
 
   it('rejects unsupported language with declared recovery before network', async () => {

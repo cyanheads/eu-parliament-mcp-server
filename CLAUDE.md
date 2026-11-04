@@ -50,6 +50,8 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 `src/services/eu-parliament/eu-parliament-service.ts` owns domain operations. The client validates fixed-origin JSON-LD responses before normalization. Tests inject fetch at that network boundary; production initializes the service in `src/index.ts`.
 
+Every upstream headers/body read shares the remaining 40-second operation deadline. GET retries allow three attempts; best-effort document-family enrichment uses one attempt. There is no separate per-attempt timeout.
+
 ### Server identity and configuration
 
 `src/index.ts` registers nine tools and no resource or prompt definitions; `createApp({ skills: 'skills' })` serves the published `skills/eu-parliament-guide` as `skill://eu-parliament-guide/SKILL.md`. Keep that skill in step when identifier chains, gates, or coverage change. Both `createApp()` name and title are `eu-parliament-mcp-server`; the package description comes from `package.json`. The install name is `@cyanheads/eu-parliament-mcp-server` and registry identity is `io.github.cyanheads/eu-parliament-mcp-server`.
@@ -135,7 +137,7 @@ src/
     eu-parliament-schemas.ts         # Upstream JSON-LD edge schemas
     eu-parliament-normalization.ts   # IDs, localization and paging
     eu-parliament-reference.ts       # Supported filter codes and reference topics
-    eu-parliament-rendering.ts       # Field-path content[] text; sizes budgeted page rows
+    eu-parliament-rendering.ts       # Lossless field-path content[] text
     eu-parliament-service.ts         # Domain workflows and service initialization
   mcp-server/tools/
     definitions/                    # Nine *.tool.ts definitions

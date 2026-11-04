@@ -18,8 +18,6 @@ const rejectedHint =
 const rateHint = 'Wait for the reported retry interval, then repeat the same euparl tool call.';
 const windowHint =
   'Narrow process_type to retrieve a smaller procedure set. Restart paging at offset 0 after narrowing.';
-const modeHint =
-  'Remove snapshot, or repeat the call with the process_type of the listing that returned it.';
 const snapshotHint =
   'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.';
 const stalledHint =
@@ -70,34 +68,22 @@ describe('euparl_list_procedures contract', () => {
       'The 10000-result search window is exhausted; further matches cannot be ruled out. Narrow process_type to retrieve a smaller procedure set.',
     );
   });
-  it('returns a full 300-row process_type page with the cap notice on both surfaces for limit 5000', async () => {
-    const ids = Array.from({ length: 400 }, (_, index) => `2025-${String(index).padStart(4, '0')}`);
+  it('honors a large process_type page on both surfaces without an output cap', async () => {
+    const ids = Array.from({ length: 400 }, (_, i) => `2025-${String(i).padStart(4, '0')}`);
     const fetcher = installToolHttp(() =>
       Response.json({
         data: ids.toReversed().map((id) => ({ id: `eli/dl/proc/${id}` })),
-        meta: { total: ids.length },
+        meta: { total: 400 },
       }),
     );
     const result = await runToolContract(listProceduresTool, { process_type: 'COD', limit: 5000 });
     const data = expectSuccessTwin(result);
-    expect(data.items).toEqual(
-      ids.slice(0, 300).map((id) => ({
-        procedure_id: id,
-        source_url: `https://data.europarl.europa.eu/eli/dl/proc/${id}`,
-      })),
-    );
+    expect((data.items as { procedure_id: string }[]).map((row) => row.procedure_id)).toEqual(ids);
     expect(data).toMatchObject({
-      page: { offset: 0, limit: 300, returned: 300, has_more: true, next_offset: 300 },
-      cap: 300,
-      shown: 300,
+      page: { offset: 0, limit: 5000, returned: 400, has_more: false },
       totalCount: 400,
     });
-    expect(data.notice).toContain(
-      'Requested limit normalized to the effective maximum of 300 procedures.',
-    );
-    expect(contractText(result)).toContain(
-      'Requested limit normalized to the effective maximum of 300 procedures.',
-    );
+    expect(data).not.toHaveProperty('notice');
     expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('limit')).toBe('10000');
   });
   it.each([
@@ -160,13 +146,11 @@ describe('euparl_list_procedures contract', () => {
           source_url: 'https://data.europarl.europa.eu/eli/dl/proc/2025-9002',
         },
       ],
-      page: { limit: 300, returned: 2, has_more: false, snapshot: expect.any(String) },
+      page: { limit: 1000, returned: 2, has_more: false, snapshot: expect.any(String) },
       appliedFilters: { process_type: 'COD' },
       totalCount: 2,
     });
-    expect(data.notice).toBe(
-      'Requested limit normalized to the effective maximum of 300 procedures.',
-    );
+    expect(data).not.toHaveProperty('notice');
     const url = new URL(String(fetcher.mock.calls[0]?.[0]));
     expect(url.searchParams.get('process-type')).toBe('COD');
     expect(url.searchParams.get('limit')).toBe('10000');
@@ -363,7 +347,7 @@ describe('euparl_list_procedures contract', () => {
         expectErrorTwin(
           await runToolContract(listProceduresTool, { ...filter, snapshot: 'a'.repeat(64) }),
           'invalid_mode_fields',
-          modeHint,
+          'Remove snapshot, or repeat the call with the process_type of the listing that returned it.',
           JsonRpcErrorCode.ValidationError,
         );
         expect(fetcher).not.toHaveBeenCalled();
@@ -399,7 +383,9 @@ describe('euparl_list_procedures contract', () => {
           totalCount: rows.length,
         });
         expect(data.page).toHaveProperty('snapshot');
-        expect(data).not.toHaveProperty('notice');
+        expect(data.notice).toBe(
+          `The offset ${offset} is at or beyond the complete collection of ${rows.length} items. Restart at offset 0 or return to the previous page.`,
+        );
         expect(fetcher).toHaveBeenCalledTimes(1);
       },
     );

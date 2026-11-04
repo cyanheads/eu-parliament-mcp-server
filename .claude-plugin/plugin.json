@@ -16,7 +16,7 @@
     "EUPARL_CLAMP_LIMITS": {
       "type": "string",
       "title": "Clamp limit inputs",
-      "description": "Clamp a limit above its collection's page cap to that cap with a notice (default when blank). Set false to reject a limit above the tool's largest cap instead.",
+      "description": "Normalize bounded-mode limits with a notice (default when blank). False rejects limits above a fully bounded tool's largest acquisition bound. Whole-acquired local modes have no output-size cap.",
       "default": ""
     }
   },

@@ -35,7 +35,15 @@ export function contractText(result: WireResult): string {
 export function expectSuccessTwin(result: WireResult): Record<string, unknown> {
   expect(result.isError).not.toBe(true);
   const structured = z.record(z.string(), z.unknown()).parse(result.structuredContent);
+  const localPage = z
+    .object({ returned: z.literal(0), offset: z.number(), snapshot: z.string() })
+    .safeParse(structured.page);
+  if (localPage.success && typeof structured.totalCount === 'number' && structured.totalCount > 0)
+    expect(structured.notice).toContain(
+      `The offset ${localPage.data.offset} is at or beyond the complete collection of ${structured.totalCount} items. Restart at offset 0 or return to the previous page.`,
+    );
   const text = contractText(result);
+  const lines = new Map(text.split('\n').map((line) => [line.slice(0, line.indexOf(': ')), line]));
   const enrichment = new Set([
     'appliedFilters',
     'notice',
@@ -58,7 +66,7 @@ export function expectSuccessTwin(result: WireResult): Record<string, unknown> {
         visit(item, `${path}.${key}`);
       });
     } else if (typeof value === 'string') {
-      const line = text.split('\n').find((item) => item.startsWith(`${path}: `));
+      const line = lines.get(path);
       expect(line, path).toBeDefined();
       const code = /(`+) (".*") \1/.exec(line!);
       expect(code, path).not.toBeNull();
@@ -99,6 +107,6 @@ export function expectErrorTwin(
   if (code !== undefined) expect(parsed.error.code).toBe(code);
   const text = contractText(result);
   expect(text).toContain(parsed.error.message);
-  expect(text).toContain(`Recovery: ${hint}`);
+  expect(text).toContain(hint);
   expect(text).toContain(`reason ${reason}`);
 }

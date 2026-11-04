@@ -14,8 +14,6 @@ import { envelopeResponse } from '../helpers/eu-parliament-fixtures.js';
 
 const invalidHint =
   'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
-const modeHint =
-  'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.';
 const snapshotHint =
   'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.';
 const rejectedHint =
@@ -337,7 +335,7 @@ describe('euparl_get_procedure contract', () => {
     },
   );
 
-  it('caps whole events and retains cap notice alongside snapshot continuation', async () => {
+  it('pages whole events alongside snapshot continuation', async () => {
     const events = Array.from({ length: 126 }, (_, index) => ({
       id: `eli/dl/event/EXAMPLE-${index}`,
     }));
@@ -346,7 +344,7 @@ describe('euparl_get_procedure contract', () => {
       await runToolContract(getProcedureTool, {
         procedure_id: '2025-9001',
         section: 'events',
-        limit: 1000,
+        limit: 125,
       }),
     );
     expect(data.events).toHaveLength(125);
@@ -356,9 +354,7 @@ describe('euparl_get_procedure contract', () => {
       cap: 125,
       shown: 125,
     });
-    expect(data.notice).toBe(
-      'Requested limit normalized to the effective maximum of 125 procedure section entries. Continue with offset 125 and the returned snapshot.',
-    );
+    expect(data.notice).toBe('Continue with offset 125 and the returned snapshot.');
   });
 
   it.each(['events', 'participants', 'documents'] as const)(
@@ -426,14 +422,20 @@ describe('euparl_get_procedure contract', () => {
   });
 
   it.each([
-    { section: 'overview' as const, offset: 1 },
-    { section: 'events' as const, offset: 1 },
-  ])('rejects incompatible continuation %j before HTTP', async (input) => {
+    [
+      { section: 'overview' as const, offset: 1 },
+      'Use offset 0 for overview, or select events, participants or documents for continuation.',
+    ],
+    [
+      { section: 'events' as const, offset: 1 },
+      'Pass the previous page.snapshot with the same filters, or restart at offset 0 without snapshot.',
+    ],
+  ])('rejects incompatible continuation %j before HTTP', async (input, hint) => {
     const fetcher = installToolHttp(() => envelopeResponse([procedure]));
     expectErrorTwin(
       await runToolContract(getProcedureTool, { procedure_id: '2025-9001', ...input }),
       'invalid_mode_fields',
-      modeHint,
+      hint,
       JsonRpcErrorCode.ValidationError,
     );
     expect(fetcher).not.toHaveBeenCalled();
