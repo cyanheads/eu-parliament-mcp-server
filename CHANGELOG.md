@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-11-03
+
+Non-keyword adopted-text and speech walks return each record once at any page size; local collections and decisions pages return the requested count; decisions gain per-decision member positions and label filtering; slow upstream reads no longer fail at 15 s; question citations normalize.
+
 ## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-11-02
 
 Decisions pages stay within client output limits and gain part-of relations and a vote item filter; process_type procedure listings are read whole and paged without repeats; document get resolves procedure_ids; organizations accepts committee, group and term codes; pre-2020 sittings return dates.
