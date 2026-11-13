@@ -1,6 +1,6 @@
 # eu-parliament-mcp-server - Directory Structure
 
-Generated on: 2026-11-03 03:45:29
+Generated on: 2026-11-13 18:29:59
 
 ```text
 eu-parliament-mcp-server/
@@ -174,6 +174,7 @@ eu-parliament-mcp-server/
 │   │   └── server-config.test.ts
 │   ├── fuzz/
 │   ├── helpers/
+│   │   ├── cpu-growth.ts
 │   │   ├── eu-parliament-contract.ts
 │   │   └── eu-parliament-fixtures.ts
 │   ├── integration/
@@ -212,6 +213,7 @@ eu-parliament-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
