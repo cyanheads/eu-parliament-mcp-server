@@ -1,6 +1,7 @@
 /** @fileoverview Sparse and nested published shapes at the JSON-LD parsing edge. */
 import { describe, expect, it } from 'vitest';
 import {
+  adoptedTextRowSchema,
   bodySchema,
   decisionSchema,
   documentSchema,
@@ -37,6 +38,48 @@ describe('Parliament noun schemas', () => {
       notation_publicRegister: 'P9_TA(2024)0138',
     };
     expect(documentSchema.parse(raw)).toEqual(raw);
+  });
+  it('reads adopted-text list rows for title, date and family relation, never their expressions', () => {
+    const row = {
+      id: 'eli/dl/doc/TA-9-2019-10-23-ANN01',
+      type: 'Work',
+      identifier: 'TA-9-2019-10-23-ANN01',
+      work_type: 'def/ep-document-types/AMENDMENT_BUDGET_EU_DRAFT',
+      document_date: '2019-10-23',
+      is_annex_of: ['eli/dl/doc/TA-9-2019-10-23'],
+      // Live list rows embed bare expression IDs, a shape document detail rejects.
+      is_realized_by: [
+        'eli/dl/doc/TA-9-2019-10-23-ANN01/es',
+        'eli/dl/doc/TA-9-2019-10-23-ANN01/it',
+      ],
+    };
+    expect(documentSchema.safeParse(row).success).toBe(false);
+    expect(adoptedTextRowSchema.parse(row)).toEqual({
+      id: 'eli/dl/doc/TA-9-2019-10-23-ANN01',
+      identifier: 'TA-9-2019-10-23-ANN01',
+      work_type: 'def/ep-document-types/AMENDMENT_BUDGET_EU_DRAFT',
+      document_date: '2019-10-23',
+    });
+    const titled = {
+      id: 'eli/dl/doc/TA-9-2024-0138',
+      identifier: 'TA-9-2024-0138',
+      label: 'T9-0138/2024',
+      title_dcterms: { en: 'Artificial Intelligence Act' },
+      document_date: '2024-03-13',
+      inverse_created_a_realization_of: [
+        'eli/dl/event/MTG-PL-2024-03-13-PVCRE-ITM-8-2',
+        'eli/dl/proc/2021-0106',
+      ],
+      is_realized_by: [
+        {
+          id: 'eli/dl/doc/TA-9-2024-0138/en',
+          is_embodied_by: [{ id: 'm', issued: ['2024-03-13', '2024-03-14'] }],
+        },
+      ],
+    };
+    expect(documentSchema.safeParse(titled).success).toBe(false);
+    const { is_realized_by: _expressions, ...kept } = titled;
+    expect(adoptedTextRowSchema.parse(titled)).toEqual(kept);
   });
   it('preserves sparse historical roster identities without inventing context', () => {
     expect(mepSchema.parse(rosterRecords[1])).toEqual({
@@ -175,5 +218,103 @@ describe('Parliament noun schemas', () => {
         recorded_in_a_realization_of: ['eli/dl/doc/CRE-10-2025-01-15-OTH-900001'],
       }),
     ).toMatchObject({ had_participation: { had_participant_person: ['person/900000001'] } });
+  });
+
+  it('keeps the original languages and text fragments of speech recording documents', () => {
+    const recording = {
+      id: 'eli/dl/doc/CRE-10-2026-04-28-OTH-2017073719859',
+      type: 'WorkSubdivision',
+      identifier: 'CRE-10-2026-04-28-OTH-2017073719859',
+      originalLanguage: [
+        'http://publications.europa.eu/resource/authority/language/DEU',
+        'http://publications.europa.eu/resource/authority/language/ENG',
+      ],
+      'api:xmlFragment': { en: '<oralStatements><speech/></oralStatements>' },
+    };
+    expect(
+      speechSchema.parse({ id: 'eli/dl/event/S-1', recorded_in_a_realization_of: [recording] })
+        .recorded_in_a_realization_of,
+    ).toEqual([
+      {
+        id: recording.id,
+        originalLanguage: recording.originalLanguage,
+        'api:xmlFragment': recording['api:xmlFragment'],
+      },
+    ]);
+    expect(
+      speechSchema.parse({
+        id: 'eli/dl/event/S-2',
+        recorded_in_a_realization_of: {
+          id: recording.id,
+          originalLanguage: 'http://publications.europa.eu/resource/authority/language/ITA',
+        },
+      }).recorded_in_a_realization_of,
+    ).toEqual({
+      id: recording.id,
+      originalLanguage: 'http://publications.europa.eu/resource/authority/language/ITA',
+    });
+    expect(
+      speechSchema.safeParse({
+        id: 'eli/dl/event/S-3',
+        recorded_in_a_realization_of: [{ id: recording.id, 'api:xmlFragment': { en: 1 } }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('keeps question roles published as a string or an array, original languages and alternative titles', () => {
+    const parsed = questionSchema.parse({
+      id: 'eli/dl/doc/E-8-2017-000005',
+      workHadParticipation: [
+        {
+          id: 'eli/dl/participation/E-8-2017-000005_127330',
+          had_participant_person: ['person/127330'],
+          participation_role: [
+            'http://publications.europa.eu/resource/authority/role/AUT',
+            'def/ep-roles/AUTHOR',
+          ],
+        },
+        {
+          id: 'eli/dl/participation/E-8-2017-000005_COM',
+          had_participant_organization: [
+            'http://publications.europa.eu/resource/authority/corporate-body/COM',
+            'org/EU_COMMISSION',
+          ],
+          participation_role: 'def/ep-roles/ADDRESSEE',
+        },
+      ],
+      originalLanguage: ['http://publications.europa.eu/resource/authority/language/SPA'],
+      is_realized_by: [
+        {
+          id: 'eli/dl/doc/E-8-2017-000005/en',
+          title_alternative: {
+            en: 'Question for written answer E-000005/2017<br/>to the Commission',
+          },
+        },
+      ],
+    });
+    expect(parsed.workHadParticipation).toEqual([
+      {
+        participation_role: [
+          'http://publications.europa.eu/resource/authority/role/AUT',
+          'def/ep-roles/AUTHOR',
+        ],
+      },
+      {
+        had_participant_organization: [
+          'http://publications.europa.eu/resource/authority/corporate-body/COM',
+          'org/EU_COMMISSION',
+        ],
+        participation_role: 'def/ep-roles/ADDRESSEE',
+      },
+    ]);
+    expect(parsed.originalLanguage).toEqual([
+      'http://publications.europa.eu/resource/authority/language/SPA',
+    ]);
+    expect(parsed.is_realized_by?.[0]?.title_alternative).toEqual({
+      en: 'Question for written answer E-000005/2017<br/>to the Commission',
+    });
+    expect(questionSchema.parse({ id: 'eli/dl/doc/K-8-2017-000001' })).toEqual({
+      id: 'eli/dl/doc/K-8-2017-000001',
+    });
   });
 });

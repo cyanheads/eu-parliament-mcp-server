@@ -15,6 +15,10 @@ import {
   pagingInputFields,
   serviceInput,
 } from '@/mcp-server/tools/utils/eu-parliament-tool.js';
+import {
+  firstDecisionSitting,
+  labelCitation,
+} from '@/services/eu-parliament/eu-parliament-reference.js';
 import { getEuParliamentService } from '@/services/eu-parliament/eu-parliament-service.js';
 
 const eventSchema = z
@@ -33,7 +37,7 @@ const eventSchema = z
     sitting_ids: z
       .array(z.string().describe('Canonical scheduled sitting identifier.'))
       .describe(
-        'Explicit scheduled sitting relations, sorted by identifier; when absent, a published vote-event date selects the sitting for euparl_get_plenary_votes decisions with vote_item_id or document_id. Older sittings publish no vote items or report relations on decisions, so neither filter matches there; find the report citation in decision labels instead.',
+        `Explicit scheduled sitting relations, sorted by identifier; when absent, a published vote-event date selects the sitting for euparl_get_plenary_votes decisions with vote_item_id or document_id. Older sittings publish vote items without decision links and decisions without report relations, so neither filter matches there; list the sitting's vote items with mode vote_items, or find the report citation in decision labels instead (${labelCitation}), else words of the vote item's title with language set to the title's language (decision records start with the ${firstDecisionSitting} sitting).`,
       ),
   })
   .strict()

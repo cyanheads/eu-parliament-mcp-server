@@ -2,7 +2,10 @@
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
-import { EuParliamentService } from '../../../src/services/eu-parliament/eu-parliament-service.js';
+import {
+  type DocumentsInput,
+  EuParliamentService,
+} from '../../../src/services/eu-parliament/eu-parliament-service.js';
 import {
   decisionRecord,
   documentRecord,
@@ -41,7 +44,7 @@ describe('Parliament domain workflows', () => {
         const prefix = family === 'speeches' ? 'eli/dl/event/' : 'eli/dl/doc/';
         return Response.json({
           data: Array.from({ length: Math.max(0, Math.min(limit, 500 - offset)) }, (_, i) => ({
-            id: `${prefix}ID-${offset + i}`,
+            id: `${prefix}ID-${String(offset + i).padStart(3, '0')}`,
           })),
           meta: { total: 500 },
         });
@@ -66,7 +69,7 @@ describe('Parliament domain workflows', () => {
         }
         return seen;
       };
-      const expected = Array.from({ length: 500 }, (_, i) => `ID-${i}`);
+      const expected = Array.from({ length: 500 }, (_, i) => `ID-${String(i).padStart(3, '0')}`);
       expect(await walk([100])).toEqual(expected);
       expect(await walk([37, 63, 201, 19, 180])).toEqual(expected);
       expect(queries.length).toBeGreaterThan(10);
@@ -91,6 +94,181 @@ describe('Parliament domain workflows', () => {
       makeService(fetcher, () => now).searchSpeeches({ limit: 1000 }, context()),
     ).rejects.toMatchObject({ code: JsonRpcErrorCode.Timeout });
     expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+  describe('adopted-text search rows', () => {
+    const pool = Array.from(
+      { length: 250 },
+      (_, i) => `TA-9-2024-${String(i + 1).padStart(4, '0')}`,
+    );
+    /** Each aligned page answers in reverse document_id order, as `language=` pages can. */
+    const upstream = (extra: (id: string) => Record<string, unknown> = () => ({})) => {
+      const queries: URLSearchParams[] = [];
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+        const query = new URL(String(url)).searchParams;
+        queries.push(query);
+        const offset = Number(query.get('offset'));
+        return Response.json({
+          data: pool
+            .slice(offset, offset + Number(query.get('limit')))
+            .toReversed()
+            .map((id) => ({ id: `eli/dl/doc/${id}`, identifier: id, ...extra(id) })),
+          meta: { total: pool.length },
+        });
+      });
+      return { fetcher, queries };
+    };
+    const search = async (service: EuParliamentService, input: DocumentsInput) => {
+      const result = await service.searchDocuments(input, context());
+      if (result.data.mode !== 'search') throw new Error('Expected search');
+      return { ...result.data, enrichment: result.enrichment };
+    };
+    it('reorders every aligned page by document_id, so a walk at any caller limit reads the set once in order', async () => {
+      const { fetcher, queries } = upstream((id) => ({ title_dcterms: { en: `Title ${id}` } }));
+      const service = makeService(fetcher);
+      const walk = async (limits: number[]) => {
+        const seen: string[] = [];
+        for (let index = 0, offset = 0; ; index++) {
+          const page = await search(service, { offset, limit: limits[index % limits.length]! });
+          seen.push(...page.items.map((row) => row.document_id));
+          if (!page.page.has_more) return seen;
+          offset = page.page.next_offset!;
+        }
+      };
+      expect(await walk([100])).toEqual(pool);
+      expect(await walk([37, 63, 100, 19])).toEqual(pool);
+      for (const query of queries) {
+        expect(Object.fromEntries(query)).toMatchObject({
+          limit: '100',
+          'sort-by': 'doc-id:asc',
+          language: 'en',
+          'search-language': 'en',
+        });
+        expect(query.has('view')).toBe(false);
+        expect(Number(query.get('offset')) % 100).toBe(0);
+      }
+    });
+    it('narrows a sorted call to 100 rows from at most two aligned requests', async () => {
+      const { fetcher, queries } = upstream();
+      const service = makeService(fetcher);
+      const first = await search(service, { limit: 1000 });
+      expect(first.items.map((row) => row.document_id)).toEqual(pool.slice(0, 100));
+      expect(first.page).toMatchObject({ offset: 0, limit: 100, returned: 100, next_offset: 100 });
+      expect(first.enrichment.notice).toContain(
+        'Requested limit normalized to the effective maximum of 100 adopted texts.',
+      );
+      expect(queries.map((query) => query.get('offset'))).toEqual(['0']);
+      const spanning = await search(service, { offset: 150, limit: 5000 });
+      expect(spanning.items.map((row) => row.document_id)).toEqual(pool.slice(150, 250));
+      expect(spanning.page).toMatchObject({ offset: 150, limit: 100, returned: 100 });
+      expect(queries.map((query) => query.get('offset'))).toEqual(['0', '100', '200']);
+    });
+    it('returns the requested-language title, date and procedure_ids and counts rows without that title', async () => {
+      const rows: Record<string, Record<string, unknown>> = {
+        'TA-9-2024-0001': {
+          label: 'T9-0001/2024',
+          title_dcterms: { hr: 'Naslov' },
+          document_date: '2024-01-16',
+          inverse_created_a_realization_of: [
+            'eli/dl/event/MTG-PL-2024-01-16-PVCRE-ITM-1',
+            'eli/dl/proc/2023-0001',
+            { id: 'https://data.europarl.europa.eu/eli/dl/proc/2023-0002' },
+          ],
+        },
+        'TA-9-2024-0002': { title_dcterms: { en: 'English only' }, document_date: '2024-01-17' },
+        'TA-9-2024-0003': {
+          is_realized_by: ['eli/dl/doc/TA-9-2024-0003/es', 'eli/dl/doc/TA-9-2024-0003/it'],
+        },
+        'TA-9-2024-0004': {
+          title_dcterms: { hr: 'Drugi naslov' },
+          is_realized_by: [
+            { id: 'e', is_embodied_by: [{ id: 'm', issued: ['2024-01-18', '2024-01-19'] }] },
+          ],
+        },
+      };
+      const { fetcher } = upstream((id) => rows[id] ?? { title_dcterms: { hr: id } });
+      const page = await search(makeService(fetcher), { language: 'HR', limit: 4 });
+      expect(page.items).toEqual([
+        {
+          document_id: 'TA-9-2024-0001',
+          identifier: 'TA-9-2024-0001',
+          label: 'T9-0001/2024',
+          source_url: 'https://data.europarl.europa.eu/eli/dl/doc/TA-9-2024-0001',
+          title: { value: 'Naslov', language: 'hr' },
+          date: '2024-01-16',
+          procedure_ids: ['2023-0001', '2023-0002'],
+        },
+        {
+          document_id: 'TA-9-2024-0002',
+          identifier: 'TA-9-2024-0002',
+          source_url: 'https://data.europarl.europa.eu/eli/dl/doc/TA-9-2024-0002',
+          date: '2024-01-17',
+          procedure_ids: [],
+        },
+        {
+          document_id: 'TA-9-2024-0003',
+          identifier: 'TA-9-2024-0003',
+          source_url: 'https://data.europarl.europa.eu/eli/dl/doc/TA-9-2024-0003',
+          procedure_ids: [],
+        },
+        {
+          document_id: 'TA-9-2024-0004',
+          identifier: 'TA-9-2024-0004',
+          source_url: 'https://data.europarl.europa.eu/eli/dl/doc/TA-9-2024-0004',
+          title: { value: 'Drugi naslov', language: 'hr' },
+          procedure_ids: [],
+        },
+      ]);
+      expect(page.enrichment.notice).toBe(
+        "2 rows on this page have no title in hr, the only language the adopted-text list returns; mode get with a row's document_id reads its title in another published language.",
+      );
+      expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('language')).toBe('hr');
+    });
+    it('sends one keyword request in the requested language, keeps relevance order and caps it at 100 rows', async () => {
+      const { fetcher, queries } = upstream((id) => ({ title_dcterms: { en: id } }));
+      const page = await search(makeService(fetcher), { text: 'budget', offset: 100, limit: 1000 });
+      expect(page.items.map((row) => row.document_id)).toEqual(pool.slice(100, 200).toReversed());
+      expect(page.page).toMatchObject({ offset: 100, limit: 100, returned: 100 });
+      expect(page.enrichment.notice).toContain(
+        'Requested limit normalized to the effective maximum of 100 keyword adopted texts.',
+      );
+      expect(queries).toHaveLength(1);
+      expect(Object.fromEntries(queries[0]!)).toEqual({
+        offset: '100',
+        limit: '100',
+        text: 'budget',
+        'search-language': 'en',
+        language: 'en',
+        format: 'application/ld+json',
+      });
+    });
+    it.each(['committee', 'plenary'] as const)(
+      'keeps %s rows, bounds and requests as they are',
+      async (source) => {
+        const { fetcher, queries } = upstream(() => ({
+          label: 'X9-0001/2024',
+          work_type: 'def/ep-document-types/REPORT_PLENARY',
+          title_dcterms: { en: 'Not read from family lists' },
+          document_date: '2024-01-16',
+          inverse_created_a_realization_of: 'eli/dl/proc/2023-0001',
+        }));
+        const page = await search(makeService(fetcher), { source, limit: 1000 });
+        expect(page.items[0]).toEqual({
+          document_id: 'TA-9-2024-0250',
+          identifier: 'TA-9-2024-0250',
+          label: 'X9-0001/2024',
+          work_type: 'def/ep-document-types/REPORT_PLENARY',
+          source_url: 'https://data.europarl.europa.eu/eli/dl/doc/TA-9-2024-0250',
+        });
+        expect(page.page).toMatchObject({ offset: 0, limit: 1000, returned: 250 });
+        expect(page.enrichment).not.toHaveProperty('notice');
+        expect(queries).toHaveLength(1);
+        expect(Object.fromEntries(queries[0]!)).toEqual({
+          offset: '0',
+          limit: '1000',
+          format: 'application/ld+json',
+        });
+      },
+    );
   });
   it('slices sorted fixed upstream speech pages across boundaries independently of caller geometry', async () => {
     const calls: { offset: number; limit: number; sort: string | null }[] = [];
@@ -239,6 +417,73 @@ describe('Parliament domain workflows', () => {
       expect(fetcher).not.toHaveBeenCalled();
     },
   );
+  describe('decisions document_id citations and letter case', () => {
+    const decision = (id: string, relation: Record<string, string>) => ({
+      id: `eli/dl/event/MTG-PL-2024-03-13-${id}`,
+      activity_id: id,
+      ...relation,
+    });
+    const sitting = () =>
+      vi.fn<typeof fetch>().mockImplementation(async () =>
+        envelopeResponse([
+          decision('DEC-1', { decided_on_a_realization_of: 'eli/dl/doc/A-9-2023-0188' }),
+          decision('DEC-2', {
+            decided_on_a_part_of_a_realization_of: 'eli/dl/doc/A-9-2023-0188-AM-001',
+          }),
+          decision('DEC-3', { decided_on_a_realization_of: 'eli/dl/doc/A-9-2023-0189' }),
+          decision('DEC-4', { decided_on_a_realization_of: 'eli/dl/doc/B-10-2024-0156' }),
+          decision('DEC-5', { recorded_in_a_realization_of: 'eli/dl/doc/QOB-10-2024-0156' }),
+        ]),
+      );
+    const select = async (document_id: string) => {
+      const fetcher = sitting();
+      const result = await makeService(fetcher).getPlenaryVotes(
+        { sitting_id: '2024-03-13', document_id },
+        context(),
+      );
+      if (result.data.mode !== 'decisions') throw new Error('Expected decisions');
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      return {
+        ids: result.data.decisions.map((row) => row.decision_id),
+        total: result.enrichment.totalCount,
+        snapshot: result.data.page.snapshot,
+        document_id: result.enrichment.appliedFilters.document_id,
+      };
+    };
+    it('selects the same decisions, total and snapshot for a report citation in any letter case', async () => {
+      const canonical = await select('A-9-2023-0188');
+      expect(canonical).toMatchObject({
+        ids: ['DEC-1', 'DEC-2'],
+        total: 2,
+        document_id: 'A-9-2023-0188',
+      });
+      for (const citation of ['a-9-2023-0188', 'A9-0188/2023', 'p9_a(2023)0188'])
+        expect(await select(citation)).toEqual(canonical);
+    });
+    it('maps a B citation to the B- motion only', async () => {
+      const motion = await select('B-10-2024-0156');
+      expect(motion).toMatchObject({ ids: ['DEC-4'], total: 1, document_id: 'B-10-2024-0156' });
+      expect(await select('B10-0156/2024')).toEqual(motion);
+    });
+    it.each(['A9-188/2023', 'AD-PE786.674', 'E-000003/2025'])(
+      'rejects %s with the accepted document_id forms before HTTP',
+      async (document_id) => {
+        const fetcher = vi.fn<typeof fetch>();
+        await expect(
+          makeService(fetcher).getPlenaryVotes(
+            { sitting_id: '2024-03-13', document_id },
+            context(),
+          ),
+        ).rejects.toMatchObject({
+          message: expect.stringContaining(
+            `document_id ${JSON.stringify(document_id)} is not a document identifier or citation.`,
+          ),
+          data: { reason: 'invalid_filter' },
+        });
+        expect(fetcher).not.toHaveBeenCalled();
+      },
+    );
+  });
   it('guards the effective capped limit rather than the requested limit', async () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => envelopeResponse([]));
     const result = await makeService(fetcher).searchSpeeches(
@@ -460,8 +705,12 @@ describe('Parliament domain workflows', () => {
     );
   });
   type Call = (service: EuParliamentService) => Promise<unknown>;
-  it.each<[string, Call]>([
-    ['documents sitting_date', (s) => s.searchDocuments({ sitting_date: '2024-02-30' }, context())],
+  it.each<[string, Call, string]>([
+    [
+      'documents sitting_date',
+      (s) => s.searchDocuments({ sitting_date: '2024-02-30' }, context()),
+      'sitting_date "2024-02-30"',
+    ],
     [
       'documents sitting_date_end',
       (s) =>
@@ -469,26 +718,43 @@ describe('Parliament domain workflows', () => {
           { sitting_date: '2024-02-01', sitting_date_end: '2023-02-29' },
           context(),
         ),
+      'sitting_date_end "2023-02-29"',
     ],
-    ['speeches sitting_date', (s) => s.searchSpeeches({ sitting_date: '2024-13-01' }, context())],
+    [
+      'speeches sitting_date',
+      (s) => s.searchSpeeches({ sitting_date: '2024-13-01' }, context()),
+      'sitting_date "2024-13-01"',
+    ],
     [
       'speeches sitting_date_end',
       (s) =>
         s.searchSpeeches({ sitting_date: '2024-02-01', sitting_date_end: '2024-2-3' }, context()),
+      'sitting_date_end "2024-2-3"',
     ],
-    ['votes sitting_id', (s) => s.getPlenaryVotes({ sitting_id: 'MTG-PL-2024-04-31' }, context())],
-    ['meps mandate_date', (s) => s.searchMeps({ mandate_date: '2024-02-30' }, context())],
-  ])('rejects a nonexistent or malformed %s with the date hint before HTTP', async (_, call) => {
-    const fetcher = vi.fn<typeof fetch>();
-    await expect(call(makeService(fetcher))).rejects.toMatchObject({
-      message: 'Use a real calendar date in YYYY-MM-DD form.',
-      data: {
-        reason: 'invalid_filter',
-        recovery: { hint: 'Pass an existing calendar day as YYYY-MM-DD.' },
-      },
-    });
-    expect(fetcher).not.toHaveBeenCalled();
-  });
+    [
+      'votes sitting_id',
+      (s) => s.getPlenaryVotes({ sitting_id: 'MTG-PL-2024-04-31' }, context()),
+      'sitting_id "MTG-PL-2024-04-31"',
+    ],
+    [
+      'meps mandate_date',
+      (s) => s.searchMeps({ mandate_date: '2024-02-30' }, context()),
+      'mandate_date "2024-02-30"',
+    ],
+  ])(
+    'rejects a nonexistent or malformed %s with the date hint before HTTP',
+    async (_, call, named) => {
+      const fetcher = vi.fn<typeof fetch>();
+      await expect(call(makeService(fetcher))).rejects.toMatchObject({
+        message: `${named} is not a real calendar date in YYYY-MM-DD form.`,
+        data: {
+          reason: 'invalid_filter',
+          recovery: { hint: 'Pass an existing calendar day as YYYY-MM-DD.' },
+        },
+      });
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
   it.each<[string, Call, (url: URL) => string | null]>([
     [
       'documents',
@@ -520,18 +786,24 @@ describe('Parliament domain workflows', () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(sent(new URL(String(fetcher.mock.calls[0]?.[0])))).toBe('2024-02-29');
   });
-  it.each<[string, Call]>([
-    ['documents', (s) => s.searchDocuments({ sitting_date_end: '2024-02-01' }, context())],
+  it.each<[string, Call, string]>([
+    [
+      'documents',
+      (s) => s.searchDocuments({ sitting_date_end: '2024-02-01' }, context()),
+      'sitting_date_end "2024-02-01" needs a sitting_date on or before it, but sitting_date was not supplied.',
+    ],
     [
       'speeches',
       (s) =>
         s.searchSpeeches({ sitting_date: '2024-02-29', sitting_date_end: '2024-02-28' }, context()),
+      'sitting_date_end "2024-02-28" needs a sitting_date on or before it, but sitting_date is "2024-02-29".',
     ],
   ])(
-    'rejects an incomplete or reversed sitting range in %s with the range hint before HTTP',
-    async (_, call) => {
+    'rejects an incomplete or reversed sitting range in %s naming both dates, with the range hint before HTTP',
+    async (_, call, message) => {
       const fetcher = vi.fn<typeof fetch>();
       await expect(call(makeService(fetcher))).rejects.toMatchObject({
+        message,
         data: {
           reason: 'invalid_filter',
           recovery: { hint: 'Pass sitting_date with sitting_date_end, on or before it.' },
@@ -1021,7 +1293,7 @@ describe('Parliament domain workflows', () => {
         context(),
       );
       expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
-        '/api/v2/documents/ta-9-2024-0138',
+        '/api/v2/documents/TA-9-2024-0138',
         '/api/v2/adopted-texts/TA-9-2024-0138',
       ]);
     });
@@ -1370,17 +1642,38 @@ describe('Parliament domain workflows', () => {
       'No MEPs matched. Remove name_contains to browse, relax country or political_group, or call euparl_list_reference with topic mep_filters.';
     const datedGroup =
       "On a mandate_date roster, political_group matches only the group code in force on that date; omit political_group and read each member's published political_group.";
+    const currentGroup =
+      "On the current roster, political_group matches only the group code in force today; pass mandate_date or term for an earlier group, or omit political_group and read each member's published political_group.";
+    const termRule =
+      'On a term roster, political_group matches each member of the term holding a membership in that code that had not ended when the term began, including memberships that began later, even after the term ended; it does not show who sat in the group during the term. Pass mandate_date instead of term for the members published under a code on one day.';
+    const twoCodes =
+      'GUE/NGL names two group codes: GUE-NGL (label GUE/NGL, 1995-01-06 to 2020-12-17) and THE-LEFT (The Left, from 2020-12-18, whose published name ends in GUE/NGL).';
+    const leftDays =
+      'from 2020-12-19 (the dated roster runs a day later than the published versions)';
+    const gueDays =
+      'from 1995-01-07 through 2020-12-18 (the dated roster runs a day later than the published versions)';
+    /** Term 9 holds both codes, so its call routes the other code to the same roster. */
+    const leftSent = `${twoCodes} This call sent THE-LEFT; to select the other group, pass political_group GUE-NGL.`;
+    const gueOnTerm = `${twoCodes} This call sent GUE-NGL; to select the other group, pass political_group THE-LEFT with term 9, whose roster holds both codes, or with a mandate_date ${leftDays}.`;
+    const leftOnTerm = `${twoCodes} This call sent THE-LEFT; to select the other group, pass political_group GUE-NGL with term 9, whose roster holds both codes, or with a mandate_date ${gueDays}.`;
+    const gueOnDay = `${twoCodes} This call sent GUE-NGL. A mandate_date or current roster matches only the code in force that day, so THE-LEFT matches no member here; to select it, pass political_group THE-LEFT with a mandate_date ${leftDays} or with term 9.`;
+    const leftOnDay = `${twoCodes} This call sent THE-LEFT. A mandate_date or current roster matches only the code in force that day, so GUE-NGL matches no member here; to select it, pass political_group GUE-NGL with a mandate_date ${gueDays} or with term 9.`;
 
-    it.each(['!!!', '.,;:-/', '🙂', '́̈', ' ! ? '])(
-      'rejects name_contains %j without a letter or digit before HTTP',
-      async (name_contains) => {
+    it.each([
+      ['!!!', '"!!!"'],
+      ['.,;:-/', '".,;:-/"'],
+      ['🙂', '"🙂"'],
+      ['́̈', '"́̈"'],
+      [' ! ? ', '" ! ? "'],
+    ])(
+      'rejects name_contains %j without a letter or digit, quoting it, before HTTP',
+      async (name_contains, quoted) => {
         const fetcher = vi.fn<typeof fetch>();
         await expect(
           makeService(fetcher).searchMeps({ name_contains }, context()),
         ).rejects.toMatchObject({
           code: JsonRpcErrorCode.ValidationError,
-          message:
-            'name_contains has no letter or digit after case, diacritic, and punctuation normalization.',
+          message: `name_contains ${quoted} has no letter or digit after case, diacritic, and punctuation normalization.`,
           data: {
             reason: 'invalid_filter',
             recovery: {
@@ -1583,7 +1876,7 @@ describe('Parliament domain workflows', () => {
       await expect(
         service.searchMeps({ mandate_date: '2026-11-02' }, context()),
       ).rejects.toMatchObject({
-        message: 'mandate_date 2026-11-02 is after the current UTC date 2026-11-01.',
+        message: 'mandate_date "2026-11-02" is after the current UTC date 2026-11-01.',
         data: {
           reason: 'invalid_filter',
           recovery: {
@@ -1630,22 +1923,90 @@ describe('Parliament domain workflows', () => {
     });
 
     it.each([
-      [{ mandate_date: '2016-03-09', political_group: 'GUE/NGL' }, `${noMatch} ${datedGroup}`],
-      [{ political_group: 'GUE/NGL' }, noMatch],
-      [{ mandate_date: '2016-03-09', name_contains: 'nobody' }, noMatch],
+      [
+        { mandate_date: '2016-03-09', political_group: 'GUE/NGL' },
+        `${noMatch} ${datedGroup} ${gueOnDay}`,
+        'GUE-NGL',
+      ],
+      [{ political_group: 'GUE/NGL' }, `${noMatch} ${currentGroup} ${leftOnDay}`, 'THE-LEFT'],
+      [{ political_group: 'GUE-NGL' }, `${noMatch} ${currentGroup}`, 'GUE-NGL'],
+      [{ mandate_date: '2016-03-09', name_contains: 'nobody' }, noMatch, null],
     ] as const)(
-      'explains date-bound group codes only for an empty dated group search %j',
-      async (input, notice) => {
+      'explains in-force group codes only for an empty current or dated group search %j',
+      async (input, notice, sent) => {
         const fetcher = vi
           .fn<typeof fetch>()
           .mockResolvedValue(new Response(null, { status: 204 }));
         const result = await makeService(fetcher, now).searchMeps(input, context());
         expect(result.data.items).toEqual([]);
         expect(result.enrichment.notice).toBe(notice);
-        if ('political_group' in input)
-          expect(urlOf(fetcher).searchParams.get('political-group')).toBe('THE-LEFT');
+        expect(urlOf(fetcher).searchParams.get('political-group')).toBe(sent);
       },
     );
+
+    it.each([
+      [{ term: 8 }, 'GUE-NGL', gueOnTerm],
+      [{ term: 0 }, 'GUE-NGL', gueOnTerm],
+      [{ mandate_date: '2016-03-09' }, 'GUE-NGL', gueOnDay],
+      [{ mandate_date: '2020-12-17' }, 'GUE-NGL', gueOnDay],
+      [{ mandate_date: '2020-12-18' }, 'GUE-NGL', gueOnDay],
+      [{}, 'THE-LEFT', leftOnDay],
+      [{ term: 9 }, 'THE-LEFT', leftSent],
+      [{ term: 10 }, 'THE-LEFT', leftOnTerm],
+      [{ mandate_date: '2020-12-19' }, 'THE-LEFT', leftOnDay],
+      [{ mandate_date: '2021-01-18' }, 'THE-LEFT', leftOnDay],
+    ] as const)(
+      'sends GUE/NGL on roster %j as %s and names both codes on a matching page',
+      async (roster, sent, twoCodeNotice) => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse([aaltola]));
+        const result = await makeService(fetcher, now).searchMeps(
+          { ...roster, political_group: ' gue/ngl ' },
+          context(),
+        );
+        expect(urlOf(fetcher).searchParams.get('political-group')).toBe(sent);
+        expect(result.enrichment.appliedFilters).toMatchObject({ political_group: sent });
+        expect(result.data.items.map((item) => item.mep_id)).toEqual(['256810']);
+        expect(result.enrichment.notice).toBe(
+          'term' in roster ? `${termRule} ${twoCodeNotice}` : twoCodeNotice,
+        );
+      },
+    );
+
+    it.each([
+      [{ term: 8, political_group: 'alde' }, 'ALDE', termRule],
+      [{ term: 6, political_group: 'PPE-DE' }, 'PPE-DE', termRule],
+      [{ term: 10, political_group: 'EPP' }, 'PPE', termRule],
+      [{ mandate_date: '2016-03-09', political_group: 'ENF' }, 'ENF', undefined],
+      [{ political_group: 'S&D' }, 'S-D', undefined],
+      [{ term: 8 }, null, undefined],
+    ] as const)(
+      'states the term matching rule only on a term call with political_group %j',
+      async (input, sent, notice) => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse([aaltola]));
+        const result = await makeService(fetcher, now).searchMeps(input, context());
+        expect(urlOf(fetcher).searchParams.get('political-group')).toBe(sent);
+        expect(result.enrichment.notice).toBe(notice);
+      },
+    );
+
+    it('rejects an unknown political_group with its value, every code and the listing call before HTTP', async () => {
+      const fetcher = vi.fn<typeof fetch>();
+      await expect(
+        makeService(fetcher, now).searchMeps({ political_group: 'PATRIOTS-X', term: 8 }, context()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringContaining(
+          'Unsupported political_group filter "PATRIOTS-X". Accepted codes: ALDE, ARC,',
+        ),
+        data: {
+          reason: 'invalid_filter',
+          recovery: {
+            hint: 'Call euparl_list_reference with topic mep_filters for each group code with its label and periods, then retry with one of them.',
+          },
+        },
+      });
+      expect(fetcher).not.toHaveBeenCalled();
+    });
 
     it('omits the date-bound group explanation when the dated group roster matched but no name did', async () => {
       const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse(maltaOn20240313));
@@ -1678,6 +2039,266 @@ describe('Parliament domain workflows', () => {
       });
       expect(fetcher).toHaveBeenCalledTimes(3);
       expect(urlOf(fetcher).searchParams.get('mandate-date')).toBe('2024-07-16');
+    });
+
+    describe('mep_ids', () => {
+      /** Rows of meps/show-current?mandate-date=2016-03-09 (750 rows), captured 2026-11-13. */
+      const seatedOn20160309 = [
+        {
+          id: 'person/1849',
+          type: 'Person',
+          identifier: '1849',
+          label: 'Sylvia-Yvonne KAUFMANN',
+          familyName: 'Kaufmann',
+          givenName: 'Sylvia-Yvonne',
+          sortLabel: 'KAUFMANN',
+          'api:country-of-representation': 'DE',
+          'api:political-group': 'S&D',
+        },
+        {
+          id: 'person/124884',
+          type: 'Person',
+          identifier: '124884',
+          label: 'Kosma ZŁOTOWSKI',
+          familyName: 'Złotowski',
+          givenName: 'Kosma',
+          sortLabel: 'ZLOTOWSKI',
+          'api:country-of-representation': 'PL',
+          'api:political-group': 'ECR',
+        },
+        {
+          id: 'person/124867',
+          type: 'Person',
+          identifier: '124867',
+          label: 'Brando BENIFEI',
+          familyName: 'Benifei',
+          givenName: 'Brando',
+          sortLabel: 'BENIFEI',
+          'api:country-of-representation': 'IT',
+          'api:political-group': 'S&D',
+        },
+      ];
+      /** Rows of meps?parliamentary-term=9 (875 rows), captured 2026-11-13: no country or group. */
+      const term9 = [
+        {
+          id: 'person/124867',
+          type: 'Person',
+          identifier: '124867',
+          label: 'Brando BENIFEI',
+          familyName: 'Benifei',
+          givenName: 'Brando',
+          sortLabel: 'BENIFEI',
+        },
+        {
+          id: 'person/197665',
+          type: 'Person',
+          identifier: '197665',
+          label: 'Dragoş TUDORACHE',
+          familyName: 'Tudorache',
+          givenName: 'Dragoş',
+          sortLabel: 'TUDORACHE',
+        },
+        {
+          id: 'person/124884',
+          type: 'Person',
+          identifier: '124884',
+          label: 'Kosma ZŁOTOWSKI',
+          familyName: 'Złotowski',
+          givenName: 'Kosma',
+          sortLabel: 'ZLOTOWSKI',
+        },
+      ];
+      const requested = ['124867', 'person/1849', 'https://data.europarl.europa.eu/person/197665'];
+      const roster = (input: URL) =>
+        envelopeResponse(input.searchParams.has('mandate-date') ? seatedOn20160309 : term9);
+      const serviceOver = () => {
+        const fetcher = vi
+          .fn<typeof fetch>()
+          .mockImplementation(async (input) => roster(new URL(String(input))));
+        return { fetcher, service: makeService(fetcher, now) };
+      };
+
+      it('keeps the output, filters and snapshot of a call without mep_ids', async () => {
+        const { service } = serviceOver();
+        const result = await service.searchMeps({ term: 9, limit: 1 }, context());
+        expect(result.data).toEqual({
+          items: [
+            {
+              mep_id: '124867',
+              name: 'Brando BENIFEI',
+              given_name: 'Brando',
+              family_name: 'Benifei',
+            },
+          ],
+          page: {
+            offset: 0,
+            limit: 1,
+            returned: 1,
+            has_more: true,
+            next_offset: 1,
+            // Computed by the release before mep_ids existed.
+            snapshot: '87480584a1d8e1b309888ab546cfa55b4fd1ecf00adc78a2066f8f1e99e89fa0',
+          },
+        });
+        expect(result.enrichment).toEqual({
+          appliedFilters: { scope: 'parliamentary_term', term: 9, language: 'en' },
+          totalCount: 3,
+        });
+      });
+
+      it('names requested IDs from one dated roster read, with date-published country and group', async () => {
+        const { fetcher, service } = serviceOver();
+        const result = await service.searchMeps(
+          { mandate_date: '2016-03-09', mep_ids: requested },
+          context(),
+        );
+        expect(result.data.items).toEqual([
+          {
+            mep_id: '124867',
+            name: 'Brando BENIFEI',
+            given_name: 'Brando',
+            family_name: 'Benifei',
+            country: 'IT',
+            political_group: 'S&D',
+          },
+          {
+            mep_id: '1849',
+            name: 'Sylvia-Yvonne KAUFMANN',
+            given_name: 'Sylvia-Yvonne',
+            family_name: 'Kaufmann',
+            country: 'DE',
+            political_group: 'S&D',
+          },
+        ]);
+        expect(result.data.unmatched_mep_ids).toEqual(['197665']);
+        expect(result.enrichment).toMatchObject({
+          totalCount: 2,
+          appliedFilters: {
+            scope: 'mandate_date',
+            mandate_date: '2016-03-09',
+            mep_ids: ['124867', '1849', '197665'],
+          },
+          notice:
+            "1 requested mep_id matched no row of the selected roster after the other filters; unmatched_mep_ids lists it. A term roster holds only that term's members and a mandate_date roster only members seated that day; euparl_get_mep reads any member by ID.",
+        });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        expect([...urlOf(fetcher).searchParams.keys()]).toEqual(['mandate-date', 'format']);
+      });
+
+      it('names requested IDs from a term roster without country or group', async () => {
+        const { fetcher, service } = serviceOver();
+        const result = await service.searchMeps({ term: 9, mep_ids: requested }, context());
+        expect(result.data.items).toEqual([
+          {
+            mep_id: '124867',
+            name: 'Brando BENIFEI',
+            given_name: 'Brando',
+            family_name: 'Benifei',
+          },
+          {
+            mep_id: '197665',
+            name: 'Dragoş TUDORACHE',
+            given_name: 'Dragoş',
+            family_name: 'Tudorache',
+          },
+        ]);
+        expect(result.data.unmatched_mep_ids).toEqual(['1849']);
+        expect(fetcher).toHaveBeenCalledTimes(1);
+      });
+
+      it('deduplicates canonical forms and keeps first-seen order in the echo', async () => {
+        const { service } = serviceOver();
+        const result = await service.searchMeps(
+          { term: 9, mep_ids: ['person/197665', '124867', ' person/124867 ', '197665'] },
+          context(),
+        );
+        expect(result.data.items.map((item) => item.mep_id)).toEqual(['124867', '197665']);
+        expect(result.data.unmatched_mep_ids).toEqual([]);
+        expect(result.enrichment.appliedFilters.mep_ids).toEqual(['197665', '124867']);
+        expect(result.enrichment).not.toHaveProperty('notice');
+      });
+
+      it.each([
+        'org/AFCO',
+        '12a',
+        '',
+        'https://evil.example/person/1',
+        'person/1?x=y',
+        // The public origin without the person/ segment: a form euparl_get_mep rejects too.
+        'https://data.europarl.europa.eu/124867',
+      ])('rejects mep_ids entry %j before HTTP', async (entry) => {
+        const { fetcher, service } = serviceOver();
+        await expect(
+          service.searchMeps({ term: 9, mep_ids: ['124867', entry] }, context()),
+        ).rejects.toMatchObject({
+          code: JsonRpcErrorCode.ValidationError,
+          message: `mep_ids entry "${entry}" is not a person identifier. Accepted forms: a decimal person ID (124867), person/124867, or https://data.europarl.europa.eu/person/124867.`,
+          data: {
+            reason: 'invalid_filter',
+            recovery: {
+              hint: 'Retry euparl_search_meps with only person IDs in mep_ids; resolve org/ identifiers with euparl_list_reference topic organizations and organization_ids instead.',
+            },
+          },
+        });
+        expect(fetcher).not.toHaveBeenCalled();
+      });
+
+      it('treats an empty mep_ids list as omitted, snapshot included', async () => {
+        const { service } = serviceOver();
+        const omitted = await service.searchMeps({ term: 9, limit: 1 }, context());
+        const empty = await service.searchMeps({ term: 9, limit: 1, mep_ids: [] }, context());
+        expect(empty).toEqual(omitted);
+        expect(empty.data).not.toHaveProperty('unmatched_mep_ids');
+      });
+
+      it('repeats unmatched_mep_ids on every page and binds the snapshot to the ID list', async () => {
+        const { service } = serviceOver();
+        const ids = ['124884', '1849', '124867', '197665', '999999'];
+        const first = await service.searchMeps({ term: 9, limit: 1, mep_ids: ids }, context());
+        const snapshot = first.data.page.snapshot!;
+        const pages = [first];
+        for (const offset of [1, 2, 3])
+          pages.push(
+            await service.searchMeps(
+              { term: 9, limit: 1, offset, mep_ids: ids, snapshot },
+              context(),
+            ),
+          );
+        expect(pages.map((page) => page.data.items.map((item) => item.mep_id))).toEqual([
+          ['124867'],
+          ['197665'],
+          ['124884'],
+          [],
+        ]);
+        for (const page of pages) expect(page.data.unmatched_mep_ids).toEqual(['1849', '999999']);
+        expect(pages[3]?.enrichment.notice).toContain(
+          'The offset 3 is at or beyond the complete collection of 3 items.',
+        );
+        await expect(
+          service.searchMeps(
+            { term: 9, limit: 1, offset: 1, mep_ids: ['124884', '124867'], snapshot },
+            context(),
+          ),
+        ).rejects.toMatchObject({ data: { reason: 'snapshot_changed' } });
+      });
+
+      it('narrows with name_contains and country and lists the IDs they exclude', async () => {
+        const { fetcher, service } = serviceOver();
+        const named = await service.searchMeps(
+          { mandate_date: '2016-03-09', name_contains: 'benifei', mep_ids: requested },
+          context(),
+        );
+        expect(named.data.items.map((item) => item.mep_id)).toEqual(['124867']);
+        expect(named.data.unmatched_mep_ids).toEqual(['1849', '197665']);
+        fetcher.mockImplementation(async () => envelopeResponse([seatedOn20160309[0]!]));
+        const country = await service.searchMeps(
+          { mandate_date: '2016-03-09', country: 'de', mep_ids: requested },
+          context(),
+        );
+        expect(urlOf(fetcher, 1).searchParams.get('country-of-representation')).toBe('DE');
+        expect(country.data.items.map((item) => item.mep_id)).toEqual(['1849']);
+        expect(country.data.unmatched_mep_ids).toEqual(['124867', '197665']);
+      });
     });
   });
 

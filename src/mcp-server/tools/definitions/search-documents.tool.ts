@@ -30,10 +30,26 @@ const documentSummarySchema = z
       .describe('Exact published label, when available in the catalogue.'),
     work_type: z.string().optional().describe('Published work-type code or URI.'),
     source_url: z.string().describe('Public linked-data source URL for this work.'),
+    title: localizedTextSchema
+      .optional()
+      .describe(
+        'Adopted-text rows only: published title in the requested language, the only one the list returns; absent when the row has none (the notice counts them; mode get reads a title in another language).',
+      ),
+    date: z.string().optional().describe('Adopted-text rows only: published document date.'),
+    procedure_ids: z
+      .array(z.string().describe('Canonical procedure identifier.'))
+      .optional()
+      .describe(
+        'Adopted-text rows only: procedures named by the published family relation, canonical, in published order, sitting events left out, as detail reads them. Use euparl_get_procedure.',
+      ),
   })
   .strict()
-  .describe('Sparse document discovery record; title and dates require detail retrieval.');
+  .describe(
+    'Document discovery record. Adopted-text rows add title, date and procedure_ids; committee and plenary rows carry identity only, so their title and date need mode get.',
+  );
+// Output keys follow schema order, and .extend() keeps a redeclared key at its base position.
 const documentDetailSchema = documentSummarySchema
+  .omit({ title: true, date: true, procedure_ids: true })
   .extend({
     title: localizedTextSchema
       .optional()
@@ -78,7 +94,7 @@ const documentDetailSchema = documentSummarySchema
 export const searchDocumentsTool = tool('euparl_search_documents', {
   title: 'Search parliamentary documents',
   description:
-    'Search adopted texts, committee documents, or plenary documents, then retrieve metadata and source-file links with mode get and document_id. Get accepts IDs from procedures, speeches, votes, questions and answers without a source family; parent_document_ids lead from subdivisions to parent files. Detail preserves adopted_document_ids, based_on_document_ids and public_register_ref; follow published document relations with mode get, while preserving ordinary missing-record and upstream-error outcomes for unavailable targets. Detail procedure_ids also read the procedure an adopted text, plenary or committee document publishes on its family record; adopted and based-on document relations never imply procedure links. Only adopted_texts supports text, title, sitting dates and related_process_id. Committee supports term but no year; plenary supports year but no term. Use euparl_list_reference topic document_types for family-specific work_type codes. Detail returns links, not extracted full text. Non-keyword adopted texts use doc-id:asc and aligned 100-row upstream pages independently of caller limit. Keyword searches retain relevance order and can repeat or omit records across pages. Adopted texts expose at most 10000 search results; continue with page.next_offset when present, otherwise narrow supported filters.',
+    'Search adopted texts, committee documents, or plenary documents, then retrieve metadata and source-file links with mode get and document_id. Get accepts IDs from procedures, speeches, votes, questions and answers without a source family; parent_document_ids lead from subdivisions to parent files. Detail preserves adopted_document_ids, based_on_document_ids and public_register_ref; follow published document relations with mode get, while preserving ordinary missing-record and upstream-error outcomes for unavailable targets. Detail procedure_ids also read the procedure an adopted text, plenary or committee document publishes on its family record; adopted and based-on document relations never imply procedure links. Only adopted_texts supports text, title, sitting dates and related_process_id. Committee supports term but no year; plenary supports year but no term. Use euparl_list_reference topic document_types for family-specific work_type codes. Detail returns links, not extracted full text. Adopted-text rows carry title in the requested language, date and procedure_ids; committee and plenary rows carry identity only. An adopted-text page holds at most 100 rows. Non-keyword adopted texts use doc-id:asc and aligned 100-row upstream pages independently of caller limit. Keyword searches retain relevance order and can repeat or omit records across pages. Adopted texts expose at most 10000 search results; continue with page.next_offset when present, otherwise narrow supported filters.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -95,7 +111,7 @@ export const searchDocumentsTool = tool('euparl_search_documents', {
           'Search-only family; omitted search defaults to adopted_texts. Omit entirely in get mode.',
         ),
       document_id: optionalString().describe(
-        'Get-only canonical work ID, eli/dl/doc/ prefix or exact public URI; no family restriction.',
+        'Get-only work ID from any tool, no family restriction: canonical ID (TA-9-2024-0138), eli/dl/doc/ prefix or exact public URI, in any letter case, or a returned citation (label, public_register_ref or decision label): T9-0138/2024, P9_TA(2024)0138, A9-0188/2023, P9_A(2023)0188, B9-0163/2024 (read as B-, else the QOB- question motion), RC-B9-0163/2024 or P9_OJQ(2024)03-13. Question citations belong to euparl_list_questions.',
       ),
       text: optionalString().describe(
         'Adopted-texts-only keyword search in the requested language.',

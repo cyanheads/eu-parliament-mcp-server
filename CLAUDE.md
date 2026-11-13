@@ -2,8 +2,8 @@
 
 **Server:** eu-parliament-mcp-server
 **Version:** 0.2.2
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
@@ -60,11 +60,12 @@ The upstream API is keyless, with no base-URL override. `src/config/server-confi
 
 ### Domain invariants
 
-- Only adopted texts and speeches accept keyword search. Speech search accepts terms 9 and 10, defaulting to 10; document and speech detail returns metadata and file references, not extracted bodies.
+- Only adopted texts and speeches accept keyword search. Speech search accepts terms 9 and 10, defaulting to 10; document and question detail returns metadata and file references, not extracted bodies. Speech text comes only from `include_text`, in the requested language with no fallback.
 - Page whole items with `page.next_offset`; local collections require the returned `snapshot` above offset zero, except `process_type` procedure listings, where it is optional. Restart at zero without a snapshot after `snapshot_changed`.
 - Parliament serves each `/procedures` list request from one of two orderings, so upstream offsets repeat and skip rows; a `process_type` set is acquired whole in one request and sorted by `procedure_id`.
 - Current, explicit-term, and `mandate_date` rosters are acquired completely before filtering names. Voter name resolution needs `roster_term` and never supplies historical affiliations.
-- Preserve missing fields, language provenance, recorded versus intended voters, and absent versus published-empty voter arrays.
+- Preserve missing fields, language provenance, recorded versus intended voters, and absent versus published-empty voter arrays. Voter entries that name no person (`person/` with no identifier, on some 2019 decisions) are left out of `voters`, `voter_counts` and `mep_position` with a notice; the published tallies stay.
+- Classify by where a value came from: a malformed identifier the caller supplied is `invalid_filter`, one inside a Parliament record is a serialization error. Every `invalid_filter` names the parameter, quotes the value, lists the accepted codes or forms, and carries its own hint.
 - Keep source attribution to European Parliament Open Data, CC BY 4.0, and disclose identifier/structure normalization.
 
 ---
@@ -246,7 +247,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 `mcpb pack` reads `.mcpbignore`, so exclude root development paths with anchored patterns (`/docs/`, never `docs/`). Root `skills/` remains distributable. The cleaner also strips node-gyp generator output beside `binding.gyp` (which embeds packing-machine paths) and framework build-only files, including its changelog, scripts, templates, agent docs, and config bases. Compiled `*.node` addons remain. Run packaging validation only after packing and cleanup finish.
 
-`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips two classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere; a `skills/` deeper in a package is runtime code and stays) and platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on. A server using DataCanvas therefore ships a portable bundle without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so canvas tools report an actionable install hint and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 

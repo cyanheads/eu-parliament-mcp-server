@@ -1,4 +1,5 @@
 /** @fileoverview HTTP-boundary checks for Parliament transport and operation budgets. */
+import { McpError } from '@cyanheads/mcp-ts-core/errors';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { EuParliamentClient } from '../../../src/services/eu-parliament/eu-parliament-client.js';
@@ -95,6 +96,29 @@ describe('EuParliamentClient', () => {
     expect(init?.signal).toBeInstanceOf(AbortSignal);
   });
 
+  it('sends language on the adopted-texts list route only, where it replaces view', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse([]));
+    const client = new EuParliamentClient({ fetch: fetcher });
+    await client.get(
+      'adopted-texts',
+      { offset: 0, limit: 100, language: 'hr', 'search-language': 'hr' },
+      record,
+      client.operation(signal()),
+    );
+    expect(String(fetcher.mock.calls[0]?.[0])).toBe(
+      'https://data.europarl.europa.eu/api/v2/adopted-texts?offset=0&limit=100&language=hr&search-language=hr&format=application%2Fld%2Bjson',
+    );
+    for (const [path, query] of [
+      ['adopted-texts', { view: 'list' }],
+      ['committee-documents', { language: 'en' }],
+      ['plenary-documents', { language: 'en' }],
+    ] as const)
+      await expect(client.get(path, query, record, client.operation(signal()))).rejects.toThrow(
+        `Unsupported query parameter: ${Object.keys(query)[0]}`,
+      );
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
   it.each(['adopted-texts', 'committee-documents', 'plenary-documents'])(
     'reads the %s family record with only the language query',
     async (family) => {
@@ -111,6 +135,42 @@ describe('EuParliamentClient', () => {
       );
     },
   );
+
+  it.each([
+    [
+      'speeches',
+      { offset: 0, limit: 100, 'include-output': 'xml_fragment', language: 'en' },
+      'speeches?offset=0&limit=100&include-output=xml_fragment&language=en',
+    ],
+    [
+      'speeches/MTG-PL-2024-03-12-OTH-22050000',
+      { 'include-output': 'xml_fragment', language: 'en' },
+      'speeches/MTG-PL-2024-03-12-OTH-22050000?include-output=xml_fragment&language=en',
+    ],
+  ])('sends the speech text options on %s', async (path, query, route) => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse([]));
+    const client = new EuParliamentClient({ fetch: fetcher });
+    await client.get(path, query, record, client.operation(signal()));
+    expect(String(fetcher.mock.calls[0]?.[0])).toBe(
+      `https://data.europarl.europa.eu/api/v2/${route}&format=application%2Fld%2Bjson`,
+    );
+  });
+
+  it.each([
+    ['speeches/S-1', { limit: 1 }],
+    ['speeches/S-1', { 'search-language': 'en' }],
+    ['speeches/S-1/x', { language: 'en' }],
+    ['documents/ABC', { 'include-output': 'xml_fragment' }],
+    ['parliamentary-questions/E-10-2025-000001', { language: 'en' }],
+    ['parliamentary-questions', { 'include-output': 'xml_fragment' }],
+  ])('keeps speech text options off other routes: %s %j', async (path, query) => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new EuParliamentClient({ fetch: fetcher });
+    await expect(client.get(path, query, record, client.operation(signal()))).rejects.toThrow(
+      /^Unsupported (?:query parameter|Parliament endpoint)/,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
 
   it.each([
     ['https://evil.example/x', {}],
@@ -144,6 +204,45 @@ describe('EuParliamentClient', () => {
       'https://data.europarl.europa.eu/api/v2/meps/show-current?mandate-date=2024-03-13&country-of-representation=MT&format=application%2Fld%2Bjson',
     );
   });
+
+  it('reads a sitting vote-results route with only the format query', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse([]));
+    const client = new EuParliamentClient({ fetch: fetcher });
+    await client.get(
+      'meetings/MTG-PL-2024-03-13/vote-results',
+      {},
+      record,
+      client.operation(signal()),
+    );
+    expect(String(fetcher.mock.calls[0]?.[0])).toBe(
+      'https://data.europarl.europa.eu/api/v2/meetings/MTG-PL-2024-03-13/vote-results?format=application%2Fld%2Bjson',
+    );
+  });
+
+  it.each([{ offset: 0 }, { limit: 50 }, { language: 'en' }])(
+    'rejects the vote-results paging and language query %j before fetch',
+    async (query) => {
+      const fetcher = vi.fn<typeof fetch>();
+      const client = new EuParliamentClient({ fetch: fetcher });
+      await expect(
+        client.get(
+          'meetings/MTG-PL-2024-03-13/vote-results',
+          query,
+          record,
+          client.operation(signal()),
+        ),
+      ).rejects.toThrow(`Unsupported query parameter: ${Object.keys(query)[0]}`);
+      await expect(
+        client.get(
+          'meetings/MTG-PL-2024-03-13/vote-results/x',
+          {},
+          record,
+          client.operation(signal()),
+        ),
+      ).rejects.toThrow('Unsupported Parliament endpoint');
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     'documents/..',
@@ -265,6 +364,63 @@ describe('EuParliamentClient', () => {
       expect(waits).toEqual([]);
     },
   );
+
+  it.each([
+    ['7', 0, 7000, 7],
+    ['Thu, 01 Jan 1970 00:00:03 GMT', 700, 2300, 3],
+    ['Thu, 01 Jan 1970 00:00:01 GMT', 700, 300, 1],
+    ['999', 0, 10_000, 999],
+    ['0', 0, 0, 0],
+  ])(
+    'reports a persistent 429 with Retry-After %j at clock %i as retry_after_ms %i and retryAfter %i seconds',
+    async (header, now, retry_after_ms, retryAfter) => {
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockImplementation(
+          async () => new Response(null, { status: 429, headers: { 'retry-after': header } }),
+        );
+      const waits: number[] = [];
+      const client = new EuParliamentClient({
+        fetch: fetcher,
+        now: () => now,
+        wait: async (ms) => {
+          waits.push(ms);
+        },
+      });
+      const error = await client
+        .get('meps', {}, record, client.operation(signal()))
+        .catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(McpError);
+      expect((error as McpError).data).toEqual({
+        reason: 'upstream_rate_limited',
+        retryable: true,
+        retry_after_ms,
+        retryAfter,
+      });
+      expect(fetcher).toHaveBeenCalledTimes(3);
+      // Between attempts the client still sleeps the capped wait, never the reported one.
+      expect(waits.filter((ms) => ms === retry_after_ms)).toHaveLength(2);
+    },
+  );
+
+  it.each([
+    ['no Retry-After header', {}],
+    ['an unparseable Retry-After header', { 'retry-after': 'soon' }],
+  ])('reports no retry interval for a persistent 429 with %s', async (_case, headers) => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => new Response(null, { status: 429, headers }));
+    const client = new EuParliamentClient({ fetch: fetcher, wait: instantWait });
+    const error = await client
+      .get('meps', {}, record, client.operation(signal()))
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(McpError);
+    expect((error as McpError).data).toEqual({
+      reason: 'upstream_rate_limited',
+      retryable: true,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
 
   it('spaces concurrent requests FIFO by 700ms using fake timers', async () => {
     vi.useFakeTimers();

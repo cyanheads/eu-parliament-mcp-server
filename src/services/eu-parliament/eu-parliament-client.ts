@@ -17,6 +17,11 @@ import packageMetadata from '../../../package.json' with { type: 'json' };
 
 const origin = 'https://data.europarl.europa.eu/';
 const lists = ['offset', 'limit'];
+/**
+ * `include-output=xml_fragment` embeds the spoken text in each recording document; `language`
+ * narrows those fragments and the activity label to one language.
+ */
+const speechText = ['include-output', 'language'];
 const allowlists = new Map<string, readonly string[]>([
   ['procedures', [...lists, 'process-type']],
   ['corporate-bodies', [...lists, 'body-classification']],
@@ -33,7 +38,8 @@ const allowlists = new Map<string, readonly string[]>([
       'sitting-date',
       'sitting-date-end',
       'related-process-id',
-      'view',
+      // Rows then carry title (that language only), date and family relations; `view=list` omits them.
+      'language',
       'sort-by',
     ],
   ],
@@ -52,6 +58,7 @@ const allowlists = new Map<string, readonly string[]>([
       'sitting-date-end',
       'parliamentary-term',
       'sort-by',
+      ...speechText,
     ],
   ],
   [
@@ -65,11 +72,16 @@ const allowlists = new Map<string, readonly string[]>([
   ['meetings', [...lists, 'year']],
   ['parliamentary-questions', [...lists, 'year', 'work-type']],
 ]);
-/** Single-record and sitting-decision routes accept no query parameters. */
+/**
+ * Single-record, sitting-decision and sitting vote-result routes accept no query parameters:
+ * `vote-results` paging truncates its items at 50 and reorders them, and `language` reorders them.
+ */
 const detailRoute =
-  /^(?:procedures|documents|speeches|meps|parliamentary-questions|corporate-bodies)\/[^/]+$|^meetings\/[^/]+\/decisions$/;
+  /^(?:procedures|documents|meps|parliamentary-questions|corporate-bodies)\/[^/]+$|^meetings\/[^/]+\/(?:decisions|vote-results)$/;
 /** Document family records accept only `language`, which selects the expressions they embed. */
 const familyDetailRoute = /^(?:adopted-texts|committee-documents|plenary-documents)\/[^/]+$/;
+/** A speech record accepts only the text options of the speech list. */
+const speechDetailRoute = /^speeches\/[^/]+$/;
 
 /**
  * One deadline covers every request, queue wait and backoff of a domain operation, inside the
@@ -175,7 +187,13 @@ export class EuParliamentClient {
     if (!/^[A-Za-z0-9_/-]+$/.test(path)) throw new Error('Unsupported Parliament endpoint');
     const allowed =
       allowlists.get(path) ??
-      (familyDetailRoute.test(path) ? ['language'] : detailRoute.test(path) ? [] : undefined);
+      (familyDetailRoute.test(path)
+        ? ['language']
+        : speechDetailRoute.test(path)
+          ? speechText
+          : detailRoute.test(path)
+            ? []
+            : undefined);
     if (!allowed) throw new Error('Unsupported Parliament endpoint');
     const url = new URL(`api/v2/${path}`, origin);
     for (const [key, value] of Object.entries(query)) {
@@ -208,17 +226,25 @@ export class EuParliamentClient {
             );
           const transient = [408, 429, 500, 502, 503, 504].includes(response.status);
           const header = response.headers.get('retry-after');
+          // The wait Parliament asked for, in ms: delta-seconds or an HTTP-date, never negative.
+          let requestedMs: number | undefined;
           if (header) {
-            const seconds = /^\d+$/.test(header)
+            const ms = /^\d+$/.test(header)
               ? Number(header) * 1000
               : Date.parse(header) - this.now();
-            if (Number.isFinite(seconds)) retryAfterMs = Math.min(10_000, Math.max(0, seconds));
+            if (Number.isFinite(ms)) requestedMs = Math.max(0, ms);
           }
+          // Sleeps between attempts are capped so one wait cannot spend the operation deadline.
+          if (requestedMs !== undefined) retryAfterMs = Math.min(10_000, requestedMs);
           if (response.status === 429)
             throw rateLimited('Parliament rate limit reached. Wait before retrying.', {
               reason: 'upstream_rate_limited',
               retryable: true,
-              ...(retryAfterMs !== undefined && { retry_after_ms: retryAfterMs }),
+              ...(requestedMs !== undefined && {
+                retry_after_ms: retryAfterMs,
+                // Whole seconds, uncapped: the framework renders it as the caller's wait.
+                retryAfter: Math.ceil(requestedMs / 1000),
+              }),
             });
           throw serviceUnavailable('Parliament could not serve the request. Retry later.', {
             status: response.status,

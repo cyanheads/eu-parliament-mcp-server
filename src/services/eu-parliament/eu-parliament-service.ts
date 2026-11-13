@@ -24,9 +24,14 @@ import {
   compareText,
   type DecisionSummary,
   decisionVoters,
+  documentInputIds,
   field,
+  type IdInput,
+  type LocalizedText,
+  listedVoteItems,
   localized,
   localPage,
+  normalizeAdoptedTextRow,
   normalizeDecision,
   normalizeDecisionSummary,
   normalizeDocument,
@@ -36,24 +41,33 @@ import {
   normalizeProcedure,
   normalizeQuestion,
   normalizeSpeech,
+  normalizeVoteItem,
+  nounForms,
   type PagedCollection,
   type PageWindow,
   type Paging,
   pageCaps,
   pageWindow,
   procedureIds,
+  searchResultWindow,
   sourceUrl,
+  unnamedVotersNotice,
   upstreamPage,
   type VoterPosition,
 } from './eu-parliament-normalization.js';
 import {
   documentFamily,
+  firstDecisionSitting,
+  labelCitation,
+  listed,
   normalizeCode,
+  politicalGroupNotice,
   type ReferenceEntry,
   type ReferenceTopic,
   referenceEntries,
 } from './eu-parliament-reference.js';
 import {
+  adoptedTextRowSchema,
   bodySchema,
   decisionSchema,
   documentFamilySchema,
@@ -61,13 +75,16 @@ import {
   mepSchema,
   procedureSchema,
   questionSchema,
+  type RawAdoptedTextRow,
   type RawBody,
   type RawDocument,
   type RawMep,
   type RawProcedure,
   type RawQuestion,
+  type RawVoteItem,
   sittingSchema,
   speechSchema,
+  voteItemSchema,
 } from './eu-parliament-schemas.js';
 
 /** Request dependency is explicit; no state or logging is needed for public reads. */
@@ -112,9 +129,10 @@ export interface DocumentsInput extends Paging {
   work_type?: string;
   year?: number;
 }
-/** Speech metadata search or detail. */
+/** Speech metadata search or detail, with spoken text on request. */
 export interface SpeechesInput extends Paging {
   activity_type?: string;
+  include_text?: boolean;
   mode?: 'search' | 'get';
   person_id?: string;
   sitting_date?: string;
@@ -130,22 +148,30 @@ export interface MepsInput extends Paging {
   gender?: string;
   /** YYYY-MM-DD on `meps/show-current`; exclusive with term. */
   mandate_date?: string;
+  /** Person IDs in any `euparl_get_mep` form, matched against the acquired roster. */
+  mep_ids?: string[];
   name_contains?: string;
   political_group?: string;
   term?: number;
 }
 /** Identity and separately paged membership history. */
 export interface MepInput extends Paging {
+  /** Memberships whose published interval includes this YYYY-MM-DD date, both ends inclusive. */
+  active_on?: string;
+  /** A membershipClassification code, bare or `def/ep-entities/`-prefixed, any case. */
+  classification?: string;
   mep_id: string;
   section?: 'overview' | 'memberships';
 }
+/** The `euparl_get_mep` person identifier grammar: decimal ID, `person/` prefix, or the exact public URI. */
+export const personIdPattern = /^(?:https:\/\/data\.europarl\.europa\.eu\/person\/|person\/)?\d+$/;
 /** Sitting discovery, compact decisions, rich decision or one voter position. */
 export interface VotesInput extends Paging {
   decision_id?: string;
   document_id?: string;
   label_contains?: string;
   mep_id?: string;
-  mode?: 'sittings' | 'decisions' | 'decision' | 'voters';
+  mode?: 'sittings' | 'vote_items' | 'decisions' | 'decision' | 'voters';
   position?: VoterPosition;
   resolve_names?: boolean;
   roster_term?: number;
@@ -165,11 +191,8 @@ export interface QuestionsInput extends Paging {
 function invalidMode(message: string, hint = message): never {
   throw validationError(message, { reason: 'invalid_mode_fields', recovery: { hint } });
 }
-function invalidFilter(message: string, hint?: string): never {
-  throw validationError(message, {
-    reason: 'invalid_filter',
-    ...(hint !== undefined && { recovery: { hint } }),
-  });
+function invalidFilter(message: string, hint: string): never {
+  throw validationError(message, { reason: 'invalid_filter', recovery: { hint } });
 }
 function meaningful(value: unknown): boolean {
   return (
@@ -211,25 +234,56 @@ function normalizeLabel(value: string): string {
     .replace(/\s+/gu, ' ')
     .trim();
 }
-function date(value: string): string {
+/** A missing label never matches a normalized `label_contains` query. */
+function labelMatches(label: LocalizedText | undefined, query: string): boolean {
+  return label !== undefined && normalizeLabel(label.value).includes(query);
+}
+/** A person identifier the caller passed as `parameter`, with the call that returns one. */
+function personInput(parameter: string): IdInput {
+  return {
+    parameter,
+    hint: `Call euparl_search_meps with name_contains for the member's mep_id, then retry with it as ${parameter}.`,
+  };
+}
+/** A procedure identifier the caller passed as `parameter`, with the call that returns one. */
+function procedureInput(parameter: string): IdInput {
+  return {
+    parameter,
+    hint: `Call euparl_list_procedures for procedure_id values, then retry with one as ${parameter}.`,
+  };
+}
+/** Older question records name addressees with these URIs, which no Parliament route resolves. */
+const authorityCorporateBodies = 'http://publications.europa.eu/resource/authority/corporate-body/';
+/**
+ * Rejects anything but an existing calendar day, naming `parameter` and quoting `written`, the
+ * caller's input when `value` was derived from it.
+ */
+function date(
+  value: string,
+  parameter: string,
+  {
+    hint = 'Pass an existing calendar day as YYYY-MM-DD.',
+    written = value,
+  }: { hint?: string; written?: string } = {},
+): string {
   if (
     !/^\d{4}-\d{2}-\d{2}$/.test(value) ||
     Number.isNaN(Date.parse(value)) ||
     new Date(value).toISOString().slice(0, 10) !== value
   )
     invalidFilter(
-      'Use a real calendar date in YYYY-MM-DD form.',
-      'Pass an existing calendar day as YYYY-MM-DD.',
+      `${parameter} ${JSON.stringify(written)} is not a real calendar date in YYYY-MM-DD form.`,
+      hint,
     );
   return value;
 }
 function dates(input: { sitting_date?: string; sitting_date_end?: string }): void {
-  if (input.sitting_date) date(input.sitting_date);
+  if (input.sitting_date) date(input.sitting_date, 'sitting_date');
   if (input.sitting_date_end) {
-    date(input.sitting_date_end);
+    date(input.sitting_date_end, 'sitting_date_end');
     if (!input.sitting_date || input.sitting_date_end < input.sitting_date)
       invalidFilter(
-        'sitting_date_end requires an ordered sitting_date range.',
+        `sitting_date_end ${JSON.stringify(input.sitting_date_end)} needs a sitting_date on or before it, but sitting_date ${input.sitting_date ? `is ${JSON.stringify(input.sitting_date)}` : 'was not supplied'}.`,
         'Pass sitting_date with sitting_date_end, on or before it.',
       );
   }
@@ -269,8 +323,11 @@ function result<T>(
     },
   };
 }
-const searchResultWindow = 10_000;
-let limitClamps: ReturnType<typeof createCounter> | undefined;
+const limitClamps = createCounter(
+  'euparl.limit.clamps',
+  'Paged calls whose requested limit was narrowed to a collection cap or search window',
+  '{calls}',
+);
 const loggedClamps = new Set<PagedCollection>();
 /**
  * Disclose a limit the collection cap or the search window narrowed. Every clamp is counted;
@@ -281,11 +338,6 @@ function noticesFor(input: Paging, paging: PageWindow, collection: PagedCollecti
   if (paging.limit >= requested) return [];
   const { maximum, noun } = pageCaps[collection];
   const bound = paging.limit < maximum ? 'search_window' : 'collection_cap';
-  limitClamps ??= createCounter(
-    'euparl.limit.clamps',
-    'Paged calls whose requested limit was narrowed to a collection cap or search window',
-    '{calls}',
-  );
   limitClamps.add(1, { 'euparl.collection': collection, 'euparl.limit.bound': bound });
   if (!loggedClamps.has(collection)) {
     loggedClamps.add(collection);
@@ -421,7 +473,7 @@ function decisionsUnmatched(
       ...(document_id === undefined ? [] : ['document_id']),
       ...(vote_item_id === undefined ? [] : ['vote_item_id']),
     ].join(' and ');
-    return `No decision in this sitting publishes a decided-on, part-of or vote-item relation, so a report or vote item cannot select its decisions. Remove ${names} and use label_contains with the report's citation (its document label, such as A9-0188/2023). Matching label text does not establish a final vote.`;
+    return `No decision in this sitting publishes a decided-on, part-of or vote-item relation, so a report or vote item cannot select its decisions. Remove ${names} and use label_contains with the report's citation as decision labels write it (${labelCitation}), or, when no decision label carries it, with words of the vote item's title from mode vote_items and language set to the title's language. Matching label text does not establish a final vote.`;
   }
   if (vote_item_id !== undefined) {
     const held = decisions.filter((decision) => decision.vote_item_ids.includes(vote_item_id));
@@ -433,6 +485,29 @@ function decisionsUnmatched(
     ? "No decisions matched document_id in the complete sitting. A vote can decide on no document: pass the procedure's PLENARY_VOTE_RESULTS event id as vote_item_id, or remove document_id to inspect all published decisions."
     : 'No decisions matched document_id in the complete sitting. Remove document_id to inspect all published decisions.';
 }
+/**
+ * A sitting's vote items in published order, without the roll-call, split and separate-vote
+ * requests published beside them. Every item embeds its sitting's complete vote-item list, so a
+ * read missing a listed item (the route documents a default page of 50) is incomplete.
+ */
+function sittingVoteItems(
+  raws: RawVoteItem[],
+  sitting_id: string,
+  language: string,
+  notices: string[],
+) {
+  const items = raws.filter(
+    (raw) => raw.had_activity_type?.split('/').at(-1) === 'PLENARY_VOTE_RESULTS',
+  );
+  const returned = new Set(items.map((raw) => sourceUrl(raw.id)));
+  const sittingList = new Set(items.flatMap((raw) => listedVoteItems(raw, sitting_id)));
+  const present = [...sittingList].filter((id) => returned.has(id)).length;
+  if (present < sittingList.size)
+    stalled(
+      `Parliament returned ${present} of the ${sittingList.size} vote items this sitting lists. Retry later.`,
+    );
+  return items.map((raw) => normalizeVoteItem(raw, language, notices));
+}
 
 /** Public GET workflow service; one client instance shares pacing across operations. */
 export class EuParliamentService {
@@ -441,13 +516,18 @@ export class EuParliamentService {
     this.client = new EuParliamentClient(options);
   }
 
-  /** Fixed 100-row geometry keeps equal-sort-key ordering independent of caller page sizes. */
+  /**
+   * Fixed 100-row geometry keeps equal-sort-key ordering independent of caller page sizes.
+   * `compare` puts each aligned page in a fixed order before it is sliced, for a view that returns
+   * a page's rows in varying order.
+   */
   private async alignedSearch<T>(
     path: string,
     query: Record<string, string | number | undefined>,
     schema: z.ZodType<T>,
     operation: Operation,
     paging: PageWindow,
+    { compare }: { compare?: (a: T, b: T) => number } = {},
   ): Promise<Envelope<T>> {
     const size = 100;
     const data: T[] = [];
@@ -465,9 +545,8 @@ export class EuParliamentService {
       );
       total = response.total ?? total;
       const start = Math.max(0, paging.offset - offset);
-      data.push(
-        ...response.data.slice(start, Math.min(size, paging.offset + paging.limit - offset)),
-      );
+      const rows = compare ? response.data.toSorted(compare) : response.data;
+      data.push(...rows.slice(start, Math.min(size, paging.offset + paging.limit - offset)));
       if (response.data.length < size || (total !== undefined && offset + size >= total)) {
         // A short aligned page establishes its end even when the upstream omits a total.
         if (response.data.length > 0 || offset === 0) total ??= offset + response.data.length;
@@ -508,7 +587,19 @@ export class EuParliamentService {
           'organizations requires nonempty organization_ids.',
           'Supply a nonempty organization_ids list for topic organizations.',
         );
-      const ids = input.organization_ids.map((id) => canonicalId(id, 'organization'));
+      // The whole list is checked before any request; an entry is named by its 1-based position.
+      const ids = input.organization_ids.map((id, index) => {
+        const parameter = `organization_ids entry ${index + 1}`;
+        if (id.trim().startsWith(authorityCorporateBodies))
+          invalidFilter(
+            `${parameter} ${JSON.stringify(id)} is an EU authority URI, not a Parliament organization identifier. Accepted forms: ${nounForms.organization.forms}.`,
+            "Remove EU authority URIs from organization_ids: Parliament publishes no organization record for them, and a trailing code is no substitute (COM here is the Communist and Allies Group). A question's alternative_title names its addressee in words.",
+          );
+        return canonicalId(id, 'organization', {
+          parameter,
+          hint: 'Call euparl_list_reference with topic political_groups or committees for group and committee codes, or take organization IDs from euparl_get_mep memberships or euparl_get_procedure participants, then retry organization_ids.',
+        });
+      });
       const items: ReferenceEntry[] = [];
       for (const organization_id of ids.slice(paging.offset, paging.offset + paging.limit)) {
         const response = await this.client.get(
@@ -654,7 +745,11 @@ export class EuParliamentService {
     const operation = this.client.operation(ctx.signal);
     const paging = scopePage(input, 'procedure_sections');
     const notices = noticesFor(input, paging, 'procedure_sections');
-    const procedure_id = canonicalId(input.procedure_id, 'procedure');
+    const procedure_id = canonicalId(
+      input.procedure_id,
+      'procedure',
+      procedureInput('procedure_id'),
+    );
     const section = input.section ?? 'overview';
     if (section === 'overview' && paging.offset !== 0)
       invalidMode(
@@ -686,8 +781,12 @@ export class EuParliamentService {
       );
     }
     const requestedType = /\(([A-Z]+)\)$/.exec(input.procedure_id)?.[1];
-    if (requestedType && raw.process_type?.split('/').at(-1) !== requestedType)
-      invalidFilter('Procedure citation type conflicts with the published procedure type.');
+    const publishedType = raw.process_type?.split('/').at(-1);
+    if (requestedType && publishedType !== requestedType)
+      invalidFilter(
+        `procedure_id ${JSON.stringify(input.procedure_id)} names type ${requestedType}, but Parliament publishes ${publishedType === undefined ? `no type for procedure ${procedure_id}` : `procedure ${procedure_id} as type ${publishedType}`}.`,
+        `Retry with procedure_id ${procedure_id}, without the type suffix${publishedType === undefined ? '' : `, or ${procedure_id}(${publishedType})`}.`,
+      );
     const { events, participants, documents, ...overview } = normalizeProcedure(
       raw,
       paging.language,
@@ -766,17 +865,29 @@ export class EuParliamentService {
         'related_process_id',
       ]);
       detailPaging(input);
-      const document_id = canonicalId(required(input.document_id, 'document_id'), 'document');
-      const response = await this.client.get(
-        `documents/${document_id}`,
-        {},
-        documentSchema,
-        operation,
-      );
-      const raw = response.data[0];
+      const candidates = documentInputIds(required(input.document_id, 'document_id'));
+      let [document_id] = candidates;
+      let raw: RawDocument | undefined;
+      for (const candidate of candidates) {
+        raw = (await this.client.get(`documents/${candidate}`, {}, documentSchema, operation))
+          .data[0];
+        if (!raw) continue;
+        // A citation naming two families is answered only by the record carrying the read identity.
+        if (
+          candidates.length > 1 &&
+          canonicalId(raw.identifier ?? raw.id, 'document') !== candidate
+        )
+          throw serializationError(
+            'Parliament returned a different document identifier than requested.',
+          );
+        document_id = candidate;
+        break;
+      }
       if (!raw)
         notices.push(
-          'No document detail was published. Call euparl_search_documents in search mode to discover identifiers.',
+          candidates.length > 1
+            ? `No document detail was published as ${candidates.join(' or ')}. Call euparl_search_documents in search mode to discover identifiers.`
+            : 'No document detail was published. Call euparl_search_documents in search mode to discover identifiers.',
         );
       const familyIds = raw ? await this.familyProcedureIds(raw, operation, notices) : [];
       return result(
@@ -797,18 +908,12 @@ export class EuParliamentService {
       'Narrow text, title, year, term, work_type, sitting dates or related_process_id.';
     if (source === 'adopted_texts') searchWindow(paging, `${narrowing} ${restartAfterNarrowing}`);
     dates(input);
-    if (
-      source !== 'adopted_texts' &&
-      [
-        input.text,
-        input.title,
-        input.sitting_date,
-        input.sitting_date_end,
-        input.related_process_id,
-      ].some(meaningful)
-    )
+    const adoptedOnly = (
+      ['text', 'title', 'sitting_date', 'sitting_date_end', 'related_process_id'] as const
+    ).filter((key) => meaningful(input[key]));
+    if (source !== 'adopted_texts' && adoptedOnly.length)
       invalidFilter(
-        'Keyword, sitting-date and related-process filters are available only for adopted_texts.',
+        `${listed(adoptedOnly)} ${adoptedOnly.length === 1 ? 'is' : 'are'} accepted only with source "adopted_texts", not with source ${JSON.stringify(source)}.`,
         'Use source adopted_texts for text, title, sitting_date, sitting_date_end or related_process_id, or remove those filters.',
       );
     if (source === 'committee' && input.year !== undefined)
@@ -823,7 +928,7 @@ export class EuParliamentService {
       );
     const work_type = normalizeCode(input.work_type, source);
     const related_process_id = input.related_process_id
-      ? canonicalId(input.related_process_id, 'procedure')
+      ? canonicalId(input.related_process_id, 'procedure', procedureInput('related_process_id'))
       : undefined;
     const filters = {
       source,
@@ -850,24 +955,22 @@ export class EuParliamentService {
         'sitting-date': input.sitting_date,
         'sitting-date-end': input.sitting_date_end,
         'related-process-id': related_process_id,
-        view: 'list',
+        language: paging.language,
       }),
     };
-    const response =
-      source === 'adopted_texts' && !keywords
-        ? await this.alignedSearch(
-            documentEndpoints[source],
-            { ...query, 'sort-by': 'doc-id:asc' },
-            documentSchema,
-            operation,
-            paging,
-          )
-        : await this.client.get(documentEndpoints[source], query, documentSchema, operation);
     if (source === 'adopted_texts' && keywords)
       notices.push(
         'Keyword searches retain upstream relevance order; pages can repeat or omit records as ordering changes.',
       );
-    const items = response.data.map(normalizeDocumentSummary);
+    const { items, total } =
+      source === 'adopted_texts'
+        ? await this.adoptedTextRows(query, keywords, paging, operation, notices)
+        : await this.client
+            .get(documentEndpoints[source], query, documentSchema, operation)
+            .then((response) => ({
+              items: response.data.map(normalizeDocumentSummary),
+              total: response.total,
+            }));
     if (!items.length)
       notices.push(
         emptyNotice(
@@ -878,9 +981,43 @@ export class EuParliamentService {
       );
     const paged =
       source === 'adopted_texts'
-        ? searchPage(items.length, paging, response.total, notices, narrowing)
-        : { page: upstreamPage(items.length, paging, response.total), total: response.total };
+        ? searchPage(items.length, paging, total, notices, narrowing)
+        : { page: upstreamPage(items.length, paging, total), total };
     return result({ mode, source, items, page: paged.page }, filters, notices, paged.total);
+  }
+
+  /**
+   * Adopted-text rows in the requested language: keyword searches keep relevance order; other
+   * searches read aligned pages reordered by document_id, since `language=` returns the page set
+   * of the sorted list in varying order. Returned rows without a title in that language are counted.
+   */
+  private async adoptedTextRows(
+    query: Record<string, string | number | undefined>,
+    keywords: boolean,
+    paging: PageWindow & { language: string },
+    operation: Operation,
+    notices: string[],
+  ) {
+    const path = documentEndpoints.adopted_texts;
+    const documentId = (raw: RawAdoptedTextRow) =>
+      canonicalId(raw.identifier ?? raw.id, 'document');
+    const response = keywords
+      ? await this.client.get(path, query, adoptedTextRowSchema, operation)
+      : await this.alignedSearch(
+          path,
+          { ...query, 'sort-by': 'doc-id:asc' },
+          adoptedTextRowSchema,
+          operation,
+          paging,
+          { compare: (a, b) => compareText(documentId(a), documentId(b)) },
+        );
+    const items = response.data.map((raw) => normalizeAdoptedTextRow(raw, paging.language));
+    const untitled = items.filter((item) => item.title === undefined).length;
+    if (untitled)
+      notices.push(
+        `${plural(untitled, 'row')} on this page ${untitled === 1 ? 'has' : 'have'} no title in ${paging.language}, the only language the adopted-text list returns; mode get with a row's document_id reads its title in another published language.`,
+      );
+    return { items, total: response.total };
   }
 
   /**
@@ -919,14 +1056,39 @@ export class EuParliamentService {
     return [];
   }
 
-  /** Speech results preserve metadata rather than manufacturing transcripts. */
+  /**
+   * Speech metadata, and with `include_text` the published text of each speech: one request per
+   * get, and at most 100 search rows per call because text pages run about 1.7× the bytes.
+   */
   async searchSpeeches(input: SpeechesInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
     const keywords = meaningful(input.text) || meaningful(input.title);
-    const collection = keywords ? 'keyword_speeches' : 'speeches';
+    const text = input.include_text === true;
+    const collection = text ? 'text_speeches' : keywords ? 'keyword_speeches' : 'speeches';
     const paging = scopePage(input, collection, searchResultWindow);
     const notices = noticesFor(input, paging, collection);
     const mode = input.mode ?? 'search';
+    const textQuery = text ? { 'include-output': 'xml_fragment', language: paging.language } : {};
+    /**
+     * Text requests narrow title and text to one language; name the rows that lack either. Chair
+     * rows publish no title in any language, so no retry could supply one and they are not counted.
+     */
+    const textNotice = (speeches: ReturnType<typeof normalizeSpeech>[]) => {
+      const titles = speeches.filter(
+        (speech) =>
+          !speech.title && speech.activity_type !== 'def/ep-activities/MEETING_NAME_CHAIR',
+      ).length;
+      const texts = speeches.filter((speech) => speech.document_ids.length && !speech.text).length;
+      if (!text || (!titles && !texts)) return;
+      const { language } = paging;
+      const missing = [
+        ...(titles ? [`title on ${titles}`] : []),
+        ...(texts ? [`text on ${texts}`] : []),
+      ].join(' and ');
+      notices.push(
+        `include_text returns title and text only in the requested language ${language}, without fallback. Missing in ${language}: ${missing} of ${speeches.length} ${speeches.length === 1 ? 'speech' : 'speeches'}. Retry with ${language === 'en' ? '' : 'language en or '}a language in the speech's original_languages.`,
+      );
+    };
     if (mode === 'get') {
       forbid(input, [
         'text',
@@ -938,18 +1100,24 @@ export class EuParliamentService {
         'sitting_date_end',
       ]);
       detailPaging(input);
-      const speech_id = canonicalId(required(input.speech_id, 'speech_id'), 'activity');
-      const response = await this.client.get(`speeches/${speech_id}`, {}, speechSchema, operation);
+      const speech_id = canonicalId(required(input.speech_id, 'speech_id'), 'activity', {
+        parameter: 'speech_id',
+        hint: 'Call euparl_search_speeches in search mode for speech_id values, then retry mode get with one.',
+      });
+      const response = await this.client.get(
+        `speeches/${speech_id}`,
+        textQuery,
+        speechSchema,
+        operation,
+      );
       const raw = response.data[0];
       if (!raw)
         notices.push('No speech detail was published. Call euparl_search_speeches in search mode.');
+      const speech = raw ? normalizeSpeech(raw, paging.language, notices, { text }) : undefined;
+      if (speech) textNotice([speech]);
       return result(
-        {
-          mode,
-          found: !!raw,
-          ...field('speech', raw ? normalizeSpeech(raw, paging.language, notices) : undefined),
-        },
-        { mode, speech_id, language: paging.language },
+        { mode, found: !!raw, ...field('speech', speech) },
+        { mode, speech_id, language: paging.language, ...(text && { include_text: true }) },
         notices,
       );
     }
@@ -959,7 +1127,9 @@ export class EuParliamentService {
     searchWindow(paging, `${narrowing} ${restartAfterNarrowing}`);
     dates(input);
     const activity_type = normalizeCode(input.activity_type, 'activity_type');
-    const person_id = input.person_id ? canonicalId(input.person_id, 'person') : undefined;
+    const person_id = input.person_id
+      ? canonicalId(input.person_id, 'person', personInput('person_id'))
+      : undefined;
     const query = {
       offset: paging.offset,
       limit: paging.limit,
@@ -971,6 +1141,7 @@ export class EuParliamentService {
       'parliamentary-term': term,
       'sitting-date': input.sitting_date,
       'sitting-date-end': input.sitting_date_end,
+      ...textQuery,
     };
     const response = keywords
       ? await this.client.get('speeches', query, speechSchema, operation)
@@ -985,7 +1156,10 @@ export class EuParliamentService {
       notices.push(
         'Keyword searches retain upstream relevance order; pages can repeat or omit records as ordering changes.',
       );
-    const items = response.data.map((raw) => normalizeSpeech(raw, paging.language, notices));
+    const items = response.data.map((raw) =>
+      normalizeSpeech(raw, paging.language, notices, { text }),
+    );
+    textNotice(items);
     if (!items.length)
       notices.push(
         emptyNotice(
@@ -1007,6 +1181,7 @@ export class EuParliamentService {
         ...field('activity_type', activity_type),
         ...field('sitting_date', input.sitting_date),
         ...field('sitting_date_end', input.sitting_date_end),
+        ...(text && { include_text: true }),
       },
       notices,
       paged.total,
@@ -1059,29 +1234,34 @@ export class EuParliamentService {
     return all;
   }
 
+  private utcToday(): string {
+    return new Date(this.client.now()).toISOString().slice(0, 10);
+  }
+
   /** Full selected roster is acquired before strict token matching and local paging. */
   async searchMeps(input: MepsInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
     const paging = scopePage(input, 'meps');
     const notices = noticesFor(input, paging, 'meps');
     localPaging(input);
-    const today = new Date(this.client.now()).toISOString().slice(0, 10);
+    const today = this.utcToday();
     const mandate_date = input.mandate_date?.trim() ? input.mandate_date : undefined;
     if (mandate_date !== undefined) {
       if (input.term !== undefined)
         invalidMode(
           'Supply term or mandate_date, not both: term selects a term roster, mandate_date the members seated on that date.',
         );
-      date(mandate_date);
+      date(mandate_date, 'mandate_date');
       // Parliament answers a future date with today's roster, which would misreport the date.
       if (mandate_date > today)
         invalidFilter(
-          `mandate_date ${mandate_date} is after the current UTC date ${today}.`,
+          `mandate_date ${JSON.stringify(mandate_date)} is after the current UTC date ${today}.`,
           `Use a mandate_date on or before ${today}, or omit mandate_date for members in office today.`,
         );
     }
     const country = normalizeCode(input.country, 'country');
-    const political_group = normalizeCode(input.political_group, 'political_group');
+    const groupRoster = { term: input.term, mandate_date };
+    const political_group = normalizeCode(input.political_group, 'political_group', groupRoster);
     const gender = normalizeCode(input.gender, 'gender');
     const tokens = input.name_contains
       ? normalizeName(input.name_contains).split(/\s+/).filter(Boolean)
@@ -1089,9 +1269,25 @@ export class EuParliamentService {
     // A tokenless nonblank filter would otherwise match every row and return the whole roster.
     if (!tokens.length && input.name_contains?.trim())
       invalidFilter(
-        'name_contains has no letter or digit after case, diacritic, and punctuation normalization.',
+        `name_contains ${JSON.stringify(input.name_contains)} has no letter or digit after case, diacritic, and punctuation normalization.`,
         'Include at least one letter or digit in name_contains, or omit name_contains to browse the roster.',
       );
+    // Canonical, deduplicated in first-seen order; an empty list is the same call as none.
+    const mepIdsInput = {
+      parameter: 'mep_ids entry',
+      hint: 'Retry euparl_search_meps with only person IDs in mep_ids; resolve org/ identifiers with euparl_list_reference topic organizations and organization_ids instead.',
+    };
+    const wanted = new Set(
+      (input.mep_ids ?? []).map((entry) => {
+        if (!personIdPattern.test(entry.trim()))
+          invalidFilter(
+            `${mepIdsInput.parameter} ${JSON.stringify(entry)} is not ${nounForms.person.name}. Accepted forms: ${nounForms.person.forms}.`,
+            mepIdsInput.hint,
+          );
+        return canonicalId(entry, 'person', mepIdsInput);
+      }),
+    );
+    const mep_ids = [...wanted];
     const filters = {
       ...(input.term !== undefined
         ? { scope: 'parliamentary_term', term: input.term }
@@ -1103,6 +1299,7 @@ export class EuParliamentService {
       ...field('political_group', political_group),
       ...field('gender', gender),
       ...field('name_contains', tokens.length ? tokens.join(' ') : undefined),
+      ...field('mep_ids', mep_ids.length ? mep_ids : undefined),
     };
     const all = await this.roster(
       {
@@ -1130,34 +1327,102 @@ export class EuParliamentService {
           (a.sortLabel ?? '').localeCompare(b.sortLabel ?? '') ||
           canonicalId(a.id, 'person').localeCompare(canonicalId(b.id, 'person')),
       )
-      .map(normalizeMep);
+      .map(normalizeMep)
+      .filter((row) => !wanted.size || wanted.has(row.mep_id));
+    const returned = new Set(selected.map((row) => row.mep_id));
+    const unmatched = mep_ids.filter((id) => !returned.has(id));
     const page = localPage(selected, paging, filters);
     if (!selected.length) {
       notices.push(
         'No MEPs matched. Remove name_contains to browse, relax country or political_group, or call euparl_list_reference with topic mep_filters.',
       );
-      if (!all.length && mandate_date !== undefined && political_group !== undefined)
+      if (!all.length && input.term === undefined && political_group !== undefined)
         notices.push(
-          "On a mandate_date roster, political_group matches only the group code in force on that date; omit political_group and read each member's published political_group.",
+          mandate_date !== undefined
+            ? "On a mandate_date roster, political_group matches only the group code in force on that date; omit political_group and read each member's published political_group."
+            : "On the current roster, political_group matches only the group code in force today; pass mandate_date or term for an earlier group, or omit political_group and read each member's published political_group.",
         );
     }
-    return result({ items: page.items, page: page.page }, filters, notices, page.total);
+    // Parliament matches a term roster against any membership in the code still open at the term's start.
+    if (input.term !== undefined && political_group !== undefined)
+      notices.push(
+        'On a term roster, political_group matches each member of the term holding a membership in that code that had not ended when the term began, including memberships that began later, even after the term ended; it does not show who sat in the group during the term. Pass mandate_date instead of term for the members published under a code on one day.',
+      );
+    const groupNotice = politicalGroupNotice(input.political_group, political_group, groupRoster);
+    if (groupNotice !== undefined) notices.push(groupNotice);
+    if (unmatched.length)
+      notices.push(
+        `${plural(unmatched.length, 'requested mep_id')} matched no row of the selected roster after the other filters; unmatched_mep_ids lists ${unmatched.length === 1 ? 'it' : 'them'}. A term roster holds only that term's members and a mandate_date roster only members seated that day; euparl_get_mep reads any member by ID.`,
+      );
+    return result(
+      {
+        items: page.items,
+        ...(mep_ids.length > 0 && { unmatched_mep_ids: unmatched }),
+        page: page.page,
+      },
+      filters,
+      notices,
+      page.total,
+    );
   }
 
-  /** Full memberships remain a separate local collection. */
+  /**
+   * Full memberships remain a separate local collection, latest start first, filtered by
+   * classification and date before paging; the overview counts them by classification.
+   */
   async getMep(input: MepInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
     const paging = scopePage(input, 'memberships');
     const notices = noticesFor(input, paging, 'memberships');
-    const mep_id = canonicalId(input.mep_id, 'person');
+    const mep_id = canonicalId(input.mep_id, 'person', personInput('mep_id'));
     const section = input.section ?? 'overview';
     if (section === 'overview' && paging.offset !== 0)
       invalidMode(
         'MEP overview rejects nonzero offset.',
         'Use offset 0 for overview, or select memberships for continuation.',
       );
-    if (section !== 'overview') localPaging(input);
-    const filters = { mep_id, section, language: paging.language };
+    const requestedClassification = input.classification?.trim() || undefined;
+    const active_on = input.active_on?.trim() || undefined;
+    if (section === 'overview') {
+      if (requestedClassification !== undefined)
+        invalidMode(
+          `classification ${JSON.stringify(input.classification)} filters membership rows, which only section "memberships" returns.`,
+          'Retry with section "memberships" and the same classification, or remove classification; the overview lists the codes in membership_classifications.',
+        );
+      if (active_on !== undefined)
+        invalidMode(
+          `active_on ${JSON.stringify(input.active_on)} filters membership rows, which only section "memberships" returns.`,
+          'Retry with section "memberships" and the same active_on, or remove active_on; the overview counts every membership.',
+        );
+    } else localPaging(input);
+    let classification: string | undefined;
+    if (requestedClassification !== undefined) {
+      const code = /^(?:def\/ep-entities\/)?([A-Za-z0-9_-]+)$/i.exec(requestedClassification)?.[1];
+      if (code === undefined)
+        invalidFilter(
+          `classification ${JSON.stringify(input.classification)} is not a membership classification code. Accepted forms: a code such as COMMITTEE_PARLIAMENTARY_STANDING, bare or as published (def/ep-entities/COMMITTEE_PARLIAMENTARY_STANDING), in any case.`,
+          'Call euparl_get_mep with this mep_id and no classification; its membership_classifications lists the codes this history carries.',
+        );
+      classification = code.toUpperCase();
+    }
+    if (active_on !== undefined) {
+      date(active_on, 'active_on', {
+        hint: 'Pass active_on as an existing calendar day in YYYY-MM-DD form, such as 2024-07-19.',
+      });
+      const today = this.utcToday();
+      if (active_on > today)
+        invalidFilter(
+          `active_on ${JSON.stringify(active_on)} is after the current UTC date ${today}.`,
+          `Pass an active_on on or before ${today}, or omit active_on to keep every period.`,
+        );
+    }
+    const filters = {
+      mep_id,
+      section,
+      language: paging.language,
+      ...field('classification', classification),
+      ...field('active_on', active_on),
+    };
     const response = await this.client.get(`meps/${mep_id}`, {}, mepSchema, operation);
     const raw = response.data[0];
     const source_url = sourceUrl(`person/${mep_id}`);
@@ -1176,21 +1441,69 @@ export class EuParliamentService {
       ...field('citizenship', raw.citizenship),
       ...field('place_of_birth', raw.placeOfBirth),
     };
-    const memberships = (raw.hasMembership ?? []).map((membership) => ({
-      id: membership.id,
-      ...field('organization_id', membership.organization),
-      ...field('classification', membership.membershipClassification),
-      ...field('role', membership.role),
-      ...field('start_date', membership.memberDuring?.startDate),
-      ...field('end_date', membership.memberDuring?.endDate),
-    }));
+    const memberships = (raw.hasMembership ?? [])
+      .map((membership) => ({
+        id: membership.id,
+        ...field('organization_id', membership.organization),
+        ...field('classification', membership.membershipClassification),
+        ...field('role', membership.role),
+        ...field('start_date', membership.memberDuring?.startDate),
+        ...field('end_date', membership.memberDuring?.endDate),
+      }))
+      // Latest start first, undated last, then id and the whole record: one order on every read.
+      .sort(
+        (a, b) =>
+          Number(a.start_date === undefined) - Number(b.start_date === undefined) ||
+          compareText(b.start_date ?? '', a.start_date ?? '') ||
+          compareText(a.id, b.id) ||
+          compareText(JSON.stringify(a), JSON.stringify(b)),
+      );
+    // A classification matches on the last path segment of the published value, in any case.
+    const codeOf = (published: string | undefined) =>
+      published?.slice(published.lastIndexOf('/') + 1).toUpperCase() || undefined;
+    const counts = new Map<string, number>();
+    for (const row of memberships) {
+      const code = codeOf(row.classification);
+      if (code !== undefined) counts.set(code, (counts.get(code) ?? 0) + 1);
+    }
+    const carried = [...counts].sort(([a], [b]) => compareText(a, b));
     if (section === 'overview')
       return result(
-        { found: true, ...identity, section, membership_count: memberships.length },
+        {
+          found: true,
+          ...identity,
+          section,
+          membership_count: memberships.length,
+          membership_classifications: carried.map(([code, count]) => ({
+            classification: code,
+            count,
+          })),
+        },
         filters,
         notices,
       );
-    const page = localPage(memberships, paging, filters);
+    const selected = memberships.filter(
+      (row) =>
+        (classification === undefined || codeOf(row.classification) === classification) &&
+        (active_on === undefined ||
+          (row.start_date !== undefined &&
+            row.start_date <= active_on &&
+            (row.end_date === undefined || active_on <= row.end_date))),
+    );
+    if (!selected.length && memberships.length) {
+      const unclassified = memberships.length - carried.reduce((sum, [, count]) => sum + count, 0);
+      if (classification !== undefined && !counts.has(classification))
+        notices.push(
+          carried.length
+            ? `No membership in this history has classification ${classification}. It carries ${listed(carried.map(([code, count]) => `${code} (${count})`))}${unclassified ? `, and ${plural(unclassified, 'membership')} ${unclassified === 1 ? 'has' : 'have'} no classification` : ''}. Retry with one of those codes, or remove classification.`
+            : `No membership in this history carries a classification, so classification ${classification} matches none of its ${plural(memberships.length, 'membership')}. Remove classification.`,
+        );
+      else if (active_on !== undefined)
+        notices.push(
+          `No membership${classification === undefined ? '' : ` classified ${classification}`} has a published interval including active_on ${active_on} (start_date on or before it, end_date on or after it or absent). Remove active_on to read every period; an absent end date does not establish current membership.`,
+        );
+    }
+    const page = localPage(selected, paging, filters);
     return result(
       { found: true, ...identity, section, memberships: page.items, page: page.page },
       filters,
@@ -1199,14 +1512,19 @@ export class EuParliamentService {
     );
   }
 
-  /** Sitting decisions are fetched whole, then compact records or voter positions are paged. */
+  /**
+   * Sitting vote items or decisions are fetched whole, then vote items, compact records or voter
+   * positions are paged.
+   */
   async getPlenaryVotes(input: VotesInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
     const mode = input.mode ?? 'decisions';
-    const collection = mode === 'sittings' || mode === 'voters' ? mode : 'decisions';
+    const collection =
+      mode === 'sittings' || mode === 'vote_items' || mode === 'voters' ? mode : 'decisions';
     const paging = scopePage(input, collection);
     const notices = noticesFor(input, paging, collection);
-    if (mode !== 'decisions') forbid(input, ['document_id', 'vote_item_id', 'label_contains']);
+    if (mode !== 'decisions') forbid(input, ['document_id', 'vote_item_id']);
+    if (mode !== 'decisions' && mode !== 'vote_items') forbid(input, ['label_contains']);
     if (mode !== 'decision' && mode !== 'decisions' && meaningful(input.mep_id))
       invalidMode(
         'mep_id is supported only in decisions and decision modes.',
@@ -1215,13 +1533,19 @@ export class EuParliamentService {
     const label_contains = input.label_contains?.trim()
       ? normalizeLabel(input.label_contains)
       : undefined;
+    // Decision relations name B- motions only, so a B citation selects its B- identifier.
     const document_id = input.document_id?.trim()
-      ? canonicalId(input.document_id, 'document')
+      ? documentInputIds(input.document_id)[0]
       : undefined;
     const vote_item_id = input.vote_item_id?.trim()
-      ? canonicalId(input.vote_item_id, 'activity')
+      ? canonicalId(input.vote_item_id, 'activity', {
+          parameter: 'vote_item_id',
+          hint: 'Call euparl_get_plenary_votes with mode vote_items and the same sitting_id for vote_item_id values.',
+        })
       : undefined;
-    const mep_id = input.mep_id?.trim() ? canonicalId(input.mep_id, 'person') : undefined;
+    const mep_id = input.mep_id?.trim()
+      ? canonicalId(input.mep_id, 'person', personInput('mep_id'))
+      : undefined;
     if (mode !== 'voters' && (input.resolve_names || input.roster_term !== undefined))
       invalidMode(
         'Name resolution fields are supported only in voters mode.',
@@ -1262,19 +1586,72 @@ export class EuParliamentService {
       );
     }
     forbid(input, ['year']);
-    let sitting_id = canonicalId(required(input.sitting_id, 'sitting_id'), 'activity');
+    const sittingHint =
+      'Call euparl_get_plenary_votes with mode sittings and a year for sitting_id values.';
+    const written = required(input.sitting_id, 'sitting_id');
+    let sitting_id = canonicalId(written, 'activity', {
+      parameter: 'sitting_id',
+      hint: sittingHint,
+    });
     if (/^\d{4}-\d{2}-\d{2}$/.test(sitting_id)) sitting_id = `MTG-PL-${sitting_id}`;
     if (!/^MTG-PL-\d{4}-\d{2}-\d{2}$/.test(sitting_id))
-      invalidFilter('Use a sitting date or exact MTG-PL-YYYY-MM-DD identifier.');
-    date(sitting_id.slice(7));
+      invalidFilter(
+        `sitting_id ${JSON.stringify(written)} is not a plenary sitting. Accepted forms: a sitting date YYYY-MM-DD or MTG-PL-YYYY-MM-DD, bare, after eli/dl/event/, or in the exact https://data.europarl.europa.eu/eli/dl/event/ URI.`,
+        sittingHint,
+      );
+    const sittingDate = sitting_id.slice(7);
+    date(sittingDate, 'sitting_id', { written });
     // A vote item names its sitting; a mismatch could only return an empty whole-sitting download.
     const voteItemDate = vote_item_id?.match(/^MTG-PL-(\d{4}-\d{2}-\d{2})-/)?.[1];
-    if (voteItemDate !== undefined && voteItemDate !== sitting_id.slice(7))
+    if (voteItemDate !== undefined && voteItemDate !== sittingDate)
       invalidFilter(
-        `vote_item_id belongs to the ${voteItemDate} sitting, not ${sitting_id.slice(7)}.`,
+        `vote_item_id ${JSON.stringify(input.vote_item_id)} belongs to the ${voteItemDate} sitting, not to sitting_id ${JSON.stringify(input.sitting_id)}; both must name the same sitting.`,
         `Retry with sitting_id ${voteItemDate}, the date in vote_item_id.`,
       );
-    if (mode === 'decisions') forbid(input, ['decision_id', 'position']);
+    if (mode === 'decisions' || mode === 'vote_items') forbid(input, ['decision_id', 'position']);
+    if (mode === 'vote_items') {
+      localPaging(input);
+      // One unpaged read in published order: paging and language both reorder the items.
+      const response = await this.client.get(
+        `meetings/${sitting_id}/vote-results`,
+        {},
+        voteItemSchema,
+        operation,
+      );
+      const items = sittingVoteItems(response.data, sitting_id, paging.language, notices);
+      const selected =
+        label_contains === undefined
+          ? items
+          : items.filter((item) => labelMatches(item.label, label_contains));
+      const filters = {
+        mode,
+        sitting_id,
+        language: paging.language,
+        ...field('label_contains', label_contains),
+      };
+      const page = localPage(selected, paging, filters);
+      if (!items.length)
+        notices.push(
+          'No vote items were published for this sitting. Call euparl_get_plenary_votes with mode sittings and year to discover available sittings.',
+        );
+      else if (!selected.length)
+        notices.push(
+          `No published vote item label matched label_contains. Vote item labels are titles; decision labels carry report citations and amendment numbers, so try mode decisions with the same label_contains or the report citation as decision labels write it (${labelCitation}), or remove label_contains to list every vote item.`,
+        );
+      const unlinked = selected.filter((item) => item.decision_count === undefined).length;
+      if (unlinked)
+        notices.push(
+          sittingDate < firstDecisionSitting
+            ? `${unlinked} of ${selected.length} vote items publish no decision links: decision_count is omitted rather than 0. Parliament publishes no decision records for sittings before ${firstDecisionSitting}, so decisions mode has none for this sitting; each vote item's recording_document_ids names the minutes item that records it, readable with euparl_search_documents mode get.`
+            : `${unlinked} of ${selected.length} vote items publish no decision links: decision_count is omitted rather than 0, and vote_item_id selects none of their decisions. Call euparl_get_plenary_votes with mode decisions, the same sitting_id and label_contains set to the report citation as decision labels write it (${labelCitation}), or, when no decision label carries it, to words of the vote item's title with language set to the title's language; matching label text does not establish a final vote.`,
+        );
+      return result(
+        { mode, sitting_id, vote_items: page.items, page: page.page },
+        filters,
+        notices,
+        page.total,
+      );
+    }
     if (mode === 'decision') {
       forbid(input, ['position']);
       detailPaging(input);
@@ -1282,7 +1659,10 @@ export class EuParliamentService {
     const decision_id =
       mode === 'decisions'
         ? undefined
-        : canonicalId(required(input.decision_id, 'decision_id'), 'activity');
+        : canonicalId(required(input.decision_id, 'decision_id'), 'activity', {
+            parameter: 'decision_id',
+            hint: 'Call euparl_get_plenary_votes with mode decisions and the same sitting_id for decision_id values.',
+          });
     if (mode === 'voters') {
       if (!input.position)
         invalidMode(
@@ -1339,16 +1719,12 @@ export class EuParliamentService {
       const selected =
         label_contains === undefined
           ? related
-          : related.filter(
-              (decision) =>
-                decision.label !== undefined &&
-                normalizeLabel(decision.label.value).includes(label_contains),
-            );
+          : related.filter((decision) => labelMatches(decision.label, label_contains));
       const page = localPage(selected, paging, filters);
       if (!page.total) {
         if (label_contains !== undefined && related.length)
           notices.push(
-            'No published decision label matched label_contains within the selected document and vote-item filters. Remove or change label_contains; matching text does not establish a final vote.',
+            `No published decision label matched label_contains within the selected document and vote-item filters. Remove or change label_contains (in decision labels ${labelCitation}; a label without the report citation can carry words of the vote item's title from mode vote_items instead, matched with language set to the title's language); matching text does not establish a final vote.`,
           );
         else notices.push(decisionsUnmatched(decisions, document_id, vote_item_id));
       } else if (document_id !== undefined && vote_item_id === undefined) {
@@ -1404,10 +1780,11 @@ export class EuParliamentService {
       notices.push(
         'Names are published identities in the selected term roster, not proof of spelling or affiliation on the vote date.',
       );
-      if (resolution.unresolved)
+      if (resolution.unresolved) {
         notices.push(
-          'Some voter identities are unresolved. roster_term must be the term containing the sitting date (voter_resolution.sitting_date); if it is not, retry with that term. Call euparl_get_mep with any mep_id still unresolved.',
+          `Some voter identities are unresolved. roster_term must be the term containing the sitting date ${sittingDate}; if it is not, retry with that term. For voters still without a name, call euparl_search_meps once with mep_ids set to their mep_ids, mandate_date ${sittingDate} and limit at least their count: it returns each name with the country and political group published that day. An ID it lists in unmatched_mep_ids was not seated that day; read it with euparl_get_mep.`,
         );
+      }
     }
     const page = localPage(voters, paging, {
       ...filters,
@@ -1415,6 +1792,8 @@ export class EuParliamentService {
     });
     if (ids === undefined)
       notices.push('This voter position array was not published in the response.');
+    const unnamed = unnamedVotersNotice(raw, [position]);
+    if (unnamed !== undefined) notices.push(unnamed);
     return result(
       {
         mode,
@@ -1477,8 +1856,6 @@ export class EuParliamentService {
     const citation = required(input.question_id, 'question_id').trim();
     let question_id: string | undefined;
     let resolved: Envelope<RawQuestion> | undefined;
-    const questionForms =
-      'Use a canonical question identifier such as E-10-2025-000001 or a human citation such as E-000001/2025, with prefix E, P, O, G or K.';
     // Published work prefixes: E written, P priority written, O oral, G major and K minor interpellation.
     const human = /^([EPOGK])-(\d{1,6})\/(\d{4})$/i.exec(citation);
     if (human) {
@@ -1492,7 +1869,7 @@ export class EuParliamentService {
         const term = Math.min(latestTerm, Math.max(0, Math.floor((year - 1979) / 5) + 1));
         const terms =
           year >= 1979 && year <= 2024 && (year - 1979) % 5 === 0 ? [term - 1, term] : [term];
-        const matches: { id: string; response: Envelope<RawQuestion> }[] = [];
+        const matches: { id: string; term: number; response: Envelope<RawQuestion> }[] = [];
         for (const candidateTerm of terms) {
           operation.signal.throwIfAborted();
           const id = `${prefix}-${candidateTerm}-${human[3]}-${sequence}`;
@@ -1507,11 +1884,14 @@ export class EuParliamentService {
             throw serializationError(
               'Parliament returned a different question identifier than requested.',
             );
-          if (raw) matches.push({ id, response });
+          if (raw) matches.push({ id, term: candidateTerm, response });
         }
-        if (matches.length > 1)
+        // At most two terms overlap a citation year.
+        const [first, second] = matches;
+        if (first && second)
           invalidFilter(
-            'Question citation matches multiple terms. Supply term or use a returned canonical question identifier.',
+            `question_id ${JSON.stringify(input.question_id)} matches questions in terms ${first.term} and ${second.term}: ${first.id} and ${second.id}.`,
+            `Retry with term ${first.term} or term ${second.term}, or pass ${first.id} or ${second.id} as question_id.`,
           );
         question_id = matches[0]?.id;
         resolved = matches[0]?.response;
@@ -1526,11 +1906,19 @@ export class EuParliamentService {
         ? local.slice(documentPrefix.length)
         : local;
       const match = /^([EPOGK])-(\d+)-(\d{4})-(\d{1,6})$/i.exec(unwrapped);
-      if (!match) invalidFilter(questionForms, questionForms);
+      if (!match)
+        invalidFilter(
+          `question_id ${JSON.stringify(input.question_id)} is not a question identifier or citation. Accepted forms: a canonical identifier such as E-10-2025-000001, bare, after eli/dl/doc/ or in the exact https://data.europarl.europa.eu/eli/dl/doc/ URI, or a human citation such as E-000001/2025; prefix E, P, O, G or K in any case, sequence of one to six digits.`,
+          "Call euparl_list_questions with mode list and the question's year for question_id values, then retry mode get with one of them.",
+        );
       const sequence = unwrapped.slice(unwrapped.lastIndexOf('-') + 1).padStart(6, '0');
       question_id = `${unwrapped.charAt(0).toUpperCase()}-${match[2]}-${match[3]}-${sequence}`;
-      if (input.term !== undefined && Number(match[2]) !== input.term)
-        invalidFilter('term conflicts with the canonical question identifier.');
+      const idTerm = Number(match[2]);
+      if (input.term !== undefined && idTerm !== input.term)
+        invalidFilter(
+          `term ${input.term} conflicts with question_id ${JSON.stringify(input.question_id)}, whose term is ${idTerm}.`,
+          `Retry with term ${idTerm}, or omit term; a canonical question identifier carries its own term.`,
+        );
     }
     const filters = {
       mode,

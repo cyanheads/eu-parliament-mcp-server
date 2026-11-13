@@ -10,7 +10,7 @@ const ServerConfigSchema = z.object({
     .stringbool()
     .default(true)
     .describe(
-      "Normalize bounded-mode limits with a notice; false rejects limits above a fully bounded tool's largest acquisition bound. Whole-acquired local modes have no output-size cap",
+      "Normalize bounded-mode limits with a notice; false rejects limits above a fully bounded tool's largest bound, adopted texts counting their search window. Whole-acquired local modes have no output-size cap",
     ),
 });
 

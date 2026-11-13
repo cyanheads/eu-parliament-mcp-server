@@ -16,8 +16,8 @@ import {
   rosterRecords,
 } from '../helpers/eu-parliament-fixtures.js';
 
-const invalidHint =
-  'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
+const mepFiltersHint = (parameter: string) =>
+  `Call euparl_list_reference with topic mep_filters for every accepted code, then retry ${parameter} with one of them.`;
 const snapshotHint =
   'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.';
 const stalledHint =
@@ -204,7 +204,7 @@ describe('euparl_search_meps contract', () => {
     const result = await runToolContract(searchMepsTool, { name_contains: '!!!', limit: 1 });
     expectErrorTwin(result, 'invalid_filter', nameHint, JsonRpcErrorCode.ValidationError);
     expect(contractText(result)).toContain(
-      'name_contains has no letter or digit after case, diacritic, and punctuation normalization.',
+      'name_contains "!!!" has no letter or digit after case, diacritic, and punctuation normalization.',
     );
     expect(fetcher).not.toHaveBeenCalled();
   });
@@ -294,22 +294,86 @@ describe('euparl_search_meps contract', () => {
       appliedFilters: {
         scope: 'mandate_date',
         mandate_date: '2016-03-09',
-        political_group: 'THE-LEFT',
+        political_group: 'GUE-NGL',
       },
     });
     expect(data.notice).toBe(
-      "No MEPs matched. Remove name_contains to browse, relax country or political_group, or call euparl_list_reference with topic mep_filters. On a mandate_date roster, political_group matches only the group code in force on that date; omit political_group and read each member's published political_group.",
+      "No MEPs matched. Remove name_contains to browse, relax country or political_group, or call euparl_list_reference with topic mep_filters. On a mandate_date roster, political_group matches only the group code in force on that date; omit political_group and read each member's published political_group. GUE/NGL names two group codes: GUE-NGL (label GUE/NGL, 1995-01-06 to 2020-12-17) and THE-LEFT (The Left, from 2020-12-18, whose published name ends in GUE/NGL). This call sent GUE-NGL. A mandate_date or current roster matches only the code in force that day, so THE-LEFT matches no member here; to select it, pass political_group THE-LEFT with a mandate_date from 2020-12-19 (the dated roster runs a day later than the published versions) or with term 9.",
     );
     expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('political-group')).toBe(
-      'THE-LEFT',
+      'GUE-NGL',
     );
+  });
+
+  it('sends GUE/NGL as GUE-NGL on 2020-12-18, the last day the dated roster matches it, on both surfaces', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse(rosterRecords));
+    const data = expectSuccessTwin(
+      await runToolContract(searchMepsTool, {
+        mandate_date: '2020-12-18',
+        political_group: 'GUE/NGL',
+      }),
+    );
+    expect(data).toMatchObject({
+      items: [{ mep_id: '900000001' }, { mep_id: '900000002' }],
+      totalCount: 2,
+      appliedFilters: {
+        scope: 'mandate_date',
+        mandate_date: '2020-12-18',
+        political_group: 'GUE-NGL',
+      },
+    });
+    expect(data.notice).toBe(
+      'GUE/NGL names two group codes: GUE-NGL (label GUE/NGL, 1995-01-06 to 2020-12-17) and THE-LEFT (The Left, from 2020-12-18, whose published name ends in GUE/NGL). This call sent GUE-NGL. A mandate_date or current roster matches only the code in force that day, so THE-LEFT matches no member here; to select it, pass political_group THE-LEFT with a mandate_date from 2020-12-19 (the dated roster runs a day later than the published versions) or with term 9.',
+    );
+    const url = new URL(String(fetcher.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('mandate-date')).toBe('2020-12-18');
+    expect(url.searchParams.get('political-group')).toBe('GUE-NGL');
+  });
+
+  it('sends a historical group code on a term roster and states the term matching rule on both surfaces', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse(rosterRecords));
+    const data = expectSuccessTwin(
+      await runToolContract(searchMepsTool, { political_group: ' gue/ngl ', term: 8, limit: 1 }),
+    );
+    expect(data).toMatchObject({
+      items: [{ mep_id: '900000001' }],
+      totalCount: 2,
+      appliedFilters: { scope: 'parliamentary_term', term: 8, political_group: 'GUE-NGL' },
+    });
+    expect(data.notice).toBe(
+      'On a term roster, political_group matches each member of the term holding a membership in that code that had not ended when the term began, including memberships that began later, even after the term ended; it does not show who sat in the group during the term. Pass mandate_date instead of term for the members published under a code on one day. GUE/NGL names two group codes: GUE-NGL (label GUE/NGL, 1995-01-06 to 2020-12-17) and THE-LEFT (The Left, from 2020-12-18, whose published name ends in GUE/NGL). This call sent GUE-NGL; to select the other group, pass political_group THE-LEFT with term 9, whose roster holds both codes, or with a mandate_date from 2020-12-19 (the dated roster runs a day later than the published versions). Continue with offset 1 and the returned snapshot.',
+    );
+    const url = new URL(String(fetcher.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('political-group')).toBe('GUE-NGL');
+    expect(url.searchParams.get('parliamentary-term')).toBe('8');
+  });
+
+  it('rejects an unknown group on both surfaces with the value, every code and the listing call before HTTP', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    const result = await runToolContract(searchMepsTool, { political_group: 'bogus' });
+    expectErrorTwin(
+      result,
+      'invalid_filter',
+      'Call euparl_list_reference with topic mep_filters for each group code with its label and periods, then retry with one of them.',
+      JsonRpcErrorCode.ValidationError,
+    );
+    for (const text of ['political_group filter "bogus"', 'Accepted codes: ALDE,', 'VERTS-ALE.'])
+      expect(contractText(result)).toContain(text);
+    expect(contractText(result)).not.toContain('PATRIOTS');
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it('renders the canonical code list on both invalid-filter surfaces before HTTP', async () => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
     const result = await runToolContract(searchMepsTool, { gender: 'invalid' });
-    expectErrorTwin(result, 'invalid_filter', invalidHint, JsonRpcErrorCode.ValidationError);
-    const message = 'Unsupported gender filter. Accepted codes: FEMALE, MALE, NAP, NKN, NST.';
+    expectErrorTwin(
+      result,
+      'invalid_filter',
+      mepFiltersHint('gender'),
+      JsonRpcErrorCode.ValidationError,
+    );
+    const message =
+      'Unsupported gender filter "invalid". Accepted codes: FEMALE, MALE, NAP, NKN, NST.';
     expect(result.structuredContent).toMatchObject({ error: { message } });
     expect(contractText(result)).toContain(message);
     expect(fetcher).not.toHaveBeenCalled();
@@ -363,16 +427,18 @@ describe('euparl_search_meps contract', () => {
   });
 
   it.each([
-    { country: 'ZZ' },
-    { political_group: 'bogus' },
-    { gender: 'bogus' },
-    { language: 'xx' },
-  ])('rejects invalid filters %j before HTTP', async (input) => {
+    [{ country: 'ZZ' }, mepFiltersHint('country')],
+    [{ gender: 'bogus' }, mepFiltersHint('gender')],
+    [
+      { language: 'xx' },
+      'Call euparl_list_reference with topic identifiers for every accepted code, then retry language with one of them.',
+    ],
+  ] as const)('rejects invalid filters %j before HTTP', async (input, hint) => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
     expectErrorTwin(
       await runToolContract(searchMepsTool, input),
       'invalid_filter',
-      invalidHint,
+      hint,
       JsonRpcErrorCode.ValidationError,
     );
     expect(fetcher).not.toHaveBeenCalled();
@@ -385,6 +451,54 @@ describe('euparl_search_meps contract', () => {
       'invalid_mode_fields',
       'Pass the previous page.snapshot with the same filters, or restart at offset 0 without snapshot.',
       JsonRpcErrorCode.ValidationError,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('renders mep_ids matches and unmatched_mep_ids on both surfaces, past-end page included', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse(rosterRecords));
+    const input = { term: 9, limit: 1, mep_ids: ['person/900000002', '900000009'] };
+    const first = expectSuccessTwin(await runToolContract(searchMepsTool, input));
+    expect(first).toMatchObject({
+      items: [{ mep_id: '900000002', name: 'Élodie DEMO' }],
+      unmatched_mep_ids: ['900000009'],
+      totalCount: 1,
+      appliedFilters: { mep_ids: ['900000002', '900000009'] },
+      page: { returned: 1, has_more: false },
+    });
+    expect(first.notice).toBe(
+      "1 requested mep_id matched no row of the selected roster after the other filters; unmatched_mep_ids lists it. A term roster holds only that term's members and a mandate_date roster only members seated that day; euparl_get_mep reads any member by ID.",
+    );
+    expect(contractText(await runToolContract(searchMepsTool, input))).toContain(
+      'result.unmatched_mep_ids[0]: ` "900000009" `',
+    );
+    const past = expectSuccessTwin(
+      await runToolContract(searchMepsTool, { ...input, offset: 5, snapshot: snapshotOf(first) }),
+    );
+    expect(past).toMatchObject({ items: [], unmatched_mep_ids: ['900000009'], totalCount: 1 });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it('omits unmatched_mep_ids from both surfaces without mep_ids', async () => {
+    installToolHttp(() => envelopeResponse(rosterRecords));
+    const result = await runToolContract(searchMepsTool, { term: 9, mep_ids: [] });
+    const data = expectSuccessTwin(result);
+    expect(data).not.toHaveProperty('unmatched_mep_ids');
+    expect(data.appliedFilters).not.toHaveProperty('mep_ids');
+    expect(contractText(result)).not.toContain('unmatched_mep_ids');
+  });
+
+  it('rejects a mep_ids entry outside the person grammar on both surfaces before HTTP', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse(rosterRecords));
+    const result = await runToolContract(searchMepsTool, { mep_ids: ['900000001', 'org/AFCO'] });
+    expectErrorTwin(
+      result,
+      'invalid_filter',
+      'Retry euparl_search_meps with only person IDs in mep_ids; resolve org/ identifiers with euparl_list_reference topic organizations and organization_ids instead.',
+      JsonRpcErrorCode.ValidationError,
+    );
+    expect(contractText(result)).toContain(
+      'mep_ids entry "org/AFCO" is not a person identifier. Accepted forms: a decimal person ID (124867), person/124867, or https://data.europarl.europa.eu/person/124867.',
     );
     expect(fetcher).not.toHaveBeenCalled();
   });

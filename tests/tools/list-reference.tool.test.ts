@@ -12,8 +12,8 @@ import {
 } from '../helpers/eu-parliament-contract.js';
 import { envelopeResponse } from '../helpers/eu-parliament-fixtures.js';
 
-const invalidHint =
-  'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
+const organizationHint =
+  'Call euparl_list_reference with topic political_groups or committees for group and committee codes, or take organization IDs from euparl_get_mep memberships or euparl_get_procedure participants, then retry organization_ids.';
 const rejectedHint =
   'Call euparl_list_reference for supported filters and identifiers, then retry with a narrower supported request.';
 const rateHint = 'Wait for the reported retry interval, then repeat the same euparl tool call.';
@@ -307,15 +307,14 @@ describe('euparl_list_reference contract', () => {
   });
   it('validates IDs beyond the selected page before making any HTTP requests', async () => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
-    expectErrorTwin(
-      await runToolContract(listReferenceTool, {
-        topic: 'organizations',
-        organization_ids: ['5144', 'https://evil.example/org/5144'],
-        limit: 1,
-      }),
-      'invalid_filter',
-      invalidHint,
-      JsonRpcErrorCode.ValidationError,
+    const failure = await runToolContract(listReferenceTool, {
+      topic: 'organizations',
+      organization_ids: ['5144', 'https://evil.example/org/5144'],
+      limit: 1,
+    });
+    expectErrorTwin(failure, 'invalid_filter', organizationHint, JsonRpcErrorCode.ValidationError);
+    expect(contractText(failure)).toContain(
+      'organization_ids entry 2 "https://evil.example/org/5144" is not an organization identifier.',
     );
     expect(fetcher).not.toHaveBeenCalled();
   });
@@ -329,14 +328,43 @@ describe('euparl_list_reference contract', () => {
     'https://evil.example/org/5144',
   ])('rejects organization label or unsafe form %s before any request', async (id) => {
     const fetcher = installToolHttp(() => envelopeResponse([body]));
+    const failure = await runToolContract(listReferenceTool, {
+      topic: 'organizations',
+      organization_ids: ['5144', id],
+    });
+    expectErrorTwin(failure, 'invalid_filter', organizationHint, JsonRpcErrorCode.ValidationError);
+    expect(contractText(failure)).toContain(
+      `organization_ids entry 2 ${JSON.stringify(id)} is not an organization identifier.`,
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+  it('names a label by its position, the accepted forms and the next call, before any request', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([body]));
+    const failure = await runToolContract(listReferenceTool, {
+      topic: 'organizations',
+      organization_ids: ['org/5144', 'IMCO', 's&d', '6579'],
+    });
+    expectErrorTwin(failure, 'invalid_filter', organizationHint, JsonRpcErrorCode.ValidationError);
+    expect(contractText(failure)).toContain(
+      'organization_ids entry 3 "s&d" is not an organization identifier. Accepted forms: a decimal ID (5144) or a case-sensitive code of letters, digits, hyphens and underscores (IMCO, S-D, ep-9, EU_PARLIAMENT), bare, after org/, or in the exact https://data.europarl.europa.eu/org/ URI; labels such as S&D are not identifiers.',
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+  it('rejects an EU authority corporate-body URI as no Parliament organization, before any request', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([body]));
+    const authority = 'http://publications.europa.eu/resource/authority/corporate-body/COM';
+    const failure = await runToolContract(listReferenceTool, {
+      topic: 'organizations',
+      organization_ids: [authority],
+    });
     expectErrorTwin(
-      await runToolContract(listReferenceTool, {
-        topic: 'organizations',
-        organization_ids: ['5144', id],
-      }),
+      failure,
       'invalid_filter',
-      invalidHint,
+      "Remove EU authority URIs from organization_ids: Parliament publishes no organization record for them, and a trailing code is no substitute (COM here is the Communist and Allies Group). A question's alternative_title names its addressee in words.",
       JsonRpcErrorCode.ValidationError,
+    );
+    expect(contractText(failure)).toContain(
+      `organization_ids entry 1 "${authority}" is an EU authority URI, not a Parliament organization identifier. Accepted forms: a decimal ID (5144)`,
     );
     expect(fetcher).not.toHaveBeenCalled();
   });
@@ -575,7 +603,7 @@ describe('euparl_list_reference contract', () => {
     expectErrorTwin(
       await runToolContract(listReferenceTool, { topic: 'coverage', language: 'xx' }),
       'invalid_filter',
-      invalidHint,
+      'Call euparl_list_reference with topic identifiers for every accepted code, then retry language with one of them.',
       JsonRpcErrorCode.ValidationError,
     );
     expect(fetcher).not.toHaveBeenCalled();

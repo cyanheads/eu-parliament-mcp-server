@@ -35,11 +35,26 @@ const questionSchema = questionSummarySchema
     title: localizedTextSchema
       .optional()
       .describe('Published question title and actual selected source language.'),
+    alternative_title: localizedTextSchema
+      .optional()
+      .describe(
+        'Published alternative title and actual selected source language: question type, citation, addressee in words, Rule and authors, with any <br/> separators kept as published.',
+      ),
     date: z.string().optional().describe('Published question document date.'),
     term_id: z.string().optional().describe('Published parliamentary-term reference.'),
     creator_ids: z
       .array(z.string().describe('Published creator reference.'))
       .describe('All explicit creator references, without inferred authorship.'),
+    addressee_ids: z
+      .array(z.string().describe('Published addressee organization reference, verbatim.'))
+      .describe(
+        'Organizations of participations published with the ADDRESSEE role, in published order: org/COM, org/EU_COMMISSION, org/EU_COUNCIL or org/HRVP; some records publish an EU authority URI (http://publications.europa.eu/resource/authority/corporate-body/…) beside such a code or in its place; empty when no role is published. They do not resolve through euparl_list_reference topic organizations, where COM is the Communist and Allies Group; alternative_title names the addressee in words.',
+      ),
+    original_languages: z
+      .array(z.string().describe('ISO 639-1 code, or an unlisted authority code verbatim.'))
+      .describe(
+        'Languages the question was written in, in published order: Parliament language authority codes mapped to ISO 639-1 for the 24 EU languages; empty when unpublished.',
+      ),
     links: z
       .array(linkSchema)
       .describe('All source files in the selected question expression language.'),
@@ -75,7 +90,7 @@ const questionSchema = questionSummarySchema
 export const listQuestionsTool = tool('euparl_list_questions', {
   title: 'List parliamentary questions',
   description:
-    'List parliamentary questions by year and work_type or retrieve metadata, source-file links and published answers with mode get and question_id. Human citations such as E-000001/2025 retain their full year; omission of term checks canonical candidates for every overlapping parliamentary term and requires one verified match. Supply term to disambiguate; canonical IDs resolve directly. Use euparl_list_reference topic question_types for work_type codes. No keyword, author or addressee search is available. Empty answers means no answer relation was published in this response. Get rejects list filters and nondefault paging; continue lists with page.next_offset.',
+    'List parliamentary questions by year and work_type or retrieve metadata, addressed institutions, original languages, source-file links and published answers with mode get and question_id. Human citations such as E-000001/2025 retain their full year; omission of term checks canonical candidates for every overlapping parliamentary term and requires one verified match. Supply term to disambiguate; canonical IDs resolve directly. Use euparl_list_reference topic question_types for work_type codes. No keyword, author or addressee search is available. Empty answers means no answer relation was published in this response. Get rejects list filters and nondefault paging; continue lists with page.next_offset.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({

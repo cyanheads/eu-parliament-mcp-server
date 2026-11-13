@@ -14,7 +14,10 @@ import {
   pagingInputFields,
   serviceInput,
 } from '@/mcp-server/tools/utils/eu-parliament-tool.js';
-import { getEuParliamentService } from '@/services/eu-parliament/eu-parliament-service.js';
+import {
+  getEuParliamentService,
+  personIdPattern,
+} from '@/services/eu-parliament/eu-parliament-service.js';
 
 const sectionSchema = z
   .enum(['overview', 'memberships'])
@@ -24,14 +27,14 @@ const sectionSchema = z
 export const getMepTool = tool('euparl_get_mep', {
   title: 'Read a member and membership history',
   description:
-    'Read an MEP identity or membership history including published committee, delegation, and political-group records. Default section overview returns identity and membership_count; section memberships pages full membership records. Missing end dates do not establish current membership. Continue memberships with page.next_offset and snapshot; restart at offset 0 without snapshot after snapshot_changed. Missing detail succeeds with found false; discover IDs with euparl_search_meps.',
+    'Read an MEP identity or membership history including published committee, delegation, and political-group records. Default section overview returns identity, membership_count and membership_classifications (count per classification code); section memberships pages full membership records, latest start_date first, filtered by classification and active_on before paging. Missing end dates do not establish current membership. Continue memberships with page.next_offset and snapshot; restart at offset 0 without snapshot after snapshot_changed. Missing detail succeeds with found false; discover IDs with euparl_search_meps.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
       mep_id: z
         .string()
         .min(1)
-        .regex(/^(?:https:\/\/data\.europarl\.europa\.eu\/person\/|person\/)?\d+$/)
+        .regex(personIdPattern)
         .describe(
           'Decimal person ID, person/ prefix, or exact https://data.europarl.europa.eu/person/ URI.',
         ),
@@ -40,6 +43,12 @@ export const getMepTool = tool('euparl_get_mep', {
         .describe(
           'Default overview returns identity and membership count; memberships returns the selected history page.',
         ),
+      classification: optionalString().describe(
+        'Section memberships only: keep memberships with this membershipClassification code, bare (COMMITTEE_PARLIAMENTARY_STANDING) or as published (def/ep-entities/COMMITTEE_PARLIAMENTARY_STANDING), case-insensitive, matched on the last path segment. The overview lists the codes this history carries in membership_classifications; memberships without a classification never match.',
+      ),
+      active_on: optionalString().describe(
+        'Section memberships only: keep memberships whose published interval includes this YYYY-MM-DD date, not after today (UTC): start_date on or before it and end_date on or after it, an absent end counting as open. Reports the published interval only; a missing end date does not establish current membership.',
+      ),
       ...pagingInputFields('memberships'),
       snapshot: optionalString().describe(
         'Returned membership snapshot; required for membership offset above 0, optional at offset 0.',
@@ -70,6 +79,22 @@ export const getMepTool = tool('euparl_get_mep', {
         .optional()
         .describe(
           'Parsed membership count on a found overview; absent relations do not prove no membership history.',
+        ),
+      membership_classifications: z
+        .array(
+          z
+            .object({
+              classification: z
+                .string()
+                .describe('Classification code, the last path segment of the published value.'),
+              count: z.number().int().positive().describe('Memberships with this classification.'),
+            })
+            .strict()
+            .describe('One classification code this history carries.'),
+        )
+        .optional()
+        .describe(
+          'Found overview only: classified memberships counted by code, sorted by code; values classification accepts. Unclassified memberships are left out, so the counts can sum below membership_count.',
         ),
       memberships: z
         .array(
@@ -103,7 +128,7 @@ export const getMepTool = tool('euparl_get_mep', {
         )
         .optional()
         .describe(
-          'Selected membership history page; present only on a found memberships response.',
+          'Selected membership history page, latest start_date first, then by id, undated last; present only on a found memberships response.',
         ),
       page: pageSchema
         .optional()
@@ -116,7 +141,7 @@ export const getMepTool = tool('euparl_get_mep', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Person identifier or language is unsupported.',
+      when: 'Person identifier or language is unsupported, classification is not a code, or active_on is not a real date or is after today (UTC).',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
       thrownBy: 'service',
@@ -124,7 +149,7 @@ export const getMepTool = tool('euparl_get_mep', {
     {
       reason: 'invalid_mode_fields',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Overview has nonzero offset or membership continuation lacks a snapshot.',
+      when: 'Overview has nonzero offset, classification or active_on, or membership continuation lacks a snapshot.',
       recovery:
         'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.',
       thrownBy: 'service',

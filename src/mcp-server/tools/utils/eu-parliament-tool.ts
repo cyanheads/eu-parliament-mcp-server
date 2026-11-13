@@ -93,17 +93,26 @@ const capList = (collections: readonly PagedCollection[]) =>
       .filter((collection) => pageCaps[collection].maximum < Number.MAX_SAFE_INTEGER)
       .map((collection) => `${pageCaps[collection].maximum} ${pageCaps[collection].noun}`),
   );
+/** The largest limit EUPARL_CLAMP_LIMITS=false accepts for `collection`. */
+function strictMaximum(collection: PagedCollection): number {
+  const caps = pageCaps[collection];
+  return 'strictMaximum' in caps ? caps.strictMaximum : caps.maximum;
+}
 /**
  * Whole-item `limit` for a tool paging `collections`. With clamping on (the default) a larger
  * value is accepted and the service clamps it to the collection cap, so the schema advertises no
  * `maximum`: `multipleOf(1)` stands in for `.int()`, which Zod 4 emits with
  * `maximum: 9007199254740991`, and the integer refinement catches float noise `multipleOf`
- * tolerates. With EUPARL_CLAMP_LIMITS=false a fully bounded tool's largest bound is enforced and advertised; mixed tools keep local modes open.
+ * tolerates. With EUPARL_CLAMP_LIMITS=false a fully bounded tool's largest strict bound is
+ * enforced and advertised; mixed tools keep local modes open. A strict bound above every page cap
+ * (adopted texts accept their search window) answers with the selected mode's cap.
  * The mode is read per call and per `tools/list` emission (the `.meta()` getters), never when
  * the definition module is imported, which happens before `setup()` parses the environment.
  */
 function limitInput(collections: readonly [PagedCollection, ...PagedCollection[]]) {
-  const maximum = Math.max(...collections.map((collection) => pageCaps[collection].maximum));
+  const maximum = Math.max(...collections.map(strictMaximum));
+  const abovePages =
+    maximum > Math.max(...collections.map((collection) => pageCaps[collection].maximum));
   return z
     .number()
     .multipleOf(1, wholeNumber)
@@ -131,7 +140,7 @@ function limitInput(collections: readonly [PagedCollection, ...PagedCollection[]
         const local = collections.some(
           (collection) => pageCaps[collection].maximum === Number.MAX_SAFE_INTEGER,
         );
-        return `Whole items requested; default 20. ${local ? 'Whole-acquired local collections return the requested count or remaining rows, without an output-size cap. ' : ''}${bounded.length ? `Bounded-mode acquisition limits: ${capList(bounded)}. ${!clampLimits() && !local ? `Limits above ${maximum} are rejected; smaller mode limits normalize with a notice.` : 'Larger bounded-mode limits normalize with a notice.'} ` : ''}Values above the safe-integer range normalize to 9007199254740991; search windows and bounded modes may narrow further.`;
+        return `Whole items requested; default 20. ${local ? 'Whole-acquired local collections return the requested count or remaining rows, without an output-size cap. ' : ''}${bounded.length ? `Bounded-mode acquisition limits: ${capList(bounded)}. ${!clampLimits() && !local ? `Limits above ${maximum} are rejected; ${abovePages ? "a smaller limit above the selected mode's acquisition limit normalizes to that limit with a notice." : 'smaller mode limits normalize with a notice.'}` : 'Larger bounded-mode limits normalize with a notice.'} ` : ''}Values above the safe-integer range normalize to 9007199254740991; search windows and bounded modes may narrow further.`;
       },
     });
 }

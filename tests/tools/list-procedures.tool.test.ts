@@ -11,8 +11,6 @@ import {
 } from '../helpers/eu-parliament-contract.js';
 import { envelopeResponse } from '../helpers/eu-parliament-fixtures.js';
 
-const invalidHint =
-  'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
 const rejectedHint =
   'Call euparl_list_reference for supported filters and identifiers, then retry with a narrower supported request.';
 const rateHint = 'Wait for the reported retry interval, then repeat the same euparl tool call.';
@@ -458,16 +456,24 @@ describe('euparl_list_procedures contract', () => {
     },
   );
 
-  it.each([{ process_type: 'unsupported' }, { language: 'xx' }])(
-    'returns invalid_filter and its exact recovery for %j',
-    async (input) => {
+  it.each([
+    [
+      { process_type: 'XYZ' },
+      'Unsupported process_type filter "XYZ". Accepted codes: ACI, APP, AVC, BUD, CNS, COD, DEC, NLE, SYN, BUI, COS, DEA, DCE, IMM, INI, INL, INS, REG, RPS, RSO, RSP, GBD.',
+      'Call euparl_list_reference with topic procedure_types for every accepted code, then retry process_type with one of them.',
+    ],
+    [
+      { language: 'xx' },
+      'Unsupported language filter "xx". Accepted codes: bg, es, cs, da, de, et, el, en, fr, ga, hr, it, lv, lt, hu, mt, nl, pl, pt, ro, sk, sl, fi, sv.',
+      'Call euparl_list_reference with topic identifiers for every accepted code, then retry language with one of them.',
+    ],
+  ] as const)(
+    'returns invalid_filter naming the value, every accepted code and its recovery for %j',
+    async (input, message, hint) => {
       const fetcher = installToolHttp(() => envelopeResponse([]));
-      expectErrorTwin(
-        await runToolContract(listProceduresTool, input),
-        'invalid_filter',
-        invalidHint,
-        JsonRpcErrorCode.ValidationError,
-      );
+      const failure = await runToolContract(listProceduresTool, input);
+      expectErrorTwin(failure, 'invalid_filter', hint, JsonRpcErrorCode.ValidationError);
+      expect(contractText(failure)).toContain(message);
       expect(fetcher).not.toHaveBeenCalled();
     },
   );

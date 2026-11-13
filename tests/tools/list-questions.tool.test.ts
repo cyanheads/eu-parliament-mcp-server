@@ -3,6 +3,7 @@
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import { listQuestionsTool } from '../../src/mcp-server/tools/definitions/list-questions.tool.js';
 import {
   contractText,
@@ -12,14 +13,15 @@ import {
 } from '../helpers/eu-parliament-contract.js';
 import { envelopeResponse, questionRecord } from '../helpers/eu-parliament-fixtures.js';
 
-const invalidHint =
-  'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
-const acceptedForms =
-  'Use a canonical question identifier such as E-10-2025-000001 or a human citation such as E-000001/2025, with prefix E, P, O, G or K.';
+const questionForms =
+  'Accepted forms: a canonical identifier such as E-10-2025-000001, bare, after eli/dl/doc/ or in the exact https://data.europarl.europa.eu/eli/dl/doc/ URI, or a human citation such as E-000001/2025; prefix E, P, O, G or K in any case, sequence of one to six digits.';
+const questionHint =
+  "Call euparl_list_questions with mode list and the question's year for question_id values, then retry mode get with one of them.";
 const row = (id: string) => ({ id: `eli/dl/doc/${id}`, identifier: id });
 const page = (start: number, count: number) =>
   Array.from({ length: count }, (_, i) => row(`E-10-2025-${String(start + i).padStart(6, '0')}`));
 const questionPath = (id: string) => `/api/v2/parliamentary-questions/${id}`;
+const authority = 'http://publications.europa.eu/resource/authority/';
 afterEach(() => vi.useRealTimers());
 
 describe('euparl_list_questions contract', () => {
@@ -150,9 +152,13 @@ describe('euparl_list_questions contract', () => {
       question_id: 'K-8-2017-000001',
       term: 9,
     });
-    expectErrorTwin(result, 'invalid_filter', invalidHint);
+    expectErrorTwin(
+      result,
+      'invalid_filter',
+      'Retry with term 8, or omit term; a canonical question identifier carries its own term.',
+    );
     expect(contractText(result)).toContain(
-      'term conflicts with the canonical question identifier.',
+      'term 9 conflicts with question_id "K-8-2017-000001", whose term is 8.',
     );
     expect(fetcher).not.toHaveBeenCalled();
   });
@@ -163,12 +169,15 @@ describe('euparl_list_questions contract', () => {
     'X-10-2025-900001',
     'https://data.europarl.europa.eu/eli/dl/doc/X-10-2025-900001',
   ])(
-    'rejects unsupported question prefix %s before HTTP, naming the accepted forms',
+    'rejects unsupported question prefix %s before HTTP, naming question_id, its value, the accepted forms and a next call',
     async (question_id) => {
       const fetcher = installToolHttp(() => envelopeResponse([]));
       const result = await runToolContract(listQuestionsTool, { mode: 'get', question_id });
-      expectErrorTwin(result, 'invalid_filter', acceptedForms);
-      expect(contractText(result)).toContain(acceptedForms);
+      expectErrorTwin(result, 'invalid_filter', questionHint);
+      const message = `question_id "${question_id}" is not a question identifier or citation. ${questionForms}`;
+      expect(result.structuredContent).toMatchObject({ error: { message } });
+      expect(contractText(result)).toContain(message);
+      expect(contractText(result)).toContain(`Recovery: ${questionHint}`);
       expect(fetcher).not.toHaveBeenCalled();
     },
   );
@@ -266,8 +275,14 @@ describe('euparl_list_questions contract', () => {
       mode: 'get',
       question_id: 'E-900001/2024',
     });
-    expectErrorTwin(result, 'invalid_filter', invalidHint);
-    expect(contractText(result)).toContain('Supply term');
+    expectErrorTwin(
+      result,
+      'invalid_filter',
+      'Retry with term 9 or term 10, or pass E-9-2024-900001 or E-10-2024-900001 as question_id.',
+    );
+    expect(contractText(result)).toContain(
+      'question_id "E-900001/2024" matches questions in terms 9 and 10: E-9-2024-900001 and E-10-2024-900001.',
+    );
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(new URL(String(fetcher.mock.calls[1]?.[0])).pathname).toBe(
       '/api/v2/parliamentary-questions/E-10-2024-900001',
@@ -374,10 +389,23 @@ describe('euparl_list_questions contract', () => {
   });
 
   it.each([
-    [{ work_type: 'UNKNOWN' }, invalidHint],
-    [{ language: 'xx' }, invalidHint],
-    [{ mode: 'get', question_id: 'E-10-2025-900001', term: 9 }, invalidHint],
-    [{ mode: 'get', question_id: 'not-a-citation' }, acceptedForms],
+    [
+      { work_type: 'UNKNOWN' },
+      'Call euparl_list_reference with topic question_types for every accepted code, then retry work_type with one of them.',
+    ],
+    [
+      { work_type: 'REPORT_PLENARY' },
+      'Call euparl_search_documents with source "plenary" and work_type REPORT_PLENARY, or call euparl_list_reference with topic question_types for each question work type.',
+    ],
+    [
+      { language: 'xx' },
+      'Call euparl_list_reference with topic identifiers for every accepted code, then retry language with one of them.',
+    ],
+    [
+      { mode: 'get', question_id: 'E-10-2025-900001', term: 9 },
+      'Retry with term 10, or omit term; a canonical question identifier carries its own term.',
+    ],
+    [{ mode: 'get', question_id: 'not-a-citation' }, questionHint],
   ] as const)('rejects invalid filter %j', async (input, hint) => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
     expectErrorTwin(await runToolContract(listQuestionsTool, input), 'invalid_filter', hint);
@@ -474,11 +502,466 @@ describe('euparl_list_questions contract', () => {
     '../E-10-2025-3',
   ])('rejects invalid question %s with question guidance before HTTP', async (question_id) => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
-    expectErrorTwin(
-      await runToolContract(listQuestionsTool, { mode: 'get', question_id }),
-      'invalid_filter',
-      'Use a canonical question identifier such as E-10-2025-000001 or a human citation such as E-000001/2025, with prefix E, P, O, G or K.',
+    const result = await runToolContract(listQuestionsTool, { mode: 'get', question_id });
+    expectErrorTwin(result, 'invalid_filter', questionHint);
+    expect(contractText(result)).toContain(
+      `question_id "${question_id}" is not a question identifier or citation. ${questionForms}`,
     );
     expect(fetcher).not.toHaveBeenCalled();
+  });
+});
+
+/** A question participation as `/parliamentary-questions/{id}` publishes it; the role may be absent. */
+const participation = (
+  question: string,
+  suffix: string,
+  participant: { had_participant_person: string[] } | { had_participant_organization: string[] },
+  participation_role?: string | string[],
+) => ({
+  id: `eli/dl/participation/${question}_${suffix}`,
+  type: 'Participation',
+  ...participant,
+  ...(participation_role !== undefined && { participation_role }),
+});
+/**
+ * Question detail as `/parliamentary-questions/{id}` published it on 2026-11-13: identity, titles,
+ * creators, original language, participations and each expression's alternative title, without
+ * files or answers.
+ */
+const liveQuestion = (
+  identifier: string,
+  record: {
+    work_type?: string;
+    date: string;
+    creator: string[];
+    titles: Record<string, string>;
+    alternatives: Record<string, string>;
+    originalLanguage: string;
+    participations: ReturnType<typeof participation>[];
+  },
+) => ({
+  id: `eli/dl/doc/${identifier}`,
+  type: 'Work',
+  identifier,
+  work_type: `def/ep-document-types/${record.work_type ?? 'QUESTION_WRITTEN'}`,
+  document_date: record.date,
+  parliamentary_term: `org/ep-${identifier.split('-')[1]}`,
+  creator: record.creator,
+  title_dcterms: record.titles,
+  is_realized_by: Object.entries(record.alternatives).map(([language, text]) => ({
+    id: `eli/dl/doc/${identifier}/${language}`,
+    type: 'Expression',
+    title_alternative: { [language]: text },
+  })),
+  originalLanguage: [`${authority}language/${record.originalLanguage}`],
+  workHadParticipation: record.participations,
+});
+const author = 'def/ep-roles/AUTHOR';
+const addressee = 'def/ep-roles/ADDRESSEE';
+const liveQuestions = {
+  'E-10-2025-000001': liveQuestion('E-10-2025-000001', {
+    date: '2025-01-01',
+    creator: ['person/257064'],
+    titles: { pl: 'Środki z KPO dla Polski', en: 'NRRP funds for Poland' },
+    alternatives: {
+      en: 'Question for written answer E-000001/2025 - to the Commission - Rule 144 - Anna Bryłka (PfE)',
+      pl: 'Pytanie wymagające odpowiedzi na piśmie E-000001/2025 - do Komisji - Art. 144 Regulaminu - Anna Bryłka (PfE)',
+    },
+    originalLanguage: 'POL',
+    participations: [
+      participation(
+        'E-10-2025-000001',
+        '257064',
+        { had_participant_person: ['person/257064'] },
+        author,
+      ),
+      participation(
+        'E-10-2025-000001',
+        'COM',
+        { had_participant_organization: ['org/COM'] },
+        addressee,
+      ),
+    ],
+  }),
+  'E-9-2021-000001': liveQuestion('E-9-2021-000001', {
+    date: '2021-01-04',
+    creator: ['person/197472'],
+    titles: {
+      nl: 'Wereldwijde EU-sanctieregeling voor de mensenrechten',
+      en: 'EU global human rights sanctions regime',
+    },
+    alternatives: {
+      nl: 'Vraag met verzoek om schriftelijk antwoord E-000001/2021/rev.1<br/>aan de Raad<br/>Artikel 138 van het Reglement<br/>Filip De Man (ID)',
+      en: 'Question for written answer E-000001/2021/rev.1<br/>to the Council<br/>Rule 138<br/>Filip De Man (ID)',
+    },
+    originalLanguage: 'NLD',
+    participations: [
+      participation(
+        'E-9-2021-000001',
+        'CS',
+        { had_participant_organization: ['org/EU_COUNCIL'] },
+        addressee,
+      ),
+      participation(
+        'E-9-2021-000001',
+        '197472',
+        { had_participant_person: ['person/197472'] },
+        author,
+      ),
+    ],
+  }),
+  'P-10-2025-000006': liveQuestion('P-10-2025-000006', {
+    work_type: 'QUESTION_WRITTEN_PRIORITY',
+    date: '2025-01-03',
+    creator: ['person/125093', 'person/197734'],
+    titles: {
+      el: 'Το επικίνδυνο ενδεχόμενο υπογραφής ενός τουρκοσυριακού συμφώνου για τις θαλάσσιες ζώνες',
+      en: 'The dangerous possibility of a Turkish-Syrian maritime zone agreement',
+    },
+    alternatives: {
+      en: 'Priority question for written answer P-000006/2025 - to the Vice-President of the Commission / High Representative of the Union for Foreign Affairs and Security Policy - Rule 144 - Kostas Papadakis (NI), Lefteris Nikolaou-Alavanos (NI)',
+      el: 'Ερώτηση προτεραιότητας με αίτημα γραπτής απάντησης P-000006/2025 - προς την Αντιπρόεδρο της Επιτροπής/Ύπατη Εκπρόσωπο της Ένωσης για Θέματα Εξωτερικής Πολιτικής και Πολιτικής Ασφάλειας - Άρθρο 144 του Κανονισμού - Κώστας Παπαδάκης (NI), Λευτέρης Νικολάου-Αλαβάνος (NI)',
+    },
+    originalLanguage: 'ELL',
+    participations: [
+      participation(
+        'P-10-2025-000006',
+        '197734',
+        { had_participant_person: ['person/197734'] },
+        author,
+      ),
+      participation(
+        'P-10-2025-000006',
+        '125093',
+        { had_participant_person: ['person/125093'] },
+        author,
+      ),
+      participation(
+        'P-10-2025-000006',
+        'HRVP',
+        { had_participant_organization: ['org/HRVP'] },
+        addressee,
+      ),
+    ],
+  }),
+  'E-8-2017-000005': liveQuestion('E-8-2017-000005', {
+    date: '2017-01-03',
+    creator: ['person/127330'],
+    titles: { en: 'Strategy on migration policy', es: 'Estrategia en política migratoria' },
+    alternatives: {
+      en: 'Question for written answer E-000005/2017<br/>to the Commission<br/>Rule 130<br/>Tania González Peñas (GUE/NGL)',
+      es: 'Pregunta con solicitud de respuesta escrita E-000005/2017<br/>a la Comisión<br/>Artículo 130 del Reglamento<br/>Tania González Peñas (GUE/NGL)',
+    },
+    originalLanguage: 'SPA',
+    participations: [
+      participation('E-8-2017-000005', '127330', { had_participant_person: ['person/127330'] }, [
+        `${authority}role/AUT`,
+        author,
+      ]),
+      participation(
+        'E-8-2017-000005',
+        'COM',
+        { had_participant_organization: [`${authority}corporate-body/COM`, 'org/EU_COMMISSION'] },
+        addressee,
+      ),
+    ],
+  }),
+  /**
+   * Four of its 64 participations, none with a role (the Commission is one of them), and the first
+   * three of its 63 creators and the first two of its 63 alternative-title authors.
+   */
+  'K-8-2017-000001': liveQuestion('K-8-2017-000001', {
+    work_type: 'INTERPELLATION_MINOR',
+    date: '2017-01-27',
+    creator: ['person/124991', 'person/4432', 'person/28508'],
+    titles: {
+      fr: 'VP/HR - La politique israélienne de colonisation',
+      en: 'VP/HR - Israeli settlement policy',
+    },
+    alternatives: {
+      en: "Minor interpellation for written answer K-000001/2017<br/>to the Commission<br/>Rule 130a<br/>Marietje Schaake, Sophia in 't Veld",
+    },
+    originalLanguage: 'ENG',
+    participations: [
+      participation('K-8-2017-000001', '124987', { had_participant_person: ['person/124987'] }),
+      participation('K-8-2017-000001', '28481', { had_participant_person: ['person/28481'] }),
+      participation('K-8-2017-000001', 'COM', {
+        had_participant_organization: [`${authority}corporate-body/COM`, 'org/EU_COMMISSION'],
+      }),
+      participation('K-8-2017-000001', '112753', { had_participant_person: ['person/112753'] }),
+    ],
+  }),
+};
+
+describe('euparl_list_questions addressees, alternative titles and original languages', () => {
+  it.each([
+    [
+      'E-10-2025-000001',
+      'en',
+      {
+        title: { value: 'NRRP funds for Poland', language: 'en' },
+        alternative_title: {
+          value:
+            'Question for written answer E-000001/2025 - to the Commission - Rule 144 - Anna Bryłka (PfE)',
+          language: 'en',
+        },
+        creator_ids: ['person/257064'],
+        addressee_ids: ['org/COM'],
+        original_languages: ['pl'],
+      },
+    ],
+    [
+      'E-10-2025-000001',
+      'pl',
+      {
+        title: { value: 'Środki z KPO dla Polski', language: 'pl' },
+        alternative_title: {
+          value:
+            'Pytanie wymagające odpowiedzi na piśmie E-000001/2025 - do Komisji - Art. 144 Regulaminu - Anna Bryłka (PfE)',
+          language: 'pl',
+        },
+        addressee_ids: ['org/COM'],
+        original_languages: ['pl'],
+      },
+    ],
+    [
+      'E-9-2021-000001',
+      'en',
+      {
+        alternative_title: {
+          value:
+            'Question for written answer E-000001/2021/rev.1<br/>to the Council<br/>Rule 138<br/>Filip De Man (ID)',
+          language: 'en',
+        },
+        creator_ids: ['person/197472'],
+        addressee_ids: ['org/EU_COUNCIL'],
+        original_languages: ['nl'],
+      },
+    ],
+    [
+      'P-10-2025-000006',
+      'en',
+      {
+        work_type: 'def/ep-document-types/QUESTION_WRITTEN_PRIORITY',
+        alternative_title: {
+          value:
+            'Priority question for written answer P-000006/2025 - to the Vice-President of the Commission / High Representative of the Union for Foreign Affairs and Security Policy - Rule 144 - Kostas Papadakis (NI), Lefteris Nikolaou-Alavanos (NI)',
+          language: 'en',
+        },
+        creator_ids: ['person/125093', 'person/197734'],
+        addressee_ids: ['org/HRVP'],
+        original_languages: ['el'],
+      },
+    ],
+    [
+      'E-8-2017-000005',
+      'en',
+      {
+        alternative_title: {
+          value:
+            'Question for written answer E-000005/2017<br/>to the Commission<br/>Rule 130<br/>Tania González Peñas (GUE/NGL)',
+          language: 'en',
+        },
+        creator_ids: ['person/127330'],
+        addressee_ids: [
+          'http://publications.europa.eu/resource/authority/corporate-body/COM',
+          'org/EU_COMMISSION',
+        ],
+        original_languages: ['es'],
+      },
+    ],
+    [
+      'K-8-2017-000001',
+      'en',
+      {
+        work_type: 'def/ep-document-types/INTERPELLATION_MINOR',
+        title: { value: 'VP/HR - Israeli settlement policy', language: 'en' },
+        alternative_title: {
+          value:
+            "Minor interpellation for written answer K-000001/2017<br/>to the Commission<br/>Rule 130a<br/>Marietje Schaake, Sophia in 't Veld",
+          language: 'en',
+        },
+        creator_ids: ['person/124991', 'person/4432', 'person/28508'],
+        addressee_ids: [],
+        original_languages: ['en'],
+      },
+    ],
+  ] as const)(
+    'returns %s in %s with its published addressees, original language and alternative title in one request',
+    async (question_id, language, expected) => {
+      const fetcher = installToolHttp(() => envelopeResponse([liveQuestions[question_id]]));
+      const result = await runToolContract(listQuestionsTool, {
+        mode: 'get',
+        question_id,
+        language,
+      });
+      const data = expectSuccessTwin(result);
+      expect(data).toMatchObject({ found: true, question: { question_id, ...expected } });
+      expect(data).not.toHaveProperty('notice');
+      expect(contractText(result)).toContain(
+        `result.question.alternative_title.value: \` ${JSON.stringify(expected.alternative_title.value)} \``,
+      );
+      expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
+        questionPath(question_id),
+      ]);
+    },
+  );
+
+  it('returns an EU authority URI published in place of a Parliament code, as addressee_ids describes', async () => {
+    const id = 'P-9-2022-000009';
+    const hrufasp = `${authority}corporate-body/HRUFASP`;
+    installToolHttp(() =>
+      envelopeResponse([
+        liveQuestion(id, {
+          work_type: 'QUESTION_WRITTEN_PRIORITY',
+          date: '2022-01-04',
+          creator: ['person/197400'],
+          titles: { en: 'Example priority question' },
+          alternatives: { en: 'Priority question for written answer P-000009/2022' },
+          originalLanguage: 'ENG',
+          participations: [
+            participation(id, 'HRUFASP', { had_participant_organization: [hrufasp] }, addressee),
+          ],
+        }),
+      ]),
+    );
+    const result = await runToolContract(listQuestionsTool, { mode: 'get', question_id: id });
+    expect(expectSuccessTwin(result)).toMatchObject({
+      question: { question_id: id, addressee_ids: [hrufasp] },
+    });
+    expect(contractText(result)).toContain(
+      `result.question.addressee_ids[0]: [\` "${hrufasp}" \`]`,
+    );
+    const described = z
+      .object({
+        properties: z.object({
+          question: z.object({
+            properties: z.object({ addressee_ids: z.object({ description: z.string() }) }),
+          }),
+        }),
+      })
+      .parse(z.toJSONSchema(listQuestionsTool.output)).properties.question.properties
+      .addressee_ids.description;
+    expect(described).toContain(
+      'org/COM, org/EU_COMMISSION, org/EU_COUNCIL or org/HRVP; some records publish an EU authority URI (http://publications.europa.eu/resource/authority/corporate-body/…) beside such a code or in its place;',
+    );
+  });
+
+  it('falls back to the English alternative title with the shared language notice', async () => {
+    installToolHttp(() => envelopeResponse([liveQuestions['E-10-2025-000001']]));
+    const data = expectSuccessTwin(
+      await runToolContract(listQuestionsTool, {
+        mode: 'get',
+        question_id: 'E-10-2025-000001',
+        language: 'fr',
+      }),
+    );
+    expect(data.question).toMatchObject({
+      title: { value: 'NRRP funds for Poland', language: 'en' },
+      alternative_title: {
+        value:
+          'Question for written answer E-000001/2025 - to the Commission - Rule 144 - Anna Bryłka (PfE)',
+        language: 'en',
+      },
+      addressee_ids: ['org/COM'],
+      original_languages: ['pl'],
+    });
+    expect(data.notice).toBe(
+      'Requested language fr unavailable; returned published en text. Requested file language fr unavailable; returned published en files.',
+    );
+  });
+
+  it('reads a singleton participation, role arrays and reference objects, keeping every addressee in published order', async () => {
+    installToolHttp(() =>
+      envelopeResponse([
+        {
+          ...row('O-10-2025-900001'),
+          workHadParticipation: {
+            id: 'eli/dl/participation/O-10-2025-900001_HRVP',
+            had_participant_organization: { id: 'org/HRVP' },
+            participation_role: [addressee],
+          },
+          originalLanguage: `${authority}language/DEU`,
+        },
+      ]),
+    );
+    expect(
+      expectSuccessTwin(
+        await runToolContract(listQuestionsTool, { mode: 'get', question_id: 'O-10-2025-900001' }),
+      ).question,
+    ).toMatchObject({ addressee_ids: ['org/HRVP'], original_languages: ['de'] });
+    installToolHttp(() =>
+      envelopeResponse([
+        {
+          ...row('O-10-2025-900002'),
+          creator: ['org/ITRE', 'person/257047'],
+          workHadParticipation: [
+            {
+              id: 'eli/dl/participation/O-10-2025-900002_ITRE',
+              had_participant_organization: ['org/ITRE'],
+              participation_role: [`${authority}role/AUT`, author],
+            },
+            {
+              id: 'eli/dl/participation/O-10-2025-900002_CS',
+              had_participant_organization: 'org/EU_COUNCIL',
+              participation_role: addressee,
+            },
+            {
+              id: 'eli/dl/participation/O-10-2025-900002_COM',
+              had_participant_organization: [{ id: 'org/EU_COMMISSION' }, 'org/COM'],
+              participation_role: addressee,
+            },
+          ],
+          originalLanguage: [`${authority}language/FRA`, `${authority}language/DEU`],
+        },
+      ]),
+    );
+    expect(
+      expectSuccessTwin(
+        await runToolContract(listQuestionsTool, { mode: 'get', question_id: 'O-10-2025-900002' }),
+      ).question,
+    ).toMatchObject({
+      creator_ids: ['org/ITRE', 'person/257047'],
+      addressee_ids: ['org/EU_COUNCIL', 'org/EU_COMMISSION', 'org/COM'],
+      original_languages: ['fr', 'de'],
+    });
+  });
+
+  it('returns empty addressees and languages and no alternative title when none is published, leaving every other field as it was', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([questionRecord]));
+    const data = expectSuccessTwin(
+      await runToolContract(listQuestionsTool, { mode: 'get', question_id: 'E-10-2025-900001' }),
+    );
+    const english = {
+      url: 'https://data.europarl.europa.eu/distribution/example/opinion_en.pdf',
+      language: 'en',
+    };
+    expect(data.question).toEqual({
+      question_id: 'E-10-2025-900001',
+      title: { value: 'Example opinion', language: 'en' },
+      date: '2025-01-15',
+      work_type: 'def/ep-document-types/QUESTION_WRITTEN',
+      term_id: 'org/ep-10',
+      creator_ids: ['person/900000001'],
+      addressee_ids: [],
+      original_languages: [],
+      links: [english],
+      answers: [{ document_id: 'E-10-2025-900001-ASW', date: '2025-02-15', links: [english] }],
+      source_url: 'https://data.europarl.europa.eu/eli/dl/doc/E-10-2025-900001',
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps list rows to their sparse identity when a row carries roles, languages and alternative titles', async () => {
+    installToolHttp(() => envelopeResponse([liveQuestions['E-10-2025-000001']]));
+    expect(
+      expectSuccessTwin(await runToolContract(listQuestionsTool, { year: 2025 })).items,
+    ).toEqual([
+      {
+        question_id: 'E-10-2025-000001',
+        work_type: 'def/ep-document-types/QUESTION_WRITTEN',
+        source_url: 'https://data.europarl.europa.eu/eli/dl/doc/E-10-2025-000001',
+      },
+    ]);
   });
 });

@@ -39,15 +39,15 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 | `euparl_list_procedures` | List procedure references by type |
 | `euparl_get_procedure` | Read procedure identity, stage, events, participants, and document references |
 | `euparl_search_documents` | Search adopted texts, list committee/plenary documents, or retrieve any canonical document |
-| `euparl_search_speeches` | Search ninth- or tenth-term speech activities and retrieve metadata and recording-document links |
-| `euparl_search_meps` | Find MEPs across a complete current, dated, or selected-term roster |
+| `euparl_search_speeches` | Search ninth- or tenth-term speech activities and retrieve metadata, recording-document links, and on request the published text |
+| `euparl_search_meps` | Find MEPs across a complete current, dated, or selected-term roster, by name or person ID |
 | `euparl_get_mep` | Read member identity and published membership history |
-| `euparl_get_plenary_votes` | Discover sittings, inspect decisions, and page recorded or intended voters |
+| `euparl_get_plenary_votes` | Discover sittings, list a sitting's vote items, inspect decisions, and page recorded or intended voters |
 | `euparl_list_questions` | List questions by year/type or retrieve a question and answer references |
 
 ### Agent skill
 
-[`skills/eu-parliament-guide`](skills/eu-parliament-guide/SKILL.md) is served over MCP as `skill://eu-parliament-guide/SKILL.md` and ships in the npm package, Docker image, and `.mcpb` bundle. It covers identifier chains from procedure to vote and debate, the term calendar, choosing a file's final vote, a voter's country on the vote date, and conclusions missing data cannot support.
+[`skills/eu-parliament-guide`](skills/eu-parliament-guide/SKILL.md) is served over MCP as `skill://eu-parliament-guide/SKILL.md` and ships in the npm package, Docker image, and `.mcpb` bundle. It covers identifier chains from procedure to vote and debate, the term calendar, choosing a file's final vote, a voter's country and group on the vote date, and conclusions missing data cannot support.
 
 ## Capability reference
 
@@ -55,7 +55,7 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 
 - Required `topic`: `committees`, `political_groups`, `organizations`, `procedure_types`, `document_types`, `question_types`, `activity_types`, `mep_filters`, `identifiers`, or `coverage`
 - `committees` and `political_groups` page Parliament's corporate-body records, historical bodies included; their organization IDs are not filter codes. Published full names and dates are included when available
-- `organizations` requires `organization_ids`: decimal IDs or the case-sensitive codes other tools return (`IMCO`, `S-D`, `ep-9`, `EU_PARLIAMENT`), bare, with an `org/` prefix, or as exact public organization URIs. A code in the wrong case is a `found: false` miss; labels such as `S&D` are rejected. Results retain input order and duplicates with per-item `found`; repeat the same IDs with `page.next_offset` for continuation. At most 20 IDs are looked up per call; reference pages need no snapshot
+- `organizations` requires `organization_ids`: decimal IDs or the case-sensitive codes other tools return (`IMCO`, `S-D`, `ep-9`, `EU_PARLIAMENT`), bare, with an `org/` prefix, or as exact public organization URIs. A code in the wrong case is a `found: false` miss; labels such as `S&D` and EU authority URIs are rejected, and a question's `addressee_ids` do not resolve here (`COM` is the Communist and Allies Group; `EU_COMMISSION`, `EU_COUNCIL` and `HRVP` return no name). Results retain input order and duplicates with per-item `found`; repeat the same IDs with `page.next_offset` for continuation. At most 20 IDs are looked up per call; reference pages need no snapshot
 
 ---
 
@@ -79,7 +79,8 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 ### `euparl_search_documents` <sub>tool</sub>
 
 - `mode: "search"` defaults to `source: "adopted_texts"`, the only family with `text`, `title`, sitting-date, and `related_process_id` filters; adopted texts take `year` and `term`, `committee` takes `term`, `plenary` takes `year`. `work_type` codes are family-specific
-- `mode: "get"` takes a `document_id` from any tool (procedures, speeches, votes, questions, answers) and rejects search filters and paging
+- Adopted-text rows carry `title` (in the requested language only), `date`, and `procedure_ids`; a page holds at most 100 rows. Committee and plenary rows carry identity only
+- `mode: "get"` takes a `document_id` from any tool (procedures, speeches, votes, questions, answers) in any letter case, or a citation such as `T9-0138/2024`, `P9_TA(2024)0138`, `A9-0188/2023`, `RC-B9-0163/2024`, `B9-0163/2024`, or `P9_OJQ(2024)03-13`, and rejects search filters and paging
 - Detail returns metadata, procedure and `parent_document_ids` references, published `adopted_document_ids` and `based_on_document_ids`, optional `public_register_ref`, and every source-file link in the selected language; bodies are linked, not extracted. A published relation does not guarantee its target is available upstream
 - Adopted texts, plenary documents (reports, motions) and committee documents publish their procedure only on their family record, so their get makes one extra request for `procedure_ids`. If that read fails, the rest of the record is returned with a notice that `procedure_ids` may be incomplete
 
@@ -89,16 +90,19 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 
 - Search by `text`, `title`, `person_id`, `activity_type`, or sitting-date range; optional `term` selects 9 or 10, defaulting to 10. Term-9 records start in July 2021
 - `mode: "get"` requires `speech_id` and rejects search filters and nondefault paging
-- Returns activity metadata and participants, not transcripts. Follow `document_ids` through document get and any parent references to source files
+- Returns activity metadata, participants, and `original_languages` for every row. Follow `document_ids` through document get and any parent references to source files
+- `include_text: true` (search and get) adds each speech's published `text`, `speaker`, and `language_tags` in the selected language, with no fallback: a speech unpublished in that language omits its title or text, with a notice. Search returns at most 100 rows per call
 
 ---
 
 ### `euparl_search_meps` <sub>tool</sub>
 
 - Omitting `term` and `mandate_date` selects members in office today; `term` selects a published roster from terms 0–10; `mandate_date` (`YYYY-MM-DD`, not after today, exclusive with `term`) selects members seated on that date. Optional country, political-group, and gender codes come from `mep_filters`
-- On a `mandate_date` roster, country and group are matched and returned as published on that date, so `political_group` matches only the code in force then; for earlier groups omit it and read each member's published group. A term's first sitting day can return an incomplete roster or an upstream error; use the following day
-- Equivalent query spellings include `EPP`, `Greens/EFA`, `GUE/NGL`, `Patriots`, and country `UK` → `GB`, the code Parliament publishes for United Kingdom members on historical rosters; published historical group identities remain intact
+- On a `mandate_date` roster, country and group are matched and returned as published on that date, so `political_group` matches only the code in force then, as it does on the current roster; for earlier groups pass `mandate_date`, or omit `political_group` and read each member's published group. A term's first sitting day can return an incomplete roster or an upstream error; use the following day
+- `political_group` takes the 46 published group codes, current and historical (`PPE-DE`, `ALDE`, `GUE-NGL`, listed with labels and periods by `euparl_list_reference` topic `mep_filters`), their published labels in any case, and the aliases `EPP`, `Greens/EFA`, and `Patriots`. `GUE/NGL` names two codes: it selects `GUE-NGL` on terms 0–8 and dates through 2020-12-18, `THE-LEFT` otherwise, and the notice names the other and how to reach it. On a term roster a code matches members holding a membership in it that had not ended when the term began, not who sat in the group during the term
+- Country `UK` → `GB`, the code Parliament publishes for United Kingdom members on historical rosters; published historical group identities remain intact
 - `name_contains` matches every normalized token across the complete roster before paging, ignoring case, diacritics, and punctuation; a value with no letter or digit is rejected
+- `mep_ids` keeps the listed person IDs (decimal, `person/…`, or the public URI) from the selected roster, narrowing with every other filter; `unmatched_mep_ids` lists the requested IDs the roster does not hold. Pick the roster the IDs belong to: `mandate_date` set to the vote or sitting date for country and group as published that day, `term` for names only
 - Results use snapshot continuation. Country/group describe the selected roster context, never inferred for another date
 
 ---
@@ -106,7 +110,8 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 ### `euparl_get_mep` <sub>tool</sub>
 
 - `mep_id` accepts a decimal person ID, `person/` prefix, or exact public person URI
-- Default `section: "overview"` returns identity and `membership_count`; `section: "memberships"` pages published history with snapshots
+- Default `section: "overview"` returns identity, `membership_count`, and `membership_classifications` (a count per classification code); `section: "memberships"` pages published history with snapshots, latest `start_date` first
+- `classification` (a code such as `COMMITTEE_PARLIAMENTARY_STANDING`, bare or as published, case-insensitive) and `active_on` (`YYYY-MM-DD`, not after today) select memberships before paging and apply to `section: "memberships"` only. Memberships without a classification never match `classification`
 - Missing membership end dates do not establish current membership
 - Resolve membership organization IDs, decimal or term codes such as `org/ep-9`, through `euparl_list_reference` with `topic: "organizations"`
 
@@ -114,10 +119,10 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 
 ### `euparl_get_plenary_votes` <sub>tool</sub>
 
-- `mode: "sittings"` takes `year` (sittings data starts in 2014; earlier years return no sittings); default `decisions` takes `sitting_id` (a `YYYY-MM-DD` date or `MTG-PL-` ID) and pages summaries with labels, tallies, distinct decided-on, recording and part-of document IDs, and vote item IDs. Decisions start in 2019: 2014–2018 sittings list but return no decisions, and not every later sitting has them. Optional `document_id` filters any document relation by exact ID or hyphen-boundary descendant before paging; optional `vote_item_id` (a procedure's `PLENARY_VOTE_RESULTS` event) selects every decision of one vote item, the route to a report's final vote. A procedure event's vote date can select the sitting. Older sittings publish no vote items or report relations on decisions; there, the report citation appears only in decision labels
-- Optional `label_contains` selects a literal substring of the selected-language decision label, ignoring case, repeated whitespace and dash style. Use a report citation such as `A9-0179/2022` on older sittings without document relations; matching text does not establish a final vote. It combines with document and vote-item filters before paging
+- `mode: "sittings"` takes `year` (sittings data starts in 2014; earlier years return no sittings); `mode: "vote_items"` takes `sitting_id` (a `YYYY-MM-DD` date or `MTG-PL-` ID) and lists what the sitting voted on in published order, each item with its title, based-on documents, procedures, recording documents, and `decision_count`; default `decisions` takes `sitting_id` and pages summaries with labels, tallies, distinct decided-on, recording and part-of document IDs, and vote item IDs. Decision records start with the 2019-01-14 sitting: earlier sittings list but return no decisions, and not every later sitting has them. Vote items publish decision links from 2024-01-15, the first sitting of 2024; on earlier sittings `decision_count` is absent and `vote_item_id` selects none of their decisions. Optional `document_id` (a canonical ID or citation, in any letter case) filters any document relation by exact ID or hyphen-boundary descendant before paging; optional `vote_item_id` (a procedure's `PLENARY_VOTE_RESULTS` event or a `vote_items` row) selects every decision of one vote item, the route to a report's final vote. A procedure event's vote date can select the sitting. Where decisions carry no report relations, the report citation appears only in decision labels, and some labels carry none: words of the vote item's title, with `language` set to the title's language (French through 2023), are the alternative
+- Optional `label_contains`, in `decisions` or `vote_items`, selects a literal substring of the selected-language decision label or vote item title, ignoring case, repeated whitespace and dash style. Use a report citation on sittings without document relations: a `document_ids` entry is cited with its prefix and term joined and the year after the number (`A-9-2022-0116` is `A9-0116/2022`, the joint motion `RC-9-2022-0257` is `RC-B9-0257/2022`); matching text does not establish a final vote. In `decisions` it combines with document and vote-item filters before paging
 - `decision` adds `decision_id` and returns one rich record with commentary (an ID absent from the sitting fails `decision_not_found`). Optional `mep_id` in `decisions` or `decision` returns separate recorded/intended positions and publication availability without a roster lookup; an empty match does not prove absence from the vote
-- `mode: "voters"` adds `position`: `favor`, `against`, `abstention`, or the `intended_*` corrections, which never replace recorded votes. `available: false` means the array was not published; a published empty array has `available: true`
+- `mode: "voters"` adds `position`: `favor`, `against`, `abstention`, or the `intended_*` corrections, which never replace recorded votes. `available: false` means the array was not published; a published empty array has `available: true`. Some decisions (for example on the 2019-01-14, 2019-03-27 and 2019-04-04 sittings) publish voter entries that name no person; those entries are left out of `voters`, `voter_counts` and `mep_position`, the tallies stay as published, and a notice says so. Voters still without a name after `resolve_names` are named by one `euparl_search_meps` call with `mep_ids`, `mandate_date` set to the sitting date and `limit` at least their count
 - `resolve_names: true` requires `roster_term` (0–10) and joins names from that term's roster only; unresolved IDs stay in the output
 
 ---
@@ -126,7 +131,7 @@ European Parliament records from the [Open Data API](https://data.europarl.europ
 
 - Default `mode: "list"` accepts `year` and `work_type`; no keyword, author, or addressee search
 - `mode: "get"` requires `question_id`: a canonical work ID, known document prefix/public URI, or human citation such as `E-000001/2025` (also P, O, and the G/K interpellation prefixes). Optional `term` resolves a citation directly; omission checks the corresponding mandate, including both candidates in election years, and requires one exact match
-- Get rejects list filters and nondefault paging. Detail returns metadata, source files, and published answer references; empty `answers` does not prove the question is unanswered
+- Get rejects list filters and nondefault paging. Detail returns metadata, `alternative_title`, `addressee_ids` (the organizations published with the `ADDRESSEE` role, verbatim; they do not resolve through `euparl_list_reference`), `original_languages`, source files, and published answer references; empty `answers` does not prove the question is unanswered
 - Question prefixes E/P/O/G/K are case-insensitive and sequences of one to six digits are padded to six: `e-3/2025` and `E-10-2025-3` resolve as `E-10-2025-000003`
 
 ## Features
@@ -137,17 +142,18 @@ European Parliament-specific:
 
 - Keyless access to Parliament's public JSON-LD records, with canonical identifiers linking discovery, detail, and source evidence
 - Shared request pacing, bounded retries, and one 40-second deadline per call covering every upstream request and queue wait
-- Shared paging on every list tool: `offset`, `limit` (default 20), and `language` (default `en`, any of the 24 EU languages). Rosters, procedure sections, memberships, decisions, and voters are acquired whole, then paged locally with a `page.snapshot` that continuation must pass back; `snapshot_changed` means restart at offset 0. Procedure listings with `process_type` are acquired whole too, and passing their snapshot back is optional
+- Shared paging on every list tool: `offset`, `limit` (default 20), and `language` (default `en`, any of the 24 EU languages). Rosters, procedure sections, memberships, vote items, decisions, and voters are acquired whole, then paged locally with a `page.snapshot` that continuation must pass back; `snapshot_changed` means restart at offset 0. Procedure listings with `process_type` are acquired whole too, and passing their snapshot back is optional
 - Whole-acquired local collections return the requested count or remaining rows without an output-size cap or character budget. Complete relation arrays are preserved. Upstream request bounds are separate from caller page sizes:
 
   | Collection | Acquisition / caller limit |
   |:---|:---|
-  | Process-type procedures, MEP rosters, memberships, procedure sections, decisions, voters, static references | Requested count or remaining rows |
+  | Process-type procedures, MEP rosters, memberships, procedure sections, vote items, decisions, voters, static references | Requested count or remaining rows |
   | Non-keyword adopted texts and speeches | Fixed aligned 100-row upstream pages; caller pages span requests within one deadline |
-  | Unfiltered procedures, questions, committee/plenary documents, keyword adopted texts and speeches, live reference bodies, sittings | 1,000 per request |
+  | Adopted texts, keyword adopted texts, speeches with `include_text` | 100 per call |
+  | Unfiltered procedures, questions, committee/plenary documents, keyword speeches, live reference bodies, sittings | 1,000 per request |
   | Organization lookups (one paced request each) | 20 per call |
 
-  Larger bounded-mode limits normalize with a notice. `EUPARL_CLAMP_LIMITS=false` rejects limits above the largest bound only for tools whose modes are all bounded; smaller mode bounds still normalize. Very large finite limits normalize to the safe-integer range. Non-keyword adopted texts sort by document ID; speeches by sitting date and numbering. Keyword searches retain relevance order and can repeat or omit records. Past-end pages of nonempty local collections disclose the offset, exact total and restart guidance after snapshot validation.
+  Larger bounded-mode limits normalize with a notice. `EUPARL_CLAMP_LIMITS=false` rejects limits above the largest bound only for tools whose modes are all bounded; smaller mode bounds still normalize. Adopted texts count their 10000-result search window as that bound, so `euparl_search_documents` rejects only above 10000 and still returns 100-row adopted-text pages. Very large finite limits normalize to the safe-integer range. Non-keyword adopted texts sort by document ID; speeches by sitting date and numbering. Keyword searches retain relevance order and can repeat or omit records. Past-end pages of nonempty local collections disclose the offset, exact total and restart guidance after snapshot validation.
 
 - Speech and adopted-text searches, and procedure listings without `process_type`, expose a 10,000-result window. A page reaching past it narrows to the results left, with a notice; an offset of 10,000 or more is rejected. Narrow supported filters when the window ends; a capped upstream total is disclosed as a lower bound, and `has_more` can remain true without a reachable `next_offset`
 
@@ -155,7 +161,7 @@ Agent-friendly output:
 
 - Provenance on every response: source URLs, the actual language of each text (fallback disclosed, never translated), normalized filter echo, and continuation guidance
 - Missing data stays distinguishable: detail misses return `found: false`, empty lists succeed with guidance, and published zeros, unpublished arrays, and historical affiliations are never conflated
-- Typed error reasons with recovery hints, and the same data on `content[]` and `structuredContent`
+- Typed error reasons with recovery hints, and the same data on `content[]` and `structuredContent`. A rejected filter names the parameter, quotes the value, lists the accepted codes or forms, and carries its own recovery hint; a rate-limit failure reports Parliament's `retryAfter` in whole seconds
 
 Data source: [European Parliament Open Data](https://data.europarl.europa.eu/), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). This server normalizes identifiers and record structure.
 
@@ -201,13 +207,13 @@ For Docker or a source build, see [Running the server](#running-the-server).
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<app-root>/logs` |
 | `STORAGE_PROVIDER_TYPE` | Storage backend: `in-memory`, `filesystem`, `supabase`, `cloudflare-kv/r2/d1`. | `in-memory` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
-| `EUPARL_CLAMP_LIMITS` | Normalize bounded-mode limits with a notice; `false` rejects limits above a fully bounded tool's largest acquisition bound. Whole-acquired local modes have no output-size cap. | `true` |
+| `EUPARL_CLAMP_LIMITS` | Normalize bounded-mode limits with a notice; `false` rejects limits above a fully bounded tool's largest bound, adopted texts counting their 10000-result search window. Whole-acquired local modes have no output-size cap. | `true` |
 
 No variables are required; `EUPARL_CLAMP_LIMITS` is the one optional server-specific variable. See [`.env.example`](./.env.example) for common framework overrides.
 
 ## Running the server
 
-Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+). No API key or upstream account is required.
+Requires [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+). No API key or upstream account is required.
 
 ```sh
 git clone https://github.com/cyanheads/eu-parliament-mcp-server.git

@@ -12,8 +12,6 @@ import {
 } from '../helpers/eu-parliament-contract.js';
 import { envelopeResponse } from '../helpers/eu-parliament-fixtures.js';
 
-const invalidHint =
-  'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
 const snapshotHint =
   'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.';
 const rejectedHint =
@@ -167,6 +165,16 @@ describe('euparl_get_procedure contract', () => {
     expect(event.sitting_ids.description).toContain(
       'find the report citation in decision labels instead',
     );
+    expect(event.sitting_ids.description).toContain(
+      "find the report citation in decision labels instead (a document_ids entry is cited with its prefix and term joined and the year after the number, so A-9-2022-0116 is A9-0116/2022 and the joint motion RC-9-2022-0257 is RC-B9-0257/2022), else words of the vote item's title with language set to the title's language (decision records start",
+    );
+    expect(event.sitting_ids.description).toContain(
+      "Older sittings publish vote items without decision links and decisions without report relations, so neither filter matches there; list the sitting's vote items with mode vote_items",
+    );
+    expect(event.sitting_ids.description).toContain(
+      'decision records start with the 2019-01-14 sitting',
+    );
+    expect(event.sitting_ids.description).not.toContain('publish no vote items');
   });
   it.each([
     '2025-9001',
@@ -411,15 +419,27 @@ describe('euparl_get_procedure contract', () => {
     expect(data.notice).toBe('Requested language pl unavailable; returned published en text.');
   });
 
-  it('rejects a citation type conflict with declared recovery', async () => {
-    installToolHttp(() => envelopeResponse([procedure]));
-    expectErrorTwin(
-      await runToolContract(getProcedureTool, { procedure_id: '2025/9001(INI)' }),
-      'invalid_filter',
-      invalidHint,
-      JsonRpcErrorCode.ValidationError,
-    );
-  });
+  it.each([
+    [
+      procedure,
+      'procedure_id "2025/9001(INI)" names type INI, but Parliament publishes procedure 2025-9001 as type COD.',
+      'Retry with procedure_id 2025-9001, without the type suffix, or 2025-9001(COD).',
+    ],
+    [
+      { ...procedure, process_type: undefined },
+      'procedure_id "2025/9001(INI)" names type INI, but Parliament publishes no type for procedure 2025-9001.',
+      'Retry with procedure_id 2025-9001, without the type suffix.',
+    ],
+  ])(
+    'rejects a citation type conflict naming the published type after one request (%#)',
+    async (record, message, hint) => {
+      const fetcher = installToolHttp(() => envelopeResponse([record]));
+      const failure = await runToolContract(getProcedureTool, { procedure_id: '2025/9001(INI)' });
+      expectErrorTwin(failure, 'invalid_filter', hint, JsonRpcErrorCode.ValidationError);
+      expect(contractText(failure)).toContain(message);
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it.each([
     [
@@ -446,7 +466,7 @@ describe('euparl_get_procedure contract', () => {
     expectErrorTwin(
       await runToolContract(getProcedureTool, { procedure_id: '2025-9001', language: 'xx' }),
       'invalid_filter',
-      invalidHint,
+      'Call euparl_list_reference with topic identifiers for every accepted code, then retry language with one of them.',
       JsonRpcErrorCode.ValidationError,
     );
     expect(fetcher).not.toHaveBeenCalled();
@@ -537,7 +557,14 @@ describe('euparl_get_procedure contract', () => {
     );
     const pending = runToolContract(getProcedureTool, { procedure_id: '2025-9001' });
     await vi.runAllTimersAsync();
-    expectErrorTwin(await pending, 'upstream_rate_limited', rateHint, JsonRpcErrorCode.RateLimited);
+    const result = await pending;
+    expectErrorTwin(result, 'upstream_rate_limited', rateHint, JsonRpcErrorCode.RateLimited);
+    expect(result.structuredContent).toMatchObject({
+      error: { data: { retry_after_ms: 1000, retryAfter: 1 } },
+    });
+    expect(contractText(result)).toContain(
+      '(reason upstream_rate_limited · retryable · retry after 1)',
+    );
     expect(fetcher).toHaveBeenCalledTimes(3);
   });
 });

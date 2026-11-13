@@ -1,6 +1,7 @@
-/** @fileoverview Speech metadata contracts and followable source-document chains. */
+/** @fileoverview Speech metadata and text contracts and followable source-document chains. */
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { searchDocumentsTool } from '../../src/mcp-server/tools/definitions/search-documents.tool.js';
 import { searchSpeechesTool } from '../../src/mcp-server/tools/definitions/search-speeches.tool.js';
 import {
@@ -9,10 +10,12 @@ import {
   expectSuccessTwin,
   installToolHttp,
 } from '../helpers/eu-parliament-contract.js';
-import { documentRecord, envelopeResponse } from '../helpers/eu-parliament-fixtures.js';
+import {
+  documentRecord,
+  envelopeResponse,
+  speechFragments,
+} from '../helpers/eu-parliament-fixtures.js';
 
-const invalidHint =
-  'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.';
 const label = 'Published `label` **text** https://example.org\nnext line';
 const speech = {
   id: 'eli/dl/event/SPEECH-1',
@@ -110,6 +113,8 @@ describe('euparl_search_speeches contract', () => {
       }),
     );
     expect(data).toMatchObject({ items: [], page: { offset: 500, returned: 0, has_more: false } });
+    // A 204 past the first page carries no total and says nothing about the rows before it.
+    expect(data).not.toHaveProperty('totalCount');
     expect(data.notice).toBe(
       'The page at offset 500 returned no speeches. Restart at offset 0 or return to the previous page.',
     );
@@ -326,12 +331,14 @@ describe('euparl_search_speeches contract', () => {
         speech_id: 'S1',
         participants: [{ person_ids: ['42'] }],
         document_ids: [],
+        original_languages: [],
         source_url: 'https://data.europarl.europa.eu/eli/dl/event/S1',
       },
       {
         speech_id: 'S2',
         participants: [],
         document_ids: [],
+        original_languages: [],
         source_url: 'https://data.europarl.europa.eu/eli/dl/event/S2',
       },
     ]);
@@ -375,18 +382,51 @@ describe('euparl_search_speeches contract', () => {
     expect(data).not.toHaveProperty('speech');
   });
 
-  it.each([{ person_id: 'person/not-numeric' }, { activity_type: 'UNKNOWN' }, { language: 'xx' }])(
-    'rejects filter %j before network',
-    async (input) => {
-      const fetcher = installToolHttp(() => envelopeResponse([]));
-      expectErrorTwin(
-        await runToolContract(searchSpeechesTool, input),
-        'invalid_filter',
-        invalidHint,
-      );
-      expect(fetcher).not.toHaveBeenCalled();
-    },
-  );
+  it.each([
+    [
+      { person_id: 'abc' },
+      'person_id "abc" is not a person identifier. Accepted forms: a decimal person ID (124867), person/124867, or https://data.europarl.europa.eu/person/124867.',
+      "Call euparl_search_meps with name_contains for the member's mep_id, then retry with it as person_id.",
+    ],
+    [
+      { person_id: 'person/not-numeric' },
+      'person_id "person/not-numeric" is not a person identifier.',
+      "Call euparl_search_meps with name_contains for the member's mep_id, then retry with it as person_id.",
+    ],
+    [
+      { activity_type: 'UNKNOWN' },
+      'Unsupported activity_type filter "UNKNOWN". Accepted codes: MEETING_NAME_CHAIR,',
+      'Call euparl_list_reference with topic activity_types for every accepted code, then retry activity_type with one of them.',
+    ],
+    [
+      { language: 'xx' },
+      'Unsupported language filter "xx". Accepted codes: bg,',
+      'Call euparl_list_reference with topic identifiers for every accepted code, then retry language with one of them.',
+    ],
+  ] as const)('rejects filter %j before network', async (input, message, hint) => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    const failure = await runToolContract(searchSpeechesTool, input);
+    expectErrorTwin(failure, 'invalid_filter', hint);
+    expect(contractText(failure)).toContain(message);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed speech_id in get mode naming the parameter before network', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([]));
+    const failure = await runToolContract(searchSpeechesTool, {
+      mode: 'get',
+      speech_id: 'speech 1',
+    });
+    expectErrorTwin(
+      failure,
+      'invalid_filter',
+      'Call euparl_search_speeches in search mode for speech_id values, then retry mode get with one.',
+    );
+    expect(contractText(failure)).toContain(
+      'speech_id "speech 1" is not an activity identifier. Accepted forms: a canonical identifier of letters, digits, hyphens and underscores, bare, after eli/dl/event/, or in the exact https://data.europarl.europa.eu/eli/dl/event/ URI.',
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+  });
 
   it.each([
     [{ sitting_date: '2025-02-30' }, 'Pass an existing calendar day as YYYY-MM-DD.'],
@@ -447,14 +487,499 @@ describe('euparl_search_speeches contract', () => {
     }
   });
 
+  it('sends the same search and detail requests when text is not requested', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([speech]));
+    await runToolContract(searchSpeechesTool, { offset: 150, limit: 20 });
+    await runToolContract(searchSpeechesTool, { text: 'budget', limit: 500, language: 'de' });
+    await runToolContract(searchSpeechesTool, { mode: 'get', speech_id: 'SPEECH-1' });
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://data.europarl.europa.eu/api/v2/speeches?offset=100&limit=100&search-language=en&parliamentary-term=10&sort-by=sitting-date%3Aasc%2Cnumbering%3Aasc&format=application%2Fld%2Bjson',
+      'https://data.europarl.europa.eu/api/v2/speeches?offset=0&limit=500&text=budget&search-language=de&parliamentary-term=10&format=application%2Fld%2Bjson',
+      'https://data.europarl.europa.eu/api/v2/speeches/SPEECH-1?format=application%2Fld%2Bjson',
+    ]);
+  });
+
+  it.each([
+    { sitting_date: '2024-03-12' },
+    { sitting_date: '2024-03-12', include_text: false },
+    { mode: 'get', speech_id: 'SPEECH-1' },
+    { mode: 'get', speech_id: 'SPEECH-1', include_text: false },
+  ] as const)(
+    'echoes no include_text in appliedFilters when text is not requested: %j',
+    async (input) => {
+      installToolHttp(() => envelopeResponse([speech]));
+      const data = expectSuccessTwin(await runToolContract(searchSpeechesTool, input));
+      expect(data.appliedFilters).not.toHaveProperty('include_text');
+      expect(contractText(await runToolContract(searchSpeechesTool, input))).not.toContain(
+        'include_text',
+      );
+    },
+  );
+
   it('rejects unsupported snapshot input before acquisition', async () => {
     const fetcher = installToolHttp(() => envelopeResponse([]));
     const input = { mode: 'search' as const, snapshot: 'abc' };
     expectErrorTwin(
       await runToolContract(searchSpeechesTool, input),
       'invalid_arguments',
-      'Unknown key snapshot. This tool accepts: mode, speech_id, term, text, title, person_id, activity_type, sitting_date, sitting_date_end, offset, limit, language.',
+      'Unknown key snapshot. This tool accepts: mode, speech_id, term, text, title, person_id, activity_type, sitting_date, sitting_date_end, include_text, offset, limit, language.',
     );
     expect(fetcher).not.toHaveBeenCalled();
+  });
+});
+
+const authority = 'http://publications.europa.eu/resource/authority/language/';
+const { benifei: benifeiText, chair: chairText, irish: irishText } = speechFragments;
+const benifeiParagraphs = [
+  "Mr President, Commissioner Breton, ladies and gentlemen, after two intense years of work, we have finally come to pass the world's first binding law on artificial intelligence.",
+  'Enough of the indiscriminate use of deep fake that will be made recognizable through the so-called "watermarking", an invisible labeling.',
+];
+const reintkeText =
+  '<oralStatements><speech endTime="2026-04-28T09:48:17.542" startTime="2026-04-28T09:46:02.166" xml:lang="en"><from xml:lang="en" xml:space="preserve"><person refersTo="epdata:person/103381">Terry Reintke</person>, <role refersTo="">on behalf of the <organization refersTo="epdata:org/7028">Verts/ALE</organization> Group</role>.</from><!--en - 0--><blockContainer xml:lang="en"><p xml:space="preserve"><recordedTime time="2026-04-28T09:46:02.216+02:00" type="startEvent"/>Mr President, dear disciples, Member States come up over and over again with new tasks for Europe.<recordedTime time="2026-04-28T09:46:26.626+02:00" type="endEvent"/></p></blockContainer><!--de - 1--><blockContainer xml:lang="de-t-en-mtec"><p xml:space="preserve"><recordedTime time="2026-04-28T09:47:17.85+02:00" type="startEvent"/>A completely confused CDU course that serves the interests of Donald Trump.<recordedTime time="2026-04-28T09:47:59.01+02:00" type="endEvent"/></p></blockContainer></speech></oralStatements>';
+/** A speech activity as `/speeches` publishes it, its recording document carrying `fragments`. */
+const spoken = (
+  id: string,
+  {
+    label,
+    languages,
+    fragments,
+    type = 'PLENARY_DEBATE_SPEECH',
+    document = `CRE-${id.slice(4)}`,
+  }: {
+    label?: Record<string, string>;
+    languages?: string[];
+    fragments?: Record<string, string>;
+    type?: string;
+    document?: string;
+  },
+) => ({
+  id: `eli/dl/event/${id}`,
+  activity_id: id,
+  activity_date: id.slice(7, 17),
+  ...(label && { activity_label: label }),
+  had_activity_type: `def/ep-activities/${type}`,
+  recorded_in_a_realization_of: [
+    {
+      id: `eli/dl/doc/${document}`,
+      type: 'WorkSubdivision',
+      identifier: document,
+      ...(languages && { originalLanguage: languages.map((code) => `${authority}${code}`) }),
+      ...(fragments && { 'api:xmlFragment': fragments }),
+    },
+  ],
+});
+const benifei = {
+  ...spoken('MTG-PL-2024-03-12-OTH-22050000', {
+    label: { en: 'Artificial Intelligence Act (debate)' },
+    languages: ['ITA'],
+    fragments: { en: benifeiText },
+    document: 'CRE-9-2024-03-12-OTH-22050000',
+  }),
+  had_participation: {
+    id: 'eli/dl/participation/MTG-PL-2024-03-12-OTH-22050000_124867',
+    had_participant_person: ['person/124867'],
+    participation_role: 'def/ep-roles/SPEAKER',
+  },
+};
+const queryOf = (fetcher: ReturnType<typeof installToolHttp>, call = 0) =>
+  Object.fromEntries(new URL(String(fetcher.mock.calls[call]?.[0])).searchParams);
+
+describe('euparl_search_speeches include_text', () => {
+  it('reads one speech with its text, speaker, language tags and original languages in one request', async () => {
+    const fetcher = installToolHttp(() => envelopeResponse([benifei]));
+    const result = await runToolContract(searchSpeechesTool, {
+      mode: 'get',
+      speech_id: 'MTG-PL-2024-03-12-OTH-22050000',
+      include_text: true,
+      language: 'en',
+    });
+    const data = expectSuccessTwin(result);
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://data.europarl.europa.eu/api/v2/speeches/MTG-PL-2024-03-12-OTH-22050000?include-output=xml_fragment&language=en&format=application%2Fld%2Bjson',
+    ]);
+    expect(data).toMatchObject({
+      found: true,
+      appliedFilters: {
+        mode: 'get',
+        speech_id: 'MTG-PL-2024-03-12-OTH-22050000',
+        language: 'en',
+        include_text: true,
+      },
+      speech: {
+        speech_id: 'MTG-PL-2024-03-12-OTH-22050000',
+        title: { value: 'Artificial Intelligence Act (debate)', language: 'en' },
+        participants: [{ person_ids: ['124867'], role: 'def/ep-roles/SPEAKER' }],
+        document_ids: ['CRE-9-2024-03-12-OTH-22050000'],
+        original_languages: ['it'],
+        speaker: 'Brando Benifei, Rapporteur.',
+        language_tags: ['en'],
+        text: { value: benifeiParagraphs.join('\n\n'), language: 'en' },
+      },
+    });
+    expect(data).not.toHaveProperty('notice');
+    expect(contractText(result)).toContain(
+      `result.speech.text.value: \` ${JSON.stringify(benifeiParagraphs.join('\n\n'))} \``,
+    );
+  });
+
+  it('keeps every block of a speech with machine-translated passages and both original languages', async () => {
+    installToolHttp(() =>
+      envelopeResponse([
+        spoken('MTG-PL-2026-04-28-OTH-2017073719859', {
+          label: { en: 'Simplification of the MFF (debate)' },
+          languages: ['DEU', 'ENG'],
+          fragments: { en: reintkeText },
+        }),
+      ]),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, {
+        mode: 'get',
+        speech_id: 'MTG-PL-2026-04-28-OTH-2017073719859',
+        include_text: true,
+      }),
+    );
+    expect(data.speech).toMatchObject({
+      original_languages: ['de', 'en'],
+      language_tags: ['en', 'de-t-en-mtec'],
+      speaker: 'Terry Reintke, on behalf of the Verts/ALE Group.',
+      text: {
+        value:
+          'Mr President, dear disciples, Member States come up over and over again with new tasks for Europe.\n\nA completely confused CDU course that serves the interests of Donald Trump.',
+        language: 'en',
+      },
+    });
+  });
+
+  it('reads a chair communication without a speaker and leaves a row without a recording document textless', async () => {
+    const fetcher = installToolHttp(() =>
+      envelopeResponse([
+        spoken('MTG-PL-2025-03-11-PVCRE-CHA-1', {
+          label: { en: 'IN THE CHAIR: ROBERTA METSOLA' },
+          fragments: { en: chairText },
+          type: 'MEETING_NAME_CHAIR',
+        }),
+        {
+          id: 'eli/dl/event/MTG-PL-2021-07-05-PVCRE-CHA-1',
+          activity_id: 'MTG-PL-2021-07-05-PVCRE-CHA-1',
+          activity_date: '2021-07-05',
+          had_activity_type: 'def/ep-activities/MEETING_NAME_CHAIR',
+        },
+      ]),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, {
+        activity_type: 'MEETING_NAME_CHAIR',
+        include_text: true,
+      }),
+    );
+    expect(queryOf(fetcher)).toMatchObject({
+      'include-output': 'xml_fragment',
+      language: 'en',
+      'activity-type': 'MEETING_NAME_CHAIR',
+    });
+    expect(data.items).toEqual([
+      {
+        speech_id: 'MTG-PL-2025-03-11-PVCRE-CHA-1',
+        date: '2025-03-11',
+        title: { value: 'IN THE CHAIR: ROBERTA METSOLA', language: 'en' },
+        activity_type: 'def/ep-activities/MEETING_NAME_CHAIR',
+        participants: [],
+        document_ids: ['CRE-PL-2025-03-11-PVCRE-CHA-1'],
+        original_languages: [],
+        language_tags: ['en'],
+        text: { value: 'IN THE CHAIR: ROBERTA METSOLA\n\nPresident', language: 'en' },
+        source_url: 'https://data.europarl.europa.eu/eli/dl/event/MTG-PL-2025-03-11-PVCRE-CHA-1',
+      },
+      {
+        speech_id: 'MTG-PL-2021-07-05-PVCRE-CHA-1',
+        date: '2021-07-05',
+        activity_type: 'def/ep-activities/MEETING_NAME_CHAIR',
+        participants: [],
+        document_ids: [],
+        original_languages: [],
+        source_url: 'https://data.europarl.europa.eu/eli/dl/event/MTG-PL-2021-07-05-PVCRE-CHA-1',
+      },
+    ]);
+    expect(data).not.toHaveProperty('notice');
+  });
+
+  it('leaves chair rows, which publish no title in any language, out of the missing-title count', async () => {
+    // Chair rows publish no activity_label in any language; the other rows are narrowed to `language`.
+    const chair = (id: string, fragments?: Record<string, string>) =>
+      spoken(id, {
+        type: 'MEETING_NAME_CHAIR',
+        languages: ['DEU'],
+        ...(fragments && { fragments }),
+      });
+    const debate = {
+      label: { en: 'Opening of the sitting' },
+      languages: ['DEU'],
+      fragments: { en: irishText },
+    };
+    const fetcher = installToolHttp((url) =>
+      url.pathname.endsWith('/speeches')
+        ? envelopeResponse([
+            chair('MTG-PL-2026-10-07-PVCRE-CHA-1', { en: chairText }),
+            spoken('MTG-PL-2026-10-07-OTH-2017097974619', debate),
+            chair('MTG-PL-2026-10-07-PVCRE-CHA-2', { en: chairText }),
+            ...(url.searchParams.get('sitting-date') === '2026-10-08'
+              ? [
+                  chair('MTG-PL-2026-10-08-PVCRE-CHA-1'),
+                  spoken('MTG-PL-2026-10-08-OTH-2017098000001', { languages: ['ITA'] }),
+                ]
+              : []),
+          ])
+        : envelopeResponse([chair('MTG-PL-2026-10-07-PVCRE-CHA-1', { en: chairText })]),
+    );
+    const chairsOnly = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, {
+        sitting_date: '2026-10-07',
+        include_text: true,
+      }),
+    );
+    expect(chairsOnly.items).toMatchObject([
+      { text: { language: 'en' } },
+      { title: { value: 'Opening of the sitting', language: 'en' } },
+      { text: { language: 'en' } },
+    ]);
+    const [first, , third] = chairsOnly.items as Record<string, unknown>[];
+    expect(first).not.toHaveProperty('title');
+    expect(third).not.toHaveProperty('title');
+    expect(chairsOnly).not.toHaveProperty('notice');
+    const mixed = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, {
+        sitting_date: '2026-10-08',
+        include_text: true,
+      }),
+    );
+    expect(mixed.notice).toBe(
+      "include_text returns title and text only in the requested language en, without fallback. Missing in en: title on 1 and text on 2 of 5 speeches. Retry with a language in the speech's original_languages.",
+    );
+    const detail = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, {
+        mode: 'get',
+        speech_id: 'MTG-PL-2026-10-07-PVCRE-CHA-1',
+        include_text: true,
+      }),
+    );
+    expect(detail.speech).toMatchObject({
+      activity_type: 'def/ep-activities/MEETING_NAME_CHAIR',
+      text: { value: 'IN THE CHAIR: ROBERTA METSOLA\n\nPresident', language: 'en' },
+    });
+    expect(detail.speech).not.toHaveProperty('title');
+    expect(detail).not.toHaveProperty('notice');
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it('returns title and text only in the requested language, with a notice, and keeps the fallback title without include_text', async () => {
+    const labels = { en: 'Resumption of the session', it: 'Ripresa della sessione' };
+    const fetcher = installToolHttp((url) => {
+      const language = url.searchParams.get('language');
+      // The upstream narrows activity_label to the requested language, dropping it when unpublished.
+      const label: Record<string, string> | undefined =
+        language === null
+          ? labels
+          : language in labels
+            ? { [language]: labels[language as keyof typeof labels] }
+            : undefined;
+      return envelopeResponse([
+        spoken('MTG-PL-2021-07-05-OTH-10040000', {
+          ...(label && { label }),
+          languages: ['ITA'],
+          ...(language === 'ga' && { fragments: { ga: irishText } }),
+        }),
+        spoken('MTG-PL-2021-07-05-OTH-10060000', { ...(label && { label }), languages: ['ITA'] }),
+      ]);
+    });
+    const irish = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, {
+        term: 9,
+        sitting_date: '2021-07-05',
+        include_text: true,
+        language: 'ga',
+      }),
+    );
+    expect(queryOf(fetcher)).toMatchObject({
+      'include-output': 'xml_fragment',
+      language: 'ga',
+      'search-language': 'ga',
+    });
+    expect(irish.items).toMatchObject([
+      {
+        original_languages: ['it'],
+        speaker: 'Presidente. –',
+        language_tags: ['ga'],
+        text: {
+          value:
+            'Dearbhaím gur atosaíodh an seisiún de Pharlaimint na hEorpa a cuireadh ar atráth Déardaoin, an 24 Meitheamh 2021.',
+          language: 'ga',
+        },
+      },
+      { original_languages: ['it'] },
+    ]);
+    for (const row of irish.items as Record<string, unknown>[])
+      expect(row).not.toHaveProperty('title');
+    expect(irish.items).not.toMatchObject([{}, { text: expect.anything() }]);
+    expect(irish.notice).toBe(
+      "include_text returns title and text only in the requested language ga, without fallback. Missing in ga: title on 2 and text on 1 of 2 speeches. Retry with language en or a language in the speech's original_languages.",
+    );
+    const fallback = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, {
+        term: 9,
+        sitting_date: '2021-07-05',
+        language: 'ga',
+      }),
+    );
+    expect(queryOf(fetcher, 1)).not.toHaveProperty('include-output');
+    expect(queryOf(fetcher, 1)).not.toHaveProperty('language');
+    expect(fallback.items).toMatchObject([
+      { title: { value: 'Resumption of the session', language: 'en' }, original_languages: ['it'] },
+      { title: { value: 'Resumption of the session', language: 'en' }, original_languages: ['it'] },
+    ]);
+    for (const row of fallback.items as Record<string, unknown>[])
+      expect(row).not.toHaveProperty('text');
+    expect(fallback.notice).toBe('Requested language ga unavailable; returned published en text.');
+    const english = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, {
+        term: 9,
+        sitting_date: '2021-07-05',
+        include_text: true,
+      }),
+    );
+    expect(english.notice).toBe(
+      "include_text returns title and text only in the requested language en, without fallback. Missing in en: text on 2 of 2 speeches. Retry with a language in the speech's original_languages.",
+    );
+  });
+
+  it('acquires at most 100 rows per call through the limit clamp, in aligned pages or one keyword request', async () => {
+    const pool = Array.from({ length: 250 }, (_, i) =>
+      spoken(`MTG-PL-2025-01-15-OTH-${String(i).padStart(6, '0')}`, {
+        fragments: { en: chairText },
+      }),
+    );
+    const fetcher = installToolHttp((url) => {
+      const offset = Number(url.searchParams.get('offset'));
+      return Response.json({
+        data: pool.slice(offset, offset + Number(url.searchParams.get('limit'))),
+        meta: { total: pool.length },
+      });
+    });
+    const capped = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, { include_text: true, limit: 500 }),
+    );
+    expect(capped).toMatchObject({
+      page: { offset: 0, limit: 100, returned: 100, next_offset: 100 },
+      truncated: true,
+      totalCount: 250,
+    });
+    expect(capped.notice).toContain(
+      'Requested limit normalized to the effective maximum of 100 speeches with text.',
+    );
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(queryOf(fetcher)).toMatchObject({ offset: '0', limit: '100' });
+    const unaligned = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, { include_text: true, offset: 50, limit: 100 }),
+    );
+    expect(unaligned).toMatchObject({ page: { offset: 50, limit: 100, next_offset: 150 } });
+    expect((unaligned.items as { speech_id: string }[]).map((row) => row.speech_id)).toEqual(
+      pool.slice(50, 150).map((row) => row.activity_id),
+    );
+    expect(unaligned).not.toHaveProperty('notice', expect.stringContaining('normalized'));
+    expect([queryOf(fetcher, 1), queryOf(fetcher, 2)]).toMatchObject([
+      { offset: '0', limit: '100', 'include-output': 'xml_fragment', language: 'en' },
+      { offset: '100', limit: '100', 'include-output': 'xml_fragment', language: 'en' },
+    ]);
+    expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, {
+        include_text: true,
+        text: 'artificial intelligence',
+        limit: 500,
+      }),
+    );
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(queryOf(fetcher, 3)).toMatchObject({
+      offset: '0',
+      limit: '100',
+      text: 'artificial intelligence',
+      'include-output': 'xml_fragment',
+      language: 'en',
+    });
+    expect(queryOf(fetcher, 3)).not.toHaveProperty('sort-by');
+  });
+
+  it('fails a deadline crossed on the second aligned text page as a Timeout, never a partial page', async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const fetcher = installToolHttp((_url, _init, index) => {
+      vi.advanceTimersByTime(index === 0 ? 20_000 : 20_001);
+      return envelopeResponse(
+        Array.from({ length: 100 }, (_, i) =>
+          spoken(`MTG-PL-2025-01-15-OTH-${String(i).padStart(6, '0')}`, {}),
+        ),
+      );
+    });
+    const result = await runToolContract(searchSpeechesTool, {
+      include_text: true,
+      offset: 50,
+      limit: 100,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { code: JsonRpcErrorCode.Timeout } });
+    expect(contractText(result)).toContain('deadline');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('relays upstream text with ampersands, angle brackets, quotes and backticks whole on both surfaces', async () => {
+    const fragment =
+      '<oralStatements><speech><from xml:lang="en"><person>A &amp; B</person>.</from><blockContainer><p>R&amp;D &lt;script&gt; &quot;quoted&quot; and \'single\'</p><p>``fenced`` `code` \\ <![CDATA[<raw> & ]]>end</p></blockContainer></speech></oralStatements>';
+    installToolHttp(() =>
+      envelopeResponse([
+        spoken('MTG-PL-2025-01-15-OTH-000001', { languages: ['ENG'], fragments: { en: fragment } }),
+      ]),
+    );
+    const result = await runToolContract(searchSpeechesTool, {
+      mode: 'get',
+      speech_id: 'MTG-PL-2025-01-15-OTH-000001',
+      include_text: true,
+    });
+    const data = expectSuccessTwin(result);
+    const value = 'R&D <script> "quoted" and \'single\'\n\n``fenced`` `code` \\ <raw> & end';
+    expect(data.speech).toMatchObject({ speaker: 'A & B.', text: { value, language: 'en' } });
+    expect(contractText(result)).toContain(
+      `result.speech.text.value: \`\`\` ${JSON.stringify(value)} \`\`\``,
+    );
+  });
+
+  it.each([[{ mode: 'get', speech_id: 'S', include_text: 'yes' }], [{ include_text: 1 }]])(
+    'rejects a non-boolean include_text %j before network',
+    async (input) => {
+      const fetcher = installToolHttp(() => envelopeResponse([]));
+      const result = await runToolContract<Parameters<typeof runToolContract>[0]>(
+        searchSpeechesTool,
+        input,
+      );
+      expect(result.isError).toBe(true);
+      expect(contractText(result)).toContain('include_text');
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
+
+  it('returns an empty text search and a past-end page with the shared notices', async () => {
+    installToolHttp(() => new Response(null, { status: 204 }));
+    const empty = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, { include_text: true, sitting_date: '2025-01-01' }),
+    );
+    expect(empty).toMatchObject({ items: [], page: { returned: 0, has_more: false } });
+    expect(empty.notice).toContain('No speech records matched in term 10 (the default).');
+    expect(empty.notice).not.toContain('include_text');
+    const past = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, { include_text: true, offset: 300 }),
+    );
+    expect(past.notice).toBe(
+      'The page at offset 300 returned no speeches. Restart at offset 0 or return to the previous page.',
+    );
   });
 });

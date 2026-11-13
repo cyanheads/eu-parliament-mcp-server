@@ -56,6 +56,7 @@ const expressionSchema = z.object({
   id: z.string(),
   language: z.string().optional(),
   title: localizedSchema.optional(),
+  title_alternative: localizedSchema.optional(),
   is_embodied_by: z.array(manifestationSchema).optional(),
 });
 const documentFields = {
@@ -85,10 +86,36 @@ export const documentFamilySchema = z.object({
   id: z.string(),
   inverse_created_a_realization_of: referencesSchema,
 });
+/**
+ * Adopted-text list row under `language={code}`: the summary identity plus title, date and the
+ * family relation that view adds. Its expressions are never parsed: list rows embed them in shapes
+ * detail does not accept (bare expression IDs, several issue dates on one file), and one such row
+ * would fail the whole page.
+ */
+export const adoptedTextRowSchema = z.object({
+  id: z.string(),
+  identifier: z.string().optional(),
+  label: z.string().optional(),
+  work_type: z.string().optional(),
+  title_dcterms: localizedSchema.optional(),
+  document_date: z.string().optional(),
+  inverse_created_a_realization_of: referencesSchema,
+});
+/** Language authority URIs (`…/authority/language/ITA`), singleton or array. */
+const languagesSchema = z.union([z.string(), z.array(z.string())]).optional();
+/** Only organization participants are read; a role is a string or, on term-8 records, an array. */
+const questionParticipationSchema = z.object({
+  had_participant_organization: referencesSchema,
+  participation_role: z.union([z.string(), z.array(z.string())]).optional(),
+});
 /** Question detail embeds answer work records. */
 export const questionSchema = z.object({
   ...documentFields,
   inverse_answers_to: z.array(z.union([z.string(), documentSchema])).optional(),
+  workHadParticipation: z
+    .union([questionParticipationSchema, z.array(questionParticipationSchema)])
+    .optional(),
+  originalLanguage: languagesSchema,
 });
 /** Event relationships vary by activity type. */
 const eventSchema = z
@@ -151,12 +178,24 @@ const activityFields = {
   activity_label: localizedSchema.optional(),
   had_activity_type: z.string().optional(),
 };
-/** Speech labels and document references do not imply a transcript. */
+/**
+ * A recording document names its original languages; with `include-output=xml_fragment` it also
+ * embeds the spoken text as XML keyed by language.
+ */
+const recordingSchema = z.union([
+  z.string(),
+  z.object({
+    id: z.string(),
+    originalLanguage: languagesSchema,
+    'api:xmlFragment': localizedSchema.optional(),
+  }),
+]);
+/** Speech labels are not transcripts; spoken text arrives only in requested fragments. */
 export const speechSchema = z
   .object({
     ...activityFields,
     had_participation: participationsSchema,
-    recorded_in_a_realization_of: referencesSchema,
+    recorded_in_a_realization_of: z.union([recordingSchema, z.array(recordingSchema)]).optional(),
   })
   .transform(foldActivityDate);
 /** Sitting discovery uses the source activity identity. */
@@ -187,6 +226,26 @@ export const decisionSchema = z
     comment: localizedSchema.optional(),
   })
   .transform(foldActivityDate);
+/** The sitting or procedure a vote item belongs to, embedding its own vote-item list. */
+const voteItemParentSchema = z.union([
+  z.string(),
+  z.object({ id: z.string(), consists_of: referencesSchema }),
+]);
+/**
+ * One `/meetings/{id}/vote-results` record: a `PLENARY_VOTE_RESULTS` vote item, or one of the
+ * roll-call, split and separate-vote requests published beside them. `consists_of` links an
+ * item's decisions and is absent before 2024.
+ */
+export const voteItemSchema = z.object({
+  id: z.string(),
+  activity_id: z.string().optional(),
+  activity_label: localizedSchema.optional(),
+  had_activity_type: z.string().optional(),
+  based_on_a_realization_of: referencesSchema,
+  recorded_in_a_realization_of: referencesSchema,
+  consists_of: referencesSchema,
+  inverse_consists_of: z.union([voteItemParentSchema, z.array(voteItemParentSchema)]).optional(),
+});
 /** Live reference bodies carry classification rather than filter-code guesses. */
 export const bodySchema = z.object({
   id: z.string(),
@@ -201,10 +260,12 @@ export const bodySchema = z.object({
 
 /** Parsed upstream record types. */
 export type RawDocument = z.infer<typeof documentSchema>;
+export type RawAdoptedTextRow = z.infer<typeof adoptedTextRowSchema>;
 export type RawQuestion = z.infer<typeof questionSchema>;
 export type RawProcedure = z.infer<typeof procedureSchema>;
 export type RawMep = z.infer<typeof mepSchema>;
 export type RawSpeech = z.infer<typeof speechSchema>;
 export type RawDecision = z.infer<typeof decisionSchema>;
+export type RawVoteItem = z.infer<typeof voteItemSchema>;
 export type RawParticipation = z.infer<typeof participationSchema>;
 export type RawBody = z.infer<typeof bodySchema>;

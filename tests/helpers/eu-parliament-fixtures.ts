@@ -199,6 +199,16 @@ export const decisionRecord = {
   comment: { en: 'RCV' },
 };
 
+/** Live speech fragments (2026-11), long paragraphs trimmed; element and attribute shapes kept. */
+export const speechFragments = {
+  benifei:
+    '<oralStatements><speech endTime="2024-03-12T14:57:22.000" startTime="2024-03-12T14:52:53.869"><from xml:lang="en" xml:space="preserve"><person refersTo="epdata:person/124867">Brando Benifei</person>, <role>Rapporteur</role>.</from><blockContainer><p xml:space="preserve">Mr President, Commissioner Breton, ladies and gentlemen, after two intense years of work, we have finally come to pass the world\'s first binding law on artificial intelligence.</p><p xml:space="preserve">Enough of the indiscriminate use of <inline name="i">deep fake</inline> that will be made recognizable through the so-called "<inline name="i">watermarking</inline>", an invisible labeling.</p></blockContainer></speech></oralStatements>',
+  chair:
+    '<communication xml:lang="en"><heading xml:space="preserve">IN THE CHAIR: <person refersTo="epdata:person/118859">ROBERTA METSOLA</person></heading><subheading><role refersTo="epdata:def/ep-roles/PRESIDENT">President</role></subheading></communication>',
+  irish:
+    '<oralStatements><speech endTime="2021-07-05T17:04:29.000" startTime="2021-07-05T17:04:19.001"><from xml:lang="ga" xml:space="preserve"><person refersTo="epdata:person/96864">Presidente</person>. –</from><blockContainer><p xml:space="preserve">Dearbhaím gur atosaíodh an seisiún de Pharlaimint na hEorpa a cuireadh ar atráth Déardaoin, an 24 Meitheamh 2021.</p></blockContainer></speech></oralStatements>',
+};
+
 /** Return an HTTP response rather than bypassing transport parsing. */
 export function envelopeResponse(data: unknown[], status = 200): Response {
   return new Response(

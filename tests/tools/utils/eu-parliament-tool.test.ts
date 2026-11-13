@@ -21,7 +21,11 @@ import {
 } from '../../helpers/eu-parliament-contract.js';
 import { envelopeResponse } from '../../helpers/eu-parliament-fixtures.js';
 
-/** Each tool beside the largest page cap among the collections it serves. */
+/**
+ * Each tool beside the maximum it advertises with EUPARL_CLAMP_LIMITS=false: the largest page cap
+ * among the collections it serves, or a larger strict bound (adopted texts accept their 10000-result
+ * search window and answer with their 100-row page).
+ */
 const tools = [
   [listProceduresTool, undefined],
   [listQuestionsTool, 1000],
@@ -103,6 +107,15 @@ describe('shared limit input', () => {
       expect(advertisedLimit(definition)).not.toHaveProperty('maximum');
     },
   );
+  it('states what a strict-mode limit returns when a strict bound passes every page cap', () => {
+    strictMode();
+    expect(advertisedLimit(searchDocumentsTool).description).toBe(
+      "Whole items requested; default 20. Bounded-mode acquisition limits: 1000 documents, 100 adopted texts, or 100 keyword adopted texts. Limits above 10000 are rejected; a smaller limit above the selected mode's acquisition limit normalizes to that limit with a notice. Values above the safe-integer range normalize to 9007199254740991; search windows and bounded modes may narrow further.",
+    );
+    expect(advertisedLimit(searchSpeechesTool).description).toContain(
+      'Limits above 10000 are rejected; smaller mode limits normalize with a notice.',
+    );
+  });
   it('distinguishes local modes from verified upstream bounds without Infinity in schemas', () => {
     expect(advertisedLimit(listProceduresTool).description).toContain('1000 procedures');
     expect(advertisedLimit(listProceduresTool).description).toContain('without an output-size cap');
