@@ -36,6 +36,24 @@ describe('MCPB agent documentation cleanup', () => {
     expect(linter).toContain(`export const AGENT_DOC_ENTRY =\n  ${AGENT_DOC_ENTRY};`);
   });
 
+  it('treats agent directories and AGENTS.md or CLAUDE.md as documentation only at a package root', () => {
+    const entries = [
+      'node_modules/example/AGENTS.md',
+      'node_modules/@scope/example/CLAUDE.md',
+      'node_modules/nested/node_modules/example/CLAUDE.md',
+      'node_modules/example/docs/AGENTS.md',
+      'node_modules/example/dist/.claude/settings.json',
+      'node_modules/example/lib/framework-skills/loader.js',
+      'node_modules/@scope/skills/index.js',
+      'AGENTS.md',
+    ];
+    expect(filterAgentDocEntries(entries)).toEqual([
+      'node_modules/example/AGENTS.md',
+      'node_modules/@scope/example/CLAUDE.md',
+      'node_modules/nested/node_modules/example/CLAUDE.md',
+    ]);
+  });
+
   it.each([
     (size: number) => '1'.repeat(size),
     (size: number) => `${'1'.repeat(size)}\nend`,
