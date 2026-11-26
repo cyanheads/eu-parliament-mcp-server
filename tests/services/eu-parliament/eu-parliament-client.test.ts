@@ -136,6 +136,62 @@ describe('EuParliamentClient', () => {
     },
   );
 
+  describe('MEP declaration routes', () => {
+    it('sends every declaration list filter Parliament honors', async () => {
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse([]));
+      const client = new EuParliamentClient({ fetch: fetcher });
+      await client.get(
+        'meps-declarations',
+        {
+          offset: 100,
+          limit: 100,
+          'person-id': '124867',
+          'related-process-id': '2021-0106',
+          year: 2026,
+          'parliamentary-term': 10,
+          'filter-output': 'no-awareness-of-conflict',
+          title: 'BENIFEI',
+          'search-language': 'en',
+          language: 'en',
+          'work-type': 'MEMBER_DECLARATION_INTEREST_CONFLICT',
+        },
+        record,
+        client.operation(signal()),
+      );
+      expect(String(fetcher.mock.calls[0]?.[0])).toBe(
+        'https://data.europarl.europa.eu/api/v2/meps-declarations?offset=100&limit=100&person-id=124867&related-process-id=2021-0106&year=2026&parliamentary-term=10&filter-output=no-awareness-of-conflict&title=BENIFEI&search-language=en&language=en&work-type=MEMBER_DECLARATION_INTEREST_CONFLICT&format=application%2Fld%2Bjson',
+      );
+    });
+    it.each([
+      ['meps-declarations', { text: 'BENIFEI' }],
+      ['meps-declarations', { 'sort-by': 'doc-id:asc' }],
+      ['meps-declarations', { 'capacity-role': 'RAPPORTEUR' }],
+      ['meps-declarations/DCI-124760-2024-12-17-425114', { language: 'en' }],
+      ['meps-declarations/DCI-124760-2024-12-17-425114', { limit: 1 }],
+      ['meps-declarations/DCI-1/x', {}],
+    ])('rejects %s %j before fetch', async (path, query) => {
+      const fetcher = vi.fn<typeof fetch>();
+      const client = new EuParliamentClient({ fetch: fetcher });
+      await expect(client.get(path, query, record, client.operation(signal()))).rejects.toThrow(
+        /^Unsupported (?:query parameter|Parliament endpoint)/,
+      );
+      expect(fetcher).not.toHaveBeenCalled();
+    });
+    it('reads a declaration record with only the format query', async () => {
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse([]));
+      const client = new EuParliamentClient({ fetch: fetcher });
+      await client.get(
+        'meps-declarations/DCI-124760-2024-12-17-425114',
+        {},
+        record,
+        client.operation(signal()),
+      );
+      expect(String(fetcher.mock.calls[0]?.[0])).toBe(
+        'https://data.europarl.europa.eu/api/v2/meps-declarations/DCI-124760-2024-12-17-425114?format=application%2Fld%2Bjson',
+      );
+    });
+  });
+
   it.each([
     [
       'speeches',
@@ -240,6 +296,37 @@ describe('EuParliamentClient', () => {
           client.operation(signal()),
         ),
       ).rejects.toThrow('Unsupported Parliament endpoint');
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
+
+  it('reads a sitting foreseen-activities route with only the format query', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(envelopeResponse([]));
+    const client = new EuParliamentClient({ fetch: fetcher });
+    await client.get(
+      'meetings/MTG-PL-2026-11-24/foreseen-activities',
+      {},
+      record,
+      client.operation(signal()),
+    );
+    expect(String(fetcher.mock.calls[0]?.[0])).toBe(
+      'https://data.europarl.europa.eu/api/v2/meetings/MTG-PL-2026-11-24/foreseen-activities?format=application%2Fld%2Bjson',
+    );
+  });
+
+  it.each([{ language: 'fr' }, { offset: 0 }, { limit: 50 }])(
+    'rejects the foreseen-activities query %j before fetch',
+    async (query) => {
+      const fetcher = vi.fn<typeof fetch>();
+      const client = new EuParliamentClient({ fetch: fetcher });
+      await expect(
+        client.get(
+          'meetings/MTG-PL-2026-11-24/foreseen-activities',
+          query,
+          record,
+          client.operation(signal()),
+        ),
+      ).rejects.toThrow(`Unsupported query parameter: ${Object.keys(query)[0]}`);
       expect(fetcher).not.toHaveBeenCalled();
     },
   );

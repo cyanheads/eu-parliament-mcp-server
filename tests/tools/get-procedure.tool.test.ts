@@ -162,14 +162,12 @@ describe('euparl_get_procedure contract', () => {
       'A PLENARY_VOTE_RESULTS event id is a vote item: pass it as vote_item_id to euparl_get_plenary_votes',
     );
     expect(event.sitting_ids.description).toContain('decisions with vote_item_id or document_id');
+    expect(event.sitting_ids.description).toContain('match label_contains to the report citation');
     expect(event.sitting_ids.description).toContain(
-      'find the report citation in decision labels instead',
+      "match label_contains to the report citation (a document_ids entry is cited with its prefix and term joined and the year after the number, so A-9-2022-0116 is A9-0116/2022 and the joint motion RC-9-2022-0257 is RC-B9-0257/2022) or to words of the vote item's title in the title's language (decision records start",
     );
     expect(event.sitting_ids.description).toContain(
-      "find the report citation in decision labels instead (a document_ids entry is cited with its prefix and term joined and the year after the number, so A-9-2022-0116 is A9-0116/2022 and the joint motion RC-9-2022-0257 is RC-B9-0257/2022), else words of the vote item's title with language set to the title's language (decision records start",
-    );
-    expect(event.sitting_ids.description).toContain(
-      "Older sittings publish vote items without decision links and decisions without report relations, so neither filter matches there; list the sitting's vote items with mode vote_items",
+      "Older sittings publish vote items without decision links and decisions without report relations, so neither filter matches there: list the sitting's vote items with mode vote_items",
     );
     expect(event.sitting_ids.description).toContain(
       'decision records start with the 2019-01-14 sitting',

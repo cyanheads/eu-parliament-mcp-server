@@ -13,6 +13,7 @@ import {
 import {
   envelopeResponse,
   maltaOn20240313,
+  nullGroupOn20200129,
   rosterRecords,
 } from '../helpers/eu-parliament-fixtures.js';
 
@@ -249,6 +250,35 @@ describe('euparl_search_meps contract', () => {
     const url = new URL(String(fetcher.mock.calls[0]?.[0]));
     expect(url.pathname).toBe('/api/v2/meps/show-current');
     expect(url.searchParams.get('mandate-date')).toBe('2024-03-13');
+  });
+
+  it('lists a dated roster whose rows publish a null group or country with that field absent', async () => {
+    installToolHttp(() =>
+      envelopeResponse([
+        nullGroupOn20200129,
+        { ...rosterRecords[0], 'api:country-of-representation': null },
+      ]),
+    );
+    const data = expectSuccessTwin(
+      await runToolContract(searchMepsTool, { mandate_date: '2020-01-29' }),
+    );
+    expect(data.items).toEqual([
+      {
+        mep_id: '900000001',
+        name: 'Alex EXAMPLE',
+        given_name: 'Alex',
+        family_name: 'Example',
+        political_group: 'PPE',
+      },
+      {
+        mep_id: '185974',
+        name: 'Jordi SOLÉ',
+        given_name: 'Jordi',
+        family_name: 'Solé',
+        country: 'ES',
+      },
+    ]);
+    expect(data).toMatchObject({ totalCount: 2 });
   });
 
   it.each([

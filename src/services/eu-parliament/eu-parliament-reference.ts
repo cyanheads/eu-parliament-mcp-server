@@ -185,6 +185,7 @@ const codes = {
     'RESOLUTION_MOTION_JOINT',
     'QUESTION_RESOLUTION_MOTION',
   ],
+  mep_declarations: ['MEMBER_DECLARATION_INTEREST_CONFLICT'],
   question: [
     'QUESTION_WRITTEN_PRIORITY',
     'QUESTION_WRITTEN',
@@ -288,6 +289,7 @@ const codeTopics = {
   adopted_texts: 'document_types',
   committee: 'document_types',
   plenary: 'document_types',
+  mep_declarations: 'document_types',
   question: 'question_types',
   activity_type: 'activity_types',
 } as const satisfies Record<CodeFamily, ReferenceTopic>;
@@ -383,10 +385,10 @@ export function politicalGroupNotice(
     ? `${twoCodes} This call sent ${code}; to select the other group, pass political_group ${other} with term ${bothCodesTerm}, whose roster holds both codes, or with a mandate_date ${days}.`
     : `${twoCodes} This call sent ${code}. A mandate_date or current roster matches only the code in force that day, so ${other} matches no member here; to select it, pass political_group ${other} with a mandate_date ${days} or with term ${bothCodesTerm}.`;
 }
-const documentFamilies = ['adopted_texts', 'committee', 'plenary'] as const;
+const documentFamilies = ['adopted_texts', 'committee', 'plenary', 'mep_declarations'] as const;
 /**
  * The document family whose work-type table lists a published work type, matched on its last path
- * segment (`def/ep-document-types/TEXT_ADOPTED`); undefined outside the three families.
+ * segment (`def/ep-document-types/TEXT_ADOPTED`); undefined outside the four families.
  */
 export function documentFamily(workType: string | undefined) {
   const code = workType?.slice(workType.lastIndexOf('/') + 1) ?? '';
@@ -455,6 +457,7 @@ export function referenceEntries(
         ...rows(codes.adopted_texts, 'adopted_texts family; case-insensitive input.'),
         ...rows(codes.committee, 'committee family; case-insensitive input.'),
         ...rows(codes.plenary, 'plenary family; case-insensitive input.'),
+        ...rows(codes.mep_declarations, 'mep_declarations family; case-insensitive input.'),
       ];
     case 'question_types':
       return rows(codes.question, 'Question work type; case-insensitive input.');
@@ -534,12 +537,11 @@ export function referenceEntries(
         {
           code: 'documents',
           description:
-            'Only adopted texts support keyword document search. Committee filters are unavailable. Files are linked, never downloaded or parsed.',
+            'Only adopted texts support keyword document search, MEP declarations a title search only. Committee filters are unavailable. Files are linked, never downloaded or parsed. MEP declarations on awareness of conflicts of interest filter by person_id, related_process_id, title, year, term and awareness_of_conflict; Parliament matches no declaration for a member within a term, so term and person_id are not combined.',
         },
         {
           code: 'speeches',
-          description:
-            'Ninth- and tenth-term speech metadata and source links; search defaults to term 10. Term-9 records start in July 2021; earlier term-9 sitting dates return none. Published labels are not transcripts; include_text returns the text Parliament publishes for each speech in the selected language only, with no fallback, and at most 100 search rows per call. Term-10 machine-translated blocks are tagged {source}-t-{target}-mtec, while term-9 translations carry only the target code, so original_languages says whose words a text is. Coverage is not guaranteed for other terms.',
+          description: `Ninth- and tenth-term speech metadata and source links; search defaults to term 10. Search returns at most ${pageCaps.speeches.maximum} rows per call, ${pageCaps.keyword_speeches.maximum} with text or title keywords. Term-9 records start in July 2021; earlier term-9 sitting dates return none. Published labels are not transcripts; include_text returns the text Parliament publishes for each speech in the selected language only, with no fallback, and at most ${pageCaps.text_speeches.maximum} search rows per call. Term-10 machine-translated blocks are tagged {source}-t-{target}-mtec, while term-9 translations carry only the target code, so original_languages says whose words a text is. Coverage is not guaranteed for other terms.`,
         },
         {
           code: 'meps',
@@ -548,11 +550,11 @@ export function referenceEntries(
         },
         {
           code: 'votes',
-          description: `Discover sittings, list the vote items of a sitting or page its compact decisions, read a rich decision, then page recorded or intended positions. Sittings data starts in 2014; earlier years return no sittings. Vote items carry titles, report documents and procedures from 2014; through 2023 their titles are published in French (some also in a combined mul text) and they publish no decision links, so decision_count is absent and vote_item_id selects none of their decisions. Decision records start with the ${firstDecisionSitting} sitting: earlier sittings list but return no decisions, and not every later sitting has them. Names require explicit roster_term and reflect that published roster, never historical affiliation.`,
+          description: `Discover sittings, list the agenda items or vote items of a sitting or page its compact decisions, read a rich decision, then page recorded or intended positions. Sittings data starts in 2014; earlier years return no sittings. Agenda items come from Parliament's published agenda, available from the 2024-12-16 sitting on and for the weeks of 2023-07-10 and 2024-04-22; other earlier sittings, upcoming sittings whose agenda is not yet published, and dates with no sitting all return none. Agendas change until the sitting and a moved item changes ID; their procedure_ids and document_ids lead to procedure and document detail, while agenda item IDs are not vote_item_id values. Vote items carry titles, report documents and procedures from 2014; through 2023 their titles are published in French (some also in a combined mul text) and they publish no decision links, so decision_count is absent and vote_item_id selects none of their decisions. Decision records start with the ${firstDecisionSitting} sitting: earlier sittings list but return no decisions, and not every later sitting has them. Names require explicit roster_term and reflect that published roster, never historical affiliation. A rich decision with breakdown adds its recorded voters tallied by the group and country the roster for the sitting date publishes; decisions that do not publish all three recorded voter arrays (hand votes) or whose arrays name no person (early-2019 roll calls) get none.`,
         },
         {
           code: 'paging',
-          description: `Acquisition bounds: ${pageCapList}. Whole-acquired local collections, including process_type procedures and static reference tables, return the requested count or remaining rows without an output-size cap. Limits above the safe-integer range normalize to 9007199254740991. A larger bounded-mode limit narrows with a notice; EUPARL_CLAMP_LIMITS=false rejects values above a tool's largest bound only when all its modes are bounded, adopted texts counting their ${searchResultWindow}-result search window as that bound while still returning ${pageCaps.adopted_documents.maximum}-row pages. Organization lookups page supplied IDs without a snapshot. Non-keyword adopted texts use doc-id:asc; speeches use sitting-date:asc,numbering:asc; both acquire aligned 100-row pages independently of caller geometry within one deadline. Keyword searches retain relevance order and can repeat or omit records. Speeches, adopted texts and unfiltered procedures expose a 10000-result window; limits narrow to remaining results and offsets of 10000 or more fail. Capped totals are lower bounds; has_more can remain true without next_offset at the window. Unfiltered procedures can repeat or omit records; process_type listings are acquired whole and sorted by procedure_id with optional snapshot. Other local continuation requires the snapshot; drift fails snapshot_changed before slicing. Past-end local pages disclose the exact collection size. No retained cache.`,
+          description: `Acquisition bounds: ${pageCapList}. Whole-acquired local collections, including process_type procedures and static reference tables, return the requested count or remaining rows without an output-size cap. Limits above the safe-integer range normalize to 9007199254740991. A larger bounded-mode limit narrows with a notice; EUPARL_CLAMP_LIMITS=false rejects values above a tool's largest bound only when all its modes are bounded, adopted texts, speeches and MEP declarations counting their ${searchResultWindow}-result search window as that bound while still returning pages within their acquisition bounds. Organization lookups page supplied IDs without a snapshot. Non-keyword adopted texts use doc-id:asc; speeches use sitting-date:asc,numbering:asc; both acquire aligned 100-row pages independently of caller geometry within one deadline. Keyword searches retain relevance order and can repeat or omit records. Speeches, adopted texts, MEP declarations and unfiltered procedures expose a 10000-result window; limits narrow to remaining results and offsets of 10000 or more fail. Capped totals are lower bounds; has_more can remain true without next_offset at the window. Unfiltered procedures can repeat or omit records; process_type listings are acquired whole and sorted by procedure_id with optional snapshot. Other local continuation requires the snapshot; drift fails snapshot_changed before slicing. Past-end local pages disclose the exact collection size. No retained cache. MEP declarations ignore sort-by: each call reads aligned 100-row pages sorted by document_id and returns at most ${pageCaps.declarations.maximum} rows inside the same ${searchResultWindow}-result window, capped totals as lower bounds; when more than 100 match, pages can repeat and omit declarations.`,
         },
         {
           code: 'questions',

@@ -32,57 +32,82 @@ export function serviceInput<T extends object>(
 /** Shared whole-item list position and stateless continuation metadata. */
 export const pageSchema = z
   .object({
-    offset: z
-      .number()
-      .int()
-      .nonnegative()
-      .describe('Zero-based position in the selected collection.'),
+    offset: z.number().int().nonnegative().describe('Zero-based offset of this page.'),
     limit: z
       .number()
       .int()
       .positive()
-      .describe(
-        'Effective whole-item page size after acquisition bounds, safe-integer normalization and any search-result window. Local collections retain all requested whole items or remaining rows.',
-      ),
-    returned: z.number().int().nonnegative().describe('Number of complete items on this page.'),
-    has_more: z
-      .boolean()
-      .describe(
-        'Whether more matches are known or cannot be ruled out; a search window may prevent continuation.',
-      ),
+      .describe('Effective page size after caps and the search window.'),
+    returned: z.number().int().nonnegative().describe('Items on this page.'),
+    has_more: z.boolean().describe('True when more matches exist or cannot be ruled out.'),
     next_offset: z
       .number()
       .int()
       .nonnegative()
       .optional()
       .describe(
-        'Usable next offset when continuation is accessible; absent at a search-window boundary even if has_more is true.',
+        'Offset of the next page; absent at the search-window boundary even when has_more is true.',
       ),
     snapshot: z
       .string()
       .optional()
-      .describe(
-        'Digest of the complete normalized local collection and scope; reuse for continuation.',
-      ),
+      .describe('Pass back with next_offset to continue this local collection.'),
   })
   .strict()
-  .describe('Whole-item page metadata.');
+  .describe('Page position.');
 /** Published text and the actual selected source language. */
 export const localizedTextSchema = z
   .object({
-    value: z.string().describe('Exact published text.'),
-    language: z.string().describe('Actual language of the published text.'),
+    value: z.string().describe('Published text.'),
+    language: z.string().describe('Actual language of the text.'),
   })
   .strict()
-  .describe('Selected published localized text.');
-/** Published file link with unmodified optional metadata. */
+  .describe('Published localized text.');
+/** A document title: `value` is the first published title, `values` every one when there are several. */
+export const localizedTitleSchema = localizedTextSchema
+  .extend({
+    value: z.string().describe('Published title; the first of several.'),
+    values: z
+      .array(z.string().describe('Published title.'))
+      .min(2)
+      .optional()
+      .describe('Every title in this language, in published order; only when there are several.'),
+  })
+  .strict()
+  .describe('Published title.');
+/**
+ * Published file link with unmodified optional metadata. Several issue dates or sizes published for
+ * one language and format (one manifestation) name no file, so each of its links carries the list.
+ */
 export const linkSchema = z
   .object({
     url: z.string().describe('Absolute public file URL.'),
     media_type: z.string().optional().describe('Published media type.'),
     language: z.string().optional().describe('Published expression language.'),
-    issued: z.string().optional().describe('Published issue date.'),
-    size_bytes: z.string().optional().describe('Published byte size retained as a decimal string.'),
+    issued: z
+      .string()
+      .optional()
+      .describe('Published issue date; absent when issued_values lists several.'),
+    issued_values: z
+      .array(z.string().describe('Published issue date.'))
+      .min(2)
+      .optional()
+      .describe(
+        'Every issue date of this language and format when several, in published order; none names a file, so every link of the format carries the list.',
+      ),
+    size_bytes: z
+      .string()
+      .optional()
+      .describe(
+        'Published byte size, a decimal string; absent when size_bytes_values lists several.',
+      ),
+    size_bytes_values: z
+      .array(z.string().describe('Published byte size, a decimal string.'))
+      .min(2)
+      .optional()
+      .describe(
+        'Every byte size of this language and format when several, decimal strings in published order; none names a file, so every link of the format carries the list.',
+      ),
   })
   .strict()
   .describe('Published source-file link.');
@@ -105,14 +130,15 @@ function strictMaximum(collection: PagedCollection): number {
  * `maximum: 9007199254740991`, and the integer refinement catches float noise `multipleOf`
  * tolerates. With EUPARL_CLAMP_LIMITS=false a fully bounded tool's largest strict bound is
  * enforced and advertised; mixed tools keep local modes open. A strict bound above every page cap
- * (adopted texts accept their search window) answers with the selected mode's cap.
+ * (adopted texts, non-keyword speeches and MEP declarations accept their search window) answers
+ * with the selected mode's cap.
  * The mode is read per call and per `tools/list` emission (the `.meta()` getters), never when
  * the definition module is imported, which happens before `setup()` parses the environment.
  */
 function limitInput(collections: readonly [PagedCollection, ...PagedCollection[]]) {
   const maximum = Math.max(...collections.map(strictMaximum));
-  const abovePages =
-    maximum > Math.max(...collections.map((collection) => pageCaps[collection].maximum));
+  // Some mode's cap sits below the strict bound, so an accepted limit can still narrow there.
+  const narrows = collections.some((collection) => pageCaps[collection].maximum < maximum);
   return z
     .number()
     .multipleOf(1, wholeNumber)
@@ -140,33 +166,27 @@ function limitInput(collections: readonly [PagedCollection, ...PagedCollection[]
         const local = collections.some(
           (collection) => pageCaps[collection].maximum === Number.MAX_SAFE_INTEGER,
         );
-        return `Whole items requested; default 20. ${local ? 'Whole-acquired local collections return the requested count or remaining rows, without an output-size cap. ' : ''}${bounded.length ? `Bounded-mode acquisition limits: ${capList(bounded)}. ${!clampLimits() && !local ? `Limits above ${maximum} are rejected; ${abovePages ? "a smaller limit above the selected mode's acquisition limit normalizes to that limit with a notice." : 'smaller mode limits normalize with a notice.'}` : 'Larger bounded-mode limits normalize with a notice.'} ` : ''}Values above the safe-integer range normalize to 9007199254740991; search windows and bounded modes may narrow further.`;
+        const larger =
+          !clampLimits() && !local
+            ? `above ${maximum} is rejected${narrows ? ", and a smaller limit above the mode's cap narrows to it with a notice" : ''}`
+            : 'a larger limit narrows to the cap with a notice';
+        return `Items per page; default 20.${local ? ' Local collections return every requested row, with no output-size cap.' : ''}${bounded.length ? ` Caps: ${capList(bounded)}; ${larger}.` : ''}`;
       },
     });
 }
 /** Paging fields for a tool whose pages draw from `collections`; `limit` states their caps. */
 export function pagingInputFields(...collections: [PagedCollection, ...PagedCollection[]]) {
   return {
-    offset: z
-      .number()
-      .int()
-      .nonnegative()
-      .default(0)
-      .describe('Zero-based collection offset; default 0.'),
+    offset: z.number().int().nonnegative().default(0).describe('Zero-based offset; default 0.'),
     limit: limitInput(collections),
     language: optionalString().describe(
-      'Supported EU ISO-639-1 language, case-insensitive; default en; source text is never translated.',
+      'EU ISO 639-1 language, any case; default en; text is never translated.',
     ),
   };
 }
 /** Common result-set context, rendered completely on both surfaces. */
 export const enrichmentFields = {
-  appliedFilters: z
-    .record(
-      z.string().describe('Normalized filter name.'),
-      z.unknown().describe('Normalized filter value.'),
-    )
-    .describe('Actual normalized retrieval scope and filters.'),
+  appliedFilters: z.record(z.string(), z.unknown()).describe('Normalized scope and filters.'),
   notice: z
     .string()
     .optional()
@@ -176,24 +196,17 @@ export const enrichmentFields = {
     .int()
     .nonnegative()
     .optional()
-    .describe('Exact count only when published or computed over a complete collection.'),
+    .describe('Exact total; only when published or counted over the whole collection.'),
   available: z
     .boolean()
     .optional()
-    .describe(
-      'Whether the selected source array was published, including a published empty array.',
-    ),
+    .describe('Whether the source array was published; a published empty array counts.'),
   truncated: z
     .boolean()
     .optional()
-    .describe('True when this page returns only part of the selected collection.'),
-  shown: z
-    .number()
-    .int()
-    .nonnegative()
-    .optional()
-    .describe('Whole items shown on this partial page.'),
-  cap: z.number().int().positive().optional().describe('Effective whole-item page limit.'),
+    .describe('True when this page holds only part of the collection.'),
+  shown: z.number().int().nonnegative().optional().describe('Items on this partial page.'),
+  cap: z.number().int().positive().optional().describe('Effective page limit.'),
 };
 /** Full field-path response twin; a blank line keeps each value independent. */
 export function formatResult(value: unknown) {

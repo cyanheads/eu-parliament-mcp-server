@@ -5,8 +5,13 @@
 import { createHash } from 'node:crypto';
 import { conflict, serializationError, validationError } from '@cyanheads/mcp-ts-core/errors';
 import type {
+  MultiValuedLocalized,
   RawAdoptedTextRow,
+  RawAgendaRecord,
   RawDecision,
+  RawDeclarationFamily,
+  RawDeclarationParticipation,
+  RawDeclarationRow,
   RawDocument,
   RawMep,
   RawParticipation,
@@ -22,12 +27,22 @@ export interface LocalizedText {
   language: string;
   value: string;
 }
-/** File metadata; source byte sizes retain their decimal string encoding. */
+/** A published title: the first value, with every value only when the language publishes several. */
+export interface LocalizedTitle extends LocalizedText {
+  values?: string[];
+}
+/**
+ * File metadata; source byte sizes retain their decimal string encoding. A manifestation that
+ * publishes several issue dates or sizes gives each of its files the whole list in `*_values`,
+ * verbatim and in published order, instead of the scalar: no value is tied to a file.
+ */
 export interface Link {
   issued?: string;
+  issued_values?: string[];
   language?: string;
   media_type?: string;
   size_bytes?: string;
+  size_bytes_values?: string[];
   url: string;
 }
 /** Whole-item paging; snapshot is present for reacquired local collections. */
@@ -94,6 +109,14 @@ function withoutPrefixes(value: string, noun: Noun): string {
   if (id.startsWith(nounPrefixes[noun])) id = id.slice(nounPrefixes[noun].length);
   return id;
 }
+/** The canonical form of a prefix-free identifier, or undefined when it is not one of the noun. */
+function parsedId(id: string, noun: Noun): string | undefined {
+  if (noun === 'procedure') {
+    const match = /^(\d{4})[-/](\d{4}[A-Z]?)(?:\(([A-Z]+)\))?$/.exec(id);
+    return match ? `${match[1]}-${match[2]}` : undefined;
+  }
+  return (noun === 'person' ? /^\d+$/ : /^[A-Za-z0-9][A-Za-z0-9_-]*$/).test(id) ? id : undefined;
+}
 /**
  * Strips only a verified public URI and known noun prefix. Organizations accept decimal IDs and
  * Parliament's case-sensitive codes (`IMCO`, `S-D`, `ep-9`, `EU_PARLIAMENT`) without rewriting case.
@@ -101,12 +124,8 @@ function withoutPrefixes(value: string, noun: Noun): string {
  * came from a Parliament record, so it fails as a serialization failure naming no parameter.
  */
 export function canonicalId(value: string, noun: Noun, input?: IdInput): string {
-  const id = withoutPrefixes(value, noun);
-  if (noun === 'procedure') {
-    const match = /^(\d{4})[-/](\d{4}[A-Z]?)(?:\(([A-Z]+)\))?$/.exec(id);
-    if (match) return `${match[1]}-${match[2]}`;
-  } else if (noun === 'person' ? /^\d+$/.test(id) : /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(id))
-    return id;
+  const id = parsedId(withoutPrefixes(value, noun), noun);
+  if (id !== undefined) return id;
   throw input
     ? validationError(
         `${input.parameter} ${JSON.stringify(value)} is not ${nounForms[noun].name}. Accepted forms: ${nounForms[noun].forms}.`,
@@ -173,14 +192,42 @@ function references(value: Reference | Reference[] | undefined): string[] {
 function canonicalIds(value: Reference | Reference[] | undefined, noun: Noun): string[] {
   return references(value).map((id) => canonicalId(id, noun));
 }
-/** Canonical IDs of a relation's `eli/dl/proc/` entries in published order; other nouns drop out. */
-export function procedureIds(value: Reference | Reference[] | undefined): string[] {
-  return canonicalIds(
-    references(value).filter(
-      (id) => id.startsWith('eli/dl/proc/') || id.startsWith(`${publicOrigin}eli/dl/proc/`),
-    ),
-    'procedure',
-  );
+const skippedProcedures =
+  'Parliament publishes procedure references that are not procedure identifiers (YYYY-NNNN), so no procedure ID is returned for them: ';
+/**
+ * Adds `"value" on record` to the call's one skipped-procedure notice, once per pair, in first-seen
+ * order. A JSON-quoted value escapes every quote it holds and record IDs hold no semicolon, so
+ * `; "value" on record;` matches only that whole entry.
+ */
+function skipProcedure(notices: string[], record: string, value: string): void {
+  const entry = `${JSON.stringify(value)} on ${record}`;
+  const notice = notices.find((listed) => listed.startsWith(skippedProcedures));
+  if (notice === undefined) notices.push(`${skippedProcedures}${entry}.`);
+  else if (!`; ${notice.slice(skippedProcedures.length, -1)};`.includes(`; ${entry};`))
+    notices[notices.indexOf(notice)] = `${notice.slice(0, -1)}; ${entry}.`;
+}
+/**
+ * Canonical IDs of a relation's `eli/dl/proc/` entries in published order; other nouns drop out.
+ * An entry that is no procedure identifier (`eli/dl/proc/2023-02735`) is left out and named, as
+ * published, with `record` in the call's notice: it has no recoverable reading, and failing the
+ * whole record on one cross-reference would withhold everything else the record publishes.
+ */
+export function procedureIds(
+  value: Reference | Reference[] | undefined,
+  record: string,
+  notices: string[],
+): string[] {
+  return references(value).flatMap((reference) => {
+    if (
+      !reference.startsWith(nounPrefixes.procedure) &&
+      !reference.startsWith(`${publicOrigin}${nounPrefixes.procedure}`)
+    )
+      return [];
+    const id = parsedId(withoutPrefixes(reference, 'procedure'), 'procedure');
+    if (id !== undefined) return [id];
+    skipProcedure(notices, record, reference);
+    return [];
+  });
 }
 /** Published activity identifier, else the canonical form of the record URI. */
 export function activityId(raw: { id: string; activity_id?: string | undefined }): string {
@@ -211,6 +258,48 @@ export function localized(
   if (value === undefined) throw new Error('Selected localization is missing');
   return { value, language: selected };
 }
+/** The title published in exactly `language`, without fallback or notice; undefined when it has none. */
+export function titleInLanguage(
+  map: MultiValuedLocalized | undefined,
+  language: string,
+): LocalizedTitle | undefined {
+  const published = map?.[language];
+  if (published === undefined) return undefined;
+  if (typeof published === 'string') return { value: published, language };
+  return { value: published[0], language, ...(published.length > 1 && { values: published }) };
+}
+/**
+ * `localized` over a title map whose languages may publish several titles: it selects the language
+ * and discloses any fallback, and that language's titles form the result.
+ */
+export function localizedTitle(
+  map: MultiValuedLocalized | undefined,
+  language: string,
+  notices: string[],
+): LocalizedTitle | undefined {
+  if (!map) return undefined;
+  const firstTitles = Object.fromEntries(
+    Object.entries(map).map(([key, published]) => [
+      key,
+      typeof published === 'string' ? published : published[0],
+    ]),
+  );
+  const selected = localized(firstTitles, language, notices);
+  return selected && titleInLanguage(map, selected.language);
+}
+/**
+ * A manifestation's issue date or size on each of its file links: one published value stays the
+ * scalar `key`; several go verbatim, in published order, to `{key}_values`, naming no file.
+ */
+function fileField<K extends 'issued' | 'size_bytes'>(
+  key: K,
+  published: string | [string, ...string[]] | undefined,
+) {
+  if (published === undefined || typeof published === 'string') return field(key, published);
+  return published.length === 1
+    ? field(key, published[0])
+    : field(`${key}_values` as const, published);
+}
 /** Source-language choice is based on expression IDs, preserving every matching manifestation. */
 export function documentLinks(raw: RawDocument, language: string, notices: string[]): Link[] {
   const expressions = raw.is_realized_by ?? [];
@@ -232,8 +321,8 @@ export function documentLinks(raw: RawDocument, language: string, notices: strin
           url: sourceUrl(url),
           language: selected,
           ...field('media_type', manifestation.media_type),
-          ...field('issued', manifestation.issued),
-          ...field('size_bytes', manifestation.byteSize),
+          ...fileField('issued', manifestation.issued),
+          ...fileField('size_bytes', manifestation.byteSize),
         })),
       ),
     );
@@ -253,46 +342,127 @@ export function normalizeDocumentSummary(raw: RawDocument) {
  * publishes no other, so a row without it has none), the date, and the procedures its family
  * relation names, as detail reads them.
  */
-export function normalizeAdoptedTextRow(raw: RawAdoptedTextRow, language: string) {
-  const title = raw.title_dcterms?.[language];
+export function normalizeAdoptedTextRow(
+  raw: RawAdoptedTextRow,
+  language: string,
+  notices: string[],
+) {
+  const summary = normalizeDocumentSummary(raw);
   return {
-    ...normalizeDocumentSummary(raw),
-    ...field('title', title === undefined ? undefined : { value: title, language }),
+    ...summary,
+    ...field('title', titleInLanguage(raw.title_dcterms, language)),
     ...field('date', raw.document_date),
-    procedure_ids: procedureIds(raw.inverse_created_a_realization_of),
+    procedure_ids: procedureIds(raw.inverse_created_a_realization_of, summary.document_id, notices),
   };
 }
 /**
- * Generic work detail preserves only explicitly published relations. `familyProcedureIds` come
- * from the family record and follow the generic record's own, without repeats.
+ * One capacity a member declared in: canonical person IDs from the participation and canonical
+ * procedure ID of the capacity's activity (another noun, or a malformed procedure noticed against
+ * `record`, gives none); role, organization, label and group verbatim, each only when published.
+ */
+function normalizeCapacity(raw: RawDeclarationParticipation, record: string, notices: string[]) {
+  const capacity = raw.inCapacityOf;
+  const [procedure_id] = procedureIds(capacity?.capacityActivity, record, notices);
+  return {
+    person_ids: canonicalIds(raw.had_participant_person, 'person'),
+    ...field('role', capacity?.capacityRole),
+    ...field('organization_id', capacity?.capacityOrganization),
+    ...field('procedure_id', procedure_id),
+    ...field('activity_label', capacity?.capacityActivityLabel),
+    ...field('political_group_id', capacity?.politicalGroup),
+  };
+}
+/** A declarant's capacity. */
+export type Capacity = ReturnType<typeof normalizeCapacity>;
+/** Relations a document publishes only on its family record, which document get reads. */
+export interface FamilyRelations {
+  capacities?: Capacity[];
+  previous_version_ids?: string[];
+  procedure_ids?: string[];
+  superseded_by_ids?: string[];
+}
+/**
+ * A declaration's capacities, one per participation, and its version links, canonical and in
+ * published order; each absent when the record publishes no such relation. `record` is the
+ * declaration's document ID, which a skipped procedure notice names.
+ */
+export function declarationRelations(
+  raw: RawDeclarationFamily | RawDeclarationRow,
+  record: string,
+  notices: string[],
+) {
+  const versions = (relation: typeof raw.previousVersion) =>
+    relation === undefined ? undefined : canonicalIds(relation, 'document');
+  return {
+    ...field(
+      'capacities',
+      raw.workHadParticipation &&
+        toArray(raw.workHadParticipation).map((participation) =>
+          normalizeCapacity(participation, record, notices),
+        ),
+    ),
+    ...field('previous_version_ids', versions(raw.previousVersion)),
+    ...field('superseded_by_ids', versions(raw.inverse_previousVersion)),
+  } satisfies FamilyRelations;
+}
+/**
+ * MEP declaration search row: the adopted-text row's identity, title (requested language only),
+ * date and procedures (from `refers_to`), plus what was declared and the declaration's relations.
+ */
+export function normalizeDeclarationRow(
+  raw: RawDeclarationRow,
+  language: string,
+  notices: string[],
+) {
+  const summary = normalizeDocumentSummary(raw);
+  return {
+    ...summary,
+    ...field('title', titleInLanguage(raw.title_dcterms, language)),
+    ...field('date', raw.document_date),
+    procedure_ids: procedureIds(raw.refers_to, summary.document_id, notices),
+    ...field('awareness_of_conflict', raw.awarenessOfConflict),
+    ...field('conflict_description', raw.conflictDescription),
+    ...declarationRelations(raw, summary.document_id, notices),
+  };
+}
+/**
+ * Generic work detail preserves only explicitly published relations. Family procedures follow the
+ * generic record's own, without repeats; a declaration adds what it declares from the generic
+ * record and its capacities and version links from the family record.
  */
 export function normalizeDocument(
   raw: RawDocument,
   language: string,
   notices: string[],
-  familyProcedureIds: string[] = [],
+  family: FamilyRelations = {},
 ) {
-  const expressionTitles: Record<string, string> = Object.create(null);
+  const expressionTitles: MultiValuedLocalized = Object.create(null);
   for (const expression of raw.is_realized_by ?? [])
     Object.assign(expressionTitles, expression.title);
   const maps = raw.title_dcterms ?? expressionTitles;
+  const summary = normalizeDocumentSummary(raw);
   return {
-    ...normalizeDocumentSummary(raw),
-    ...field('title', localized(maps, language, notices)),
+    ...summary,
+    ...field('title', localizedTitle(maps, language, notices)),
     ...field('date', raw.document_date),
     ...field('term_id', raw.parliamentary_term),
     creator_ids: references(raw.creator),
     procedure_ids: [
       ...new Set([
-        ...procedureIds(raw.refers_to),
-        ...procedureIds(raw.is_about),
-        ...familyProcedureIds,
+        ...procedureIds(raw.refers_to, summary.document_id, notices),
+        ...procedureIds(raw.is_about, summary.document_id, notices),
+        ...(family.procedure_ids ?? []),
       ]),
     ],
     parent_document_ids: canonicalIds(raw.is_part_of, 'document'),
     adopted_document_ids: canonicalIds(raw.adopts, 'document'),
     based_on_document_ids: canonicalIds(raw.based_on, 'document'),
     ...field('public_register_ref', raw.notation_publicRegister),
+    ...field('awareness_of_conflict', raw.awarenessOfConflict),
+    ...field('conflict_description', raw.conflictDescription),
+    ...field('capacities', family.capacities),
+    ...field('previous_version_ids', family.previous_version_ids),
+    ...field('superseded_by_ids', family.superseded_by_ids),
     links: documentLinks(raw, language, notices),
   };
 }
@@ -344,13 +514,13 @@ const addresseeRole = 'def/ep-roles/ADDRESSEE';
  */
 export function normalizeQuestion(raw: RawQuestion, language: string, notices: string[]) {
   const document = normalizeDocument(raw, language, notices);
-  const alternativeTitles: Record<string, string> = Object.create(null);
+  const alternativeTitles: MultiValuedLocalized = Object.create(null);
   for (const expression of raw.is_realized_by ?? [])
     Object.assign(alternativeTitles, expression.title_alternative);
   return {
     question_id: document.document_id,
     ...field('title', document.title),
-    ...field('alternative_title', localized(alternativeTitles, language, notices)),
+    ...field('alternative_title', localizedTitle(alternativeTitles, language, notices)),
     ...field('date', document.date),
     ...field('work_type', document.work_type),
     ...field('term_id', document.term_id),
@@ -788,6 +958,66 @@ export function decisionVoters(raw: RawDecision, position: VoterPosition): strin
     unnamedVoter(id) ? [] : [canonicalId(id, 'person')],
   );
 }
+/** The positions a breakdown tallies; intended corrections stay out. */
+const recordedPositions = ['favor', 'against', 'abstention'] as const;
+type RecordedPosition = (typeof recordedPositions)[number];
+type Tally = Record<RecordedPosition, number>;
+/** Named voters of each recorded position. */
+export type RecordedVoters = Record<RecordedPosition, string[]>;
+/** Named recorded voters, or undefined unless all three recorded arrays are published. */
+export function recordedVoters(raw: RawDecision): RecordedVoters | undefined {
+  const [favor, against, abstention] = recordedPositions.map((position) =>
+    decisionVoters(raw, position),
+  );
+  return favor && against && abstention ? { favor, against, abstention } : undefined;
+}
+/** One row per roster value, by voters descending, then value; the row without a value last. */
+function tallyRows<K extends string>(key: K, tallies: Map<string | undefined, Tally>) {
+  const voters = (tally: Tally) => tally.favor + tally.against + tally.abstention;
+  return [...tallies]
+    .sort(
+      ([a, x], [b, y]) =>
+        Number(a === undefined) - Number(b === undefined) ||
+        voters(y) - voters(x) ||
+        compareText(a ?? '', b ?? ''),
+    )
+    .map(([value, tally]) => ({ ...field(key, value), ...tally }));
+}
+/**
+ * Recorded voters tallied by the group and the country their roster row publishes. Voters the
+ * roster lacks are counted in no row and listed once, in first-recorded order.
+ */
+export function voterBreakdown(voters: RecordedVoters, roster: readonly RawMep[]) {
+  const members = new Map(
+    roster.map((row) => [canonicalId(row.identifier ?? row.id, 'person'), row]),
+  );
+  const groups = new Map<string | undefined, Tally>();
+  const countries = new Map<string | undefined, Tally>();
+  const count = (
+    tallies: Map<string | undefined, Tally>,
+    value: string | undefined,
+    position: RecordedPosition,
+  ) => {
+    const tally = tallies.get(value) ?? { favor: 0, against: 0, abstention: 0 };
+    tally[position]++;
+    tallies.set(value, tally);
+  };
+  const unmatched = new Set<string>();
+  for (const position of recordedPositions)
+    for (const id of voters[position]) {
+      const row = members.get(id);
+      if (row === undefined) unmatched.add(id);
+      else {
+        count(groups, row['api:political-group'], position);
+        count(countries, row['api:country-of-representation'], position);
+      }
+    }
+  return {
+    political_groups: tallyRows('political_group', groups),
+    countries: tallyRows('country', countries),
+    unmatched_mep_ids: [...unmatched],
+  };
+}
 /** Compact whole-decision catalogue row. */
 export function normalizeDecisionSummary(
   raw: RawDecision,
@@ -846,11 +1076,12 @@ export function normalizeDecision(
  * never 0, where the item publishes none (sittings before 2024).
  */
 export function normalizeVoteItem(raw: RawVoteItem, language: string, notices: string[]) {
+  const vote_item_id = activityId(raw);
   return {
-    vote_item_id: activityId(raw),
+    vote_item_id,
     ...field('label', localized(raw.activity_label, language, notices)),
     document_ids: canonicalIds(raw.based_on_a_realization_of, 'document'),
-    procedure_ids: procedureIds(raw.inverse_consists_of),
+    procedure_ids: procedureIds(raw.inverse_consists_of, vote_item_id, notices),
     recording_document_ids: canonicalIds(raw.recorded_in_a_realization_of, 'document'),
     ...field(
       'decision_count',
@@ -868,9 +1099,35 @@ export function listedVoteItems(raw: RawVoteItem, sittingId: string): string[] {
       : [],
   );
 }
+/**
+ * One sitting agenda item. `start_time` is the start of the time slot listing the item, absent
+ * when no slot lists it; procedures are the `eli/dl/proc/` entries of `inverse_was_scheduled_in`.
+ */
+export function normalizeAgendaItem(
+  raw: RawAgendaRecord,
+  startTime: string | undefined,
+  language: string,
+  notices: string[],
+) {
+  const agenda_item_id = activityId(raw);
+  return {
+    agenda_item_id,
+    ...field('activity_type', raw.had_activity_type),
+    ...field('label', localized(raw.activity_label, language, notices)),
+    ...field('heading', localized(raw.headingLabel, language, notices)),
+    ...field('order', raw.activity_order),
+    ...field('start_time', startTime),
+    procedure_ids: procedureIds(raw.inverse_was_scheduled_in, agenda_item_id, notices),
+    document_ids: canonicalIds(raw.based_on_a_realization_of, 'document'),
+    source_url: sourceUrl(raw.id),
+  };
+}
+/** Public URIs of the agenda items a `MEETING_PART` time slot lists. */
+export function slotAgendaItems(raw: RawAgendaRecord): string[] {
+  return references(raw.consists_of).map(sourceUrl);
+}
 function memberPositions(raw: RawDecision, memberId: string, intended: boolean) {
-  const positions = ['favor', 'against', 'abstention'] as const;
-  const published = positions.map((position) => ({
+  const published = recordedPositions.map((position) => ({
     position,
     voters: decisionVoters(raw, intended ? `intended_${position}` : position),
   }));
@@ -898,7 +1155,7 @@ export function normalizeName(value: string): string {
     .replace(/\p{M}/gu, '')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ');
 }
-/** Results Parliament exposes to one speech, adopted-text or unfiltered procedure search. */
+/** Results Parliament exposes to one speech, adopted-text, MEP declaration or unfiltered procedure search. */
 export const searchResultWindow = 10_000;
 /**
  * Acquisition bounds; MAX_SAFE_INTEGER is only the representable local page position bound.
@@ -922,7 +1179,11 @@ export const pageCaps = {
     noun: 'keyword adopted texts',
     strictMaximum: searchResultWindow,
   },
-  speeches: { maximum: 10_000, noun: 'speeches' },
+  // Each call reads aligned 100-row pages; strict mode keeps the search window as its bound.
+  declarations: { maximum: 100, noun: 'MEP declarations', strictMaximum: searchResultWindow },
+  // Five aligned 100-row requests, like one 1000-row keyword read, fit 60% of the operation
+  // deadline at a slow page time (docs/design.md); strict mode still accepts the search window.
+  speeches: { maximum: 400, noun: 'speeches', strictMaximum: searchResultWindow },
   keyword_speeches: { maximum: 1000, noun: 'keyword speeches' },
   text_speeches: { maximum: 100, noun: 'speeches with text' },
   meps: { maximum: Number.MAX_SAFE_INTEGER, noun: 'MEPs' },
@@ -932,6 +1193,7 @@ export const pageCaps = {
   sittings: { maximum: 1000, noun: 'sittings' },
   decisions: { maximum: Number.MAX_SAFE_INTEGER, noun: 'decisions' },
   vote_items: { maximum: Number.MAX_SAFE_INTEGER, noun: 'vote items' },
+  agenda_items: { maximum: Number.MAX_SAFE_INTEGER, noun: 'agenda items' },
   reference: { maximum: 1000, noun: 'reference entries' },
   static_reference: { maximum: Number.MAX_SAFE_INTEGER, noun: 'static reference entries' },
   organizations: { maximum: 20, noun: 'organization lookups' },

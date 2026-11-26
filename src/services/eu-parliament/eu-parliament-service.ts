@@ -24,7 +24,9 @@ import {
   compareText,
   type DecisionSummary,
   decisionVoters,
+  declarationRelations,
   documentInputIds,
+  type FamilyRelations,
   field,
   type IdInput,
   type LocalizedText,
@@ -32,8 +34,10 @@ import {
   localized,
   localPage,
   normalizeAdoptedTextRow,
+  normalizeAgendaItem,
   normalizeDecision,
   normalizeDecisionSummary,
+  normalizeDeclarationRow,
   normalizeDocument,
   normalizeDocumentSummary,
   normalizeMep,
@@ -49,11 +53,15 @@ import {
   pageCaps,
   pageWindow,
   procedureIds,
+  type RecordedVoters,
+  recordedVoters,
   searchResultWindow,
+  slotAgendaItems,
   sourceUrl,
   unnamedVotersNotice,
   upstreamPage,
   type VoterPosition,
+  voterBreakdown,
 } from './eu-parliament-normalization.js';
 import {
   documentFamily,
@@ -68,14 +76,17 @@ import {
 } from './eu-parliament-reference.js';
 import {
   adoptedTextRowSchema,
+  agendaRecordSchema,
   bodySchema,
   decisionSchema,
+  declarationFamilySchema,
+  declarationRowSchema,
   documentFamilySchema,
   documentSchema,
   mepSchema,
   procedureSchema,
   questionSchema,
-  type RawAdoptedTextRow,
+  type RawAgendaRecord,
   type RawBody,
   type RawDocument,
   type RawMep,
@@ -117,12 +128,15 @@ export interface ProcedureInput extends Paging {
 }
 /** Document family search or canonical detail. */
 export interface DocumentsInput extends Paging {
+  /** A declared awareness of a conflict of interest; `false` selects declarations of none. */
+  awareness_of_conflict?: boolean;
   document_id?: string;
   mode?: 'search' | 'get';
+  person_id?: string;
   related_process_id?: string;
   sitting_date?: string;
   sitting_date_end?: string;
-  source?: 'adopted_texts' | 'committee' | 'plenary';
+  source?: 'adopted_texts' | 'committee' | 'plenary' | 'mep_declarations';
   term?: number;
   text?: string;
   title?: string;
@@ -167,11 +181,13 @@ export interface MepInput extends Paging {
 export const personIdPattern = /^(?:https:\/\/data\.europarl\.europa\.eu\/person\/|person\/)?\d+$/;
 /** Sitting discovery, compact decisions, rich decision or one voter position. */
 export interface VotesInput extends Paging {
+  /** Decision mode only: tally the recorded voters by the sitting date's roster. */
+  breakdown?: boolean;
   decision_id?: string;
   document_id?: string;
   label_contains?: string;
   mep_id?: string;
-  mode?: 'sittings' | 'vote_items' | 'decisions' | 'decision' | 'voters';
+  mode?: 'sittings' | 'agenda_items' | 'vote_items' | 'decisions' | 'decision' | 'voters';
   position?: VoterPosition;
   resolve_names?: boolean;
   roster_term?: number;
@@ -367,12 +383,13 @@ function searchWindow(paging: PageWindow, hint: string): void {
       hint,
     );
 }
+/** `narrowing` names the filters at an exhausted window, unless another notice of the call does. */
 function searchPage(
   returned: number,
   input: PageWindow,
   total: number | undefined,
   notices: string[],
-  narrowing: string,
+  narrowing?: string,
 ) {
   const page = upstreamPage(returned, input, total, searchResultWindow);
   if (total !== undefined && total >= searchResultWindow)
@@ -381,7 +398,7 @@ function searchPage(
     );
   if (page.has_more && page.next_offset === undefined)
     notices.push(
-      `The 10000-result search window is exhausted; further matches cannot be ruled out. ${narrowing}`,
+      `The 10000-result search window is exhausted; further matches cannot be ruled out.${narrowing === undefined ? '' : ` ${narrowing}`}`,
     );
   return { page, total: total !== undefined && total < searchResultWindow ? total : undefined };
 }
@@ -398,7 +415,79 @@ const documentEndpoints = {
   adopted_texts: 'adopted-texts',
   committee: 'committee-documents',
   plenary: 'plenary-documents',
+  mep_declarations: 'meps-declarations',
 } as const;
+type DocumentSource = keyof typeof documentEndpoints;
+const adoptedTextsOnly = ['adopted_texts'] as const;
+const adoptedTextsAndDeclarations = ['adopted_texts', 'mep_declarations'] as const;
+const declarationsOnly = ['mep_declarations'] as const;
+/**
+ * Search filters only some sources accept, each with those sources (filters sharing a list share
+ * one rejection clause); committee year and plenary term keep their own rejections. Declarations
+ * take title, not text: Parliament's declaration text search misses most of the declarations its
+ * title search finds.
+ */
+const sourceFilters = {
+  text: adoptedTextsOnly,
+  title: adoptedTextsAndDeclarations,
+  sitting_date: adoptedTextsOnly,
+  sitting_date_end: adoptedTextsOnly,
+  related_process_id: adoptedTextsAndDeclarations,
+  person_id: declarationsOnly,
+  awareness_of_conflict: declarationsOnly,
+} as const satisfies Partial<Record<keyof DocumentsInput, readonly DocumentSource[]>>;
+/**
+ * Rejects the filters `source` does not accept, naming each with the sources that take it, grouped
+ * by those sources in input order; the hint routes each to one. `awareness_of_conflict: false` is
+ * a filter value, which `meaningful` reads as unset.
+ */
+function rejectMisplacedFilters(input: DocumentsInput, source: DocumentSource): void {
+  const misplaced = (Object.keys(sourceFilters) as (keyof typeof sourceFilters)[]).filter(
+    (key) =>
+      (key === 'awareness_of_conflict' ? input[key] !== undefined : meaningful(input[key])) &&
+      !(sourceFilters[key] as readonly DocumentSource[]).includes(source),
+  );
+  if (!misplaced.length) return;
+  const groups = [...new Set(misplaced.map((key) => sourceFilters[key]))].map((sources) => ({
+    sources,
+    keys: misplaced.filter((key) => sourceFilters[key] === sources),
+  }));
+  const accepted = groups.map(
+    ({ sources, keys }) =>
+      `${listed(keys)} ${keys.length === 1 ? 'is' : 'are'} accepted only with ${sources.length === 1 ? 'source' : 'sources'} ${listed(sources.map((name) => JSON.stringify(name)))}`,
+  );
+  const routes = [
+    ...(misplaced.some((key) => sourceFilters[key] !== declarationsOnly)
+      ? [
+          'Use source adopted_texts for text, title, sitting_date, sitting_date_end or related_process_id, or remove those filters.',
+        ]
+      : []),
+    ...(misplaced.some((key) => sourceFilters[key] === declarationsOnly)
+      ? [
+          'Use source mep_declarations for person_id or awareness_of_conflict, or remove those filters.',
+        ]
+      : []),
+  ];
+  invalidFilter(
+    `${accepted.join('; ')}, not with source ${JSON.stringify(source)}.`,
+    source === 'mep_declarations'
+      ? `Remove ${listed(misplaced)} for source mep_declarations and narrow by year, or by title, which matches the member, capacity, committee and procedure a declaration title names; text and sitting dates search source adopted_texts.`
+      : routes.join(' '),
+  );
+}
+/** Counts rows without a title in `language`, the only language the `list` list view returns. */
+function untitledNotice(
+  items: { title?: unknown }[],
+  language: string,
+  list: 'adopted-text' | 'declaration',
+  notices: string[],
+): void {
+  const untitled = items.filter((item) => item.title === undefined).length;
+  if (untitled)
+    notices.push(
+      `${plural(untitled, 'row')} on this page ${untitled === 1 ? 'has' : 'have'} no title in ${language}, the only language the ${list} list returns; mode get with a row's document_id reads its title in another published language.`,
+    );
+}
 /** Sparse catalogue row; titles, stages and participants need a procedure lookup. */
 function procedureRow(raw: RawProcedure) {
   return {
@@ -508,6 +597,52 @@ function sittingVoteItems(
     );
   return items.map((raw) => normalizeVoteItem(raw, language, notices));
 }
+/**
+ * A sitting's agenda items without the `MEETING_PART` time slots that list them. Records arrive
+ * slots first, then items in ID string order (D-8 before D-76), so rows sort by numeric
+ * `activity_order`, items without one last, then by ID. A slot listing an item the read omits
+ * makes the read incomplete.
+ */
+function sittingAgendaItems(raws: RawAgendaRecord[], language: string, notices: string[]) {
+  const isSlot = (raw: RawAgendaRecord) =>
+    raw.had_activity_type?.split('/').at(-1) === 'MEETING_PART';
+  const slots = raws.filter(isSlot);
+  const items = raws.filter((raw) => !isSlot(raw));
+  const returned = new Set(items.map((raw) => sourceUrl(raw.id)));
+  const listed = new Set(slots.flatMap(slotAgendaItems));
+  const present = [...listed].filter((id) => returned.has(id)).length;
+  if (present < listed.size)
+    stalled(
+      `Parliament returned ${present} of the ${listed.size} agenda items this sitting's time slots list. Retry later.`,
+    );
+  // An item two slots list starts with the earlier one, whatever order the slots arrive in.
+  const starts = new Map<string, string>();
+  for (const slot of slots) {
+    const start = slot.activity_start_date;
+    if (start === undefined) continue;
+    for (const id of slotAgendaItems(slot)) {
+      const known = starts.get(id);
+      if (known === undefined || start < known) starts.set(id, start);
+    }
+  }
+  const position = (raw: RawAgendaRecord) => {
+    const order = Number(raw.activity_order);
+    return Number.isNaN(order) ? Number.POSITIVE_INFINITY : order;
+  };
+  return items
+    .toSorted((a, b) => position(a) - position(b) || compareText(activityId(a), activityId(b)))
+    .map((raw) => normalizeAgendaItem(raw, starts.get(sourceUrl(raw.id)), language, notices));
+}
+
+/** Rows per aligned upstream page; every aligned search reads this geometry whatever the caller's limit. */
+const alignedPageSize = 100;
+/** Orders document-family rows by canonical document ID, the order of each aligned page. */
+function byDocumentId(a: { id: string; identifier?: string | undefined }, b: typeof a) {
+  return compareText(
+    canonicalId(a.identifier ?? a.id, 'document'),
+    canonicalId(b.identifier ?? b.id, 'document'),
+  );
+}
 
 /** Public GET workflow service; one client instance shares pacing across operations. */
 export class EuParliamentService {
@@ -529,7 +664,7 @@ export class EuParliamentService {
     paging: PageWindow,
     { compare }: { compare?: (a: T, b: T) => number } = {},
   ): Promise<Envelope<T>> {
-    const size = 100;
+    const size = alignedPageSize;
     const data: T[] = [];
     let total: number | undefined;
     for (
@@ -844,26 +979,32 @@ export class EuParliamentService {
         ? keywords
           ? 'keyword_documents'
           : 'adopted_documents'
-        : 'documents';
-    const paging = scopePage(
-      input,
-      collection,
-      source === 'adopted_texts' ? searchResultWindow : undefined,
-    );
+        : source === 'mep_declarations'
+          ? 'declarations'
+          : 'documents';
+    // Parliament's search window bounds adopted texts and declarations; the family lists page deep.
+    const windowed = source === 'adopted_texts' || source === 'mep_declarations';
+    const paging = scopePage(input, collection, windowed ? searchResultWindow : undefined);
     const notices = noticesFor(input, paging, collection);
     const mode = input.mode ?? 'search';
     if (mode === 'get') {
-      forbid(input, [
-        'source',
-        'text',
-        'title',
-        'year',
-        'term',
-        'work_type',
-        'sitting_date',
-        'sitting_date_end',
-        'related_process_id',
-      ]);
+      forbid(
+        // false is an awareness_of_conflict value, which forbid would read as unset.
+        { ...input, awareness_of_conflict: input.awareness_of_conflict !== undefined },
+        [
+          'source',
+          'text',
+          'title',
+          'year',
+          'term',
+          'work_type',
+          'sitting_date',
+          'sitting_date_end',
+          'related_process_id',
+          'person_id',
+          'awareness_of_conflict',
+        ],
+      );
       detailPaging(input);
       const candidates = documentInputIds(required(input.document_id, 'document_id'));
       let [document_id] = candidates;
@@ -889,14 +1030,14 @@ export class EuParliamentService {
             ? `No document detail was published as ${candidates.join(' or ')}. Call euparl_search_documents in search mode to discover identifiers.`
             : 'No document detail was published. Call euparl_search_documents in search mode to discover identifiers.',
         );
-      const familyIds = raw ? await this.familyProcedureIds(raw, operation, notices) : [];
+      const family = raw ? await this.familyRelations(raw, operation, notices) : {};
       return result(
         {
           mode,
           found: !!raw,
           ...field(
             'document',
-            raw ? normalizeDocument(raw, paging.language, notices, familyIds) : undefined,
+            raw ? normalizeDocument(raw, paging.language, notices, family) : undefined,
           ),
         },
         { mode, document_id, language: paging.language },
@@ -905,16 +1046,16 @@ export class EuParliamentService {
     }
     forbid(input, ['document_id', 'snapshot']);
     const narrowing =
-      'Narrow text, title, year, term, work_type, sitting dates or related_process_id.';
-    if (source === 'adopted_texts') searchWindow(paging, `${narrowing} ${restartAfterNarrowing}`);
+      source === 'mep_declarations'
+        ? 'Narrow person_id, related_process_id, title, year, term, awareness_of_conflict or work_type.'
+        : 'Narrow text, title, year, term, work_type, sitting dates or related_process_id.';
+    if (windowed) searchWindow(paging, `${narrowing} ${restartAfterNarrowing}`);
     dates(input);
-    const adoptedOnly = (
-      ['text', 'title', 'sitting_date', 'sitting_date_end', 'related_process_id'] as const
-    ).filter((key) => meaningful(input[key]));
-    if (source !== 'adopted_texts' && adoptedOnly.length)
+    rejectMisplacedFilters(input, source);
+    if (source === 'mep_declarations' && input.term !== undefined && meaningful(input.person_id))
       invalidFilter(
-        `${listed(adoptedOnly)} ${adoptedOnly.length === 1 ? 'is' : 'are'} accepted only with source "adopted_texts", not with source ${JSON.stringify(source)}.`,
-        'Use source adopted_texts for text, title, sitting_date, sitting_date_end or related_process_id, or remove those filters.',
+        'term and person_id cannot be combined with source "mep_declarations": Parliament matches no declaration for a member within a parliamentary term. Each is accepted without the other.',
+        "Remove term and narrow the member's declarations by year, or remove person_id to list the term's declarations.",
       );
     if (source === 'committee' && input.year !== undefined)
       invalidFilter(
@@ -930,6 +1071,9 @@ export class EuParliamentService {
     const related_process_id = input.related_process_id
       ? canonicalId(input.related_process_id, 'procedure', procedureInput('related_process_id'))
       : undefined;
+    const person_id = input.person_id
+      ? canonicalId(input.person_id, 'person', personInput('person_id'))
+      : undefined;
     const filters = {
       source,
       language: paging.language,
@@ -941,6 +1085,8 @@ export class EuParliamentService {
       ...field('sitting_date', input.sitting_date),
       ...field('sitting_date_end', input.sitting_date_end),
       ...field('related_process_id', related_process_id),
+      ...field('person_id', person_id),
+      ...field('awareness_of_conflict', input.awareness_of_conflict),
     };
     const query = {
       offset: paging.offset,
@@ -957,6 +1103,19 @@ export class EuParliamentService {
         'related-process-id': related_process_id,
         language: paging.language,
       }),
+      ...(source === 'mep_declarations' && {
+        title: input.title,
+        'search-language': meaningful(input.title) ? paging.language : undefined,
+        'related-process-id': related_process_id,
+        'person-id': person_id,
+        'filter-output':
+          input.awareness_of_conflict === undefined
+            ? undefined
+            : input.awareness_of_conflict
+              ? 'awareness-of-conflict'
+              : 'no-awareness-of-conflict',
+        language: paging.language,
+      }),
     };
     if (source === 'adopted_texts' && keywords)
       notices.push(
@@ -965,24 +1124,38 @@ export class EuParliamentService {
     const { items, total } =
       source === 'adopted_texts'
         ? await this.adoptedTextRows(query, keywords, paging, operation, notices)
-        : await this.client
-            .get(documentEndpoints[source], query, documentSchema, operation)
-            .then((response) => ({
-              items: response.data.map(normalizeDocumentSummary),
-              total: response.total,
-            }));
+        : source === 'mep_declarations'
+          ? await this.declarationRows(query, paging, operation, notices)
+          : await this.client
+              .get(documentEndpoints[source], query, documentSchema, operation)
+              .then((response) => ({
+                items: response.data.map(normalizeDocumentSummary),
+                total: response.total,
+              }));
     if (!items.length)
       notices.push(
-        emptyNotice(
-          paging.offset,
-          'documents',
-          'No documents matched. Remove a named filter, or call euparl_list_reference with topic document_types; keyword search is available only for adopted_texts.',
-        ),
+        source === 'mep_declarations'
+          ? emptyNotice(
+              paging.offset,
+              'declarations',
+              'No MEP declarations matched. Remove a named filter, or select by person_id or related_process_id; title matches the member name, capacity, committee and procedure a declaration title carries.',
+            )
+          : emptyNotice(
+              paging.offset,
+              'documents',
+              'No documents matched. Remove a named filter, or call euparl_list_reference with topic document_types; keyword search is available only for adopted_texts.',
+            ),
       );
-    const paged =
-      source === 'adopted_texts'
-        ? searchPage(items.length, paging, total, notices, narrowing)
-        : { page: upstreamPage(items.length, paging, total), total };
+    // A declaration page at the window edge matches over 100, so its repeat-and-omit notice names the filters.
+    const paged = windowed
+      ? searchPage(
+          items.length,
+          paging,
+          total,
+          notices,
+          source === 'mep_declarations' ? undefined : narrowing,
+        )
+      : { page: upstreamPage(items.length, paging, total), total };
     return result({ mode, source, items, page: paged.page }, filters, notices, paged.total);
   }
 
@@ -999,8 +1172,6 @@ export class EuParliamentService {
     notices: string[],
   ) {
     const path = documentEndpoints.adopted_texts;
-    const documentId = (raw: RawAdoptedTextRow) =>
-      canonicalId(raw.identifier ?? raw.id, 'document');
     const response = keywords
       ? await this.client.get(path, query, adoptedTextRowSchema, operation)
       : await this.alignedSearch(
@@ -1009,51 +1180,116 @@ export class EuParliamentService {
           adoptedTextRowSchema,
           operation,
           paging,
-          { compare: (a, b) => compareText(documentId(a), documentId(b)) },
+          { compare: byDocumentId },
         );
-    const items = response.data.map((raw) => normalizeAdoptedTextRow(raw, paging.language));
-    const untitled = items.filter((item) => item.title === undefined).length;
-    if (untitled)
+    const items = response.data.map((raw) =>
+      normalizeAdoptedTextRow(raw, paging.language, notices),
+    );
+    untitledNotice(items, paging.language, 'adopted-text', notices);
+    return { items, total: response.total };
+  }
+
+  /**
+   * MEP declaration rows in the requested language. Parliament ignores sort-by and orders a set of
+   * more than 100 differently with each request geometry, so every call reads aligned 100-row pages
+   * sorted by document_id: a set of 100 or fewer arrives whole in one request, and a larger one is
+   * disclosed as able to repeat and omit declarations across pages.
+   */
+  private async declarationRows(
+    query: Record<string, string | number | undefined>,
+    paging: PageWindow & { language: string },
+    operation: Operation,
+    notices: string[],
+  ) {
+    const response = await this.alignedSearch(
+      documentEndpoints.mep_declarations,
+      query,
+      declarationRowSchema,
+      operation,
+      paging,
+      { compare: byDocumentId },
+    );
+    const items = response.data.map((raw) =>
+      normalizeDeclarationRow(raw, paging.language, notices),
+    );
+    untitledNotice(items, paging.language, 'declaration', notices);
+    // An unknown total counts only behind a full aligned page: a 204 past the end carries none.
+    if (response.total === undefined ? items.length > 0 : response.total > alignedPageSize)
       notices.push(
-        `${plural(untitled, 'row')} on this page ${untitled === 1 ? 'has' : 'have'} no title in ${paging.language}, the only language the adopted-text list returns; mode get with a row's document_id reads its title in another published language.`,
+        'More than 100 MEP declarations match, and Parliament keeps no single order for such a set across its 100-row pages, so pages can repeat some declarations and omit others. Narrow person_id, related_process_id, title, year, term, awareness_of_conflict or work_type to 100 or fewer, which arrive whole in one request.',
       );
     return { items, total: response.total };
   }
 
   /**
-   * Procedures of an adopted text, plenary or committee document, published only on its family
-   * record: one attempt inside the get's deadline, with `language=mul` so no expression is
-   * embedded. 204/404 means the family publishes no record. Any other classified failure leaves
-   * the generic answer standing with a notice; caller cancellation and unclassified throws
-   * propagate.
+   * Relations a document publishes only on its family record: the procedures of an adopted text,
+   * plenary or committee document (read with `language=mul`, so no expression is embedded), and
+   * the capacities and version links of an MEP declaration (its route takes no query). Any other
+   * work type reads no family record. A missing family record leaves the generic answer, except a
+   * declaration's: every declaration publishes one, so its absence is a failed read. A failed read
+   * leaves the generic answer with a notice.
    */
-  private async familyProcedureIds(
+  private async familyRelations(
     raw: RawDocument,
     operation: Operation,
     notices: string[],
-  ): Promise<string[]> {
+  ): Promise<FamilyRelations> {
     const family = documentFamily(raw.work_type);
-    if (!family) return [];
-    const document_id = canonicalId(raw.identifier ?? raw.id, 'document');
+    if (!family) return {};
+    const documentId = canonicalId(raw.identifier ?? raw.id, 'document');
+    const path = `${documentEndpoints[family]}/${documentId}`;
+    const declaration = family === 'mep_declarations';
+    const relations = declaration
+      ? await this.familyRead(path, {}, declarationFamilySchema, raw, operation, (record) =>
+          declarationRelations(record, documentId, notices),
+        )
+      : await this.familyRead(
+          path,
+          { language: 'mul' },
+          documentFamilySchema,
+          raw,
+          operation,
+          (record) => ({
+            procedure_ids: procedureIds(
+              record.inverse_created_a_realization_of,
+              documentId,
+              notices,
+            ),
+          }),
+        );
+    if (relations === null && !declaration) return {};
+    if (relations) return relations;
+    notices.push(
+      declaration
+        ? "The declarant's capacities and version links could not be read from the mep_declarations family record of this document, so capacities, previous_version_ids and superseded_by_ids are absent; repeat the same get to retry."
+        : `The procedure relation could not be read from the ${family} family record of this document, so procedure_ids may be incomplete; repeat the same get to retry.`,
+    );
+    return {};
+  }
+
+  /**
+   * One attempt at the family record of `raw` inside the get's deadline, mapped by `read` inside
+   * the attempt so a malformed relation degrades like any other classified failure. 204/404 gives
+   * null: the family publishes no record. Any other classified failure, or a record of another
+   * identity, gives undefined. Caller cancellation and unclassified throws propagate.
+   */
+  private async familyRead<T extends { id: string }>(
+    path: string,
+    query: Record<string, string>,
+    schema: z.ZodType<T>,
+    raw: RawDocument,
+    operation: Operation,
+    read: (record: T) => FamilyRelations,
+  ): Promise<FamilyRelations | null | undefined> {
     try {
-      const response = await this.client.get(
-        `${documentEndpoints[family]}/${document_id}`,
-        { language: 'mul' },
-        documentFamilySchema,
-        operation,
-        { attempts: 1 },
-      );
-      if (response.status !== 'ok') return [];
+      const response = await this.client.get(path, query, schema, operation, { attempts: 1 });
+      if (response.status !== 'ok') return null;
       const [record] = response.data;
-      if (response.data.length === 1 && record?.id === raw.id)
-        return procedureIds(record.inverse_created_a_realization_of);
+      if (response.data.length === 1 && record?.id === raw.id) return read(record);
     } catch (error) {
       if (operation.callerSignal.aborted || !(error instanceof McpError)) throw error;
     }
-    notices.push(
-      `The procedure relation could not be read from the ${family} family record of this document, so procedure_ids may be incomplete; repeat the same get to retry.`,
-    );
-    return [];
+    return undefined;
   }
 
   /**
@@ -1232,6 +1468,55 @@ export class EuParliamentService {
       if (response.next === undefined && total === undefined && response.data.length < 50) break;
     }
     return all;
+  }
+
+  /**
+   * A decision's recorded voters tallied by the group and country the `mandate_date` roster
+   * publishes, read only when all three recorded arrays are published and at least one names a
+   * person. Unlike `resolve_names`, whose names are the page, the roster read is best-effort: the
+   * decision is the payload, so any classified failure, the operation deadline included, returns
+   * it without breakdown and with a notice. An empty roster (204/404) is such a failure: a sitting
+   * with recorded voters has members, and tallying against none would list every voter as
+   * unmatched. Caller cancellation and unclassified throws propagate.
+   */
+  private async decisionBreakdown(
+    voters: RecordedVoters | undefined,
+    mandate_date: string,
+    operation: Operation,
+    notices: string[],
+  ) {
+    if (voters === undefined) {
+      notices.push(
+        'breakdown is omitted: this decision does not publish all three recorded voter arrays (favor, against and abstention), as on hand votes, so no roster was read.',
+      );
+      return;
+    }
+    if (!voters.favor.length && !voters.against.length && !voters.abstention.length) {
+      notices.push(
+        'breakdown is omitted: the recorded voter arrays of this decision name no person, so no roster was read.',
+      );
+      return;
+    }
+    try {
+      const roster = await this.roster({ 'mandate-date': mandate_date }, true, operation);
+      if (roster.length) {
+        const breakdown = { mandate_date, ...voterBreakdown(voters, roster) };
+        const unmatched = breakdown.unmatched_mep_ids.length;
+        if (unmatched) {
+          const them = unmatched === 1 ? 'it' : 'them';
+          notices.push(
+            `${plural(unmatched, 'recorded voter')} ${unmatched === 1 ? 'is' : 'are'} not on the ${mandate_date} roster, so no political_groups or countries row counts ${them}; unmatched_mep_ids lists ${them}. euparl_get_mep reads any member by ID.`,
+          );
+        }
+        return breakdown;
+      }
+    } catch (error) {
+      if (operation.callerSignal.aborted || !(error instanceof McpError)) throw error;
+    }
+    notices.push(
+      `breakdown is omitted: the ${mandate_date} roster could not be read, so the decision is returned without it. Repeat the same call to retry the breakdown.`,
+    );
+    return;
   }
 
   private utcToday(): string {
@@ -1513,14 +1798,16 @@ export class EuParliamentService {
   }
 
   /**
-   * Sitting vote items or decisions are fetched whole, then vote items, compact records or voter
-   * positions are paged.
+   * Sitting agenda items, vote items or decisions are fetched whole, then agenda items, vote
+   * items, compact records or voter positions are paged.
    */
   async getPlenaryVotes(input: VotesInput, ctx: ServiceContext) {
     const operation = this.client.operation(ctx.signal);
     const mode = input.mode ?? 'decisions';
     const collection =
-      mode === 'sittings' || mode === 'vote_items' || mode === 'voters' ? mode : 'decisions';
+      mode === 'sittings' || mode === 'agenda_items' || mode === 'vote_items' || mode === 'voters'
+        ? mode
+        : 'decisions';
     const paging = scopePage(input, collection);
     const notices = noticesFor(input, paging, collection);
     if (mode !== 'decisions') forbid(input, ['document_id', 'vote_item_id']);
@@ -1550,6 +1837,11 @@ export class EuParliamentService {
       invalidMode(
         'Name resolution fields are supported only in voters mode.',
         'Remove resolve_names and roster_term, or use mode voters with decision_id and position.',
+      );
+    if (mode !== 'decision' && input.breakdown)
+      invalidMode(
+        'breakdown is supported only in decision mode.',
+        'Remove breakdown, or use mode decision with sitting_id and decision_id.',
       );
     if (mode === 'sittings') {
       forbid(input, ['sitting_id', 'decision_id', 'position', 'snapshot']);
@@ -1608,7 +1900,32 @@ export class EuParliamentService {
         `vote_item_id ${JSON.stringify(input.vote_item_id)} belongs to the ${voteItemDate} sitting, not to sitting_id ${JSON.stringify(input.sitting_id)}; both must name the same sitting.`,
         `Retry with sitting_id ${voteItemDate}, the date in vote_item_id.`,
       );
-    if (mode === 'decisions' || mode === 'vote_items') forbid(input, ['decision_id', 'position']);
+    if (mode === 'decisions' || mode === 'agenda_items' || mode === 'vote_items')
+      forbid(input, ['decision_id', 'position']);
+    if (mode === 'agenda_items') {
+      localPaging(input);
+      // One unpaged read: every record embeds all languages, whatever `language` says.
+      const response = await this.client.get(
+        `meetings/${sitting_id}/foreseen-activities`,
+        {},
+        agendaRecordSchema,
+        operation,
+      );
+      const items = sittingAgendaItems(response.data, paging.language, notices);
+      const filters = { mode, sitting_id, language: paging.language };
+      const page = localPage(items, paging, filters);
+      // A year has fewer than 100 sittings, so the year's sittings at limit 100 settle it in one call.
+      if (!items.length)
+        notices.push(
+          `No agenda items are published for this date. Parliament returns none both for a sitting whose agenda is not yet published and for a date with no sitting; call euparl_get_plenary_votes with mode sittings, year ${sittingDate.slice(0, 4)} and limit 100 to check whether the date is a sitting.`,
+        );
+      return result(
+        { mode, sitting_id, agenda_items: page.items, page: page.page },
+        filters,
+        notices,
+        page.total,
+      );
+    }
     if (mode === 'vote_items') {
       localPaging(input);
       // One unpaged read in published order: paging and language both reorder the items.
@@ -1745,17 +2062,17 @@ export class EuParliamentService {
       });
     if (decision_id === undefined)
       throw new Error('Decision mode requires its normalized identifier');
-    if (mode === 'decision')
+    if (mode === 'decision') {
+      const decision = normalizeDecision(raw, paging.language, notices, mep_id);
+      const breakdown = input.breakdown
+        ? await this.decisionBreakdown(recordedVoters(raw), sittingDate, operation, notices)
+        : undefined;
       return result(
-        {
-          mode,
-          sitting_id,
-          decision_id,
-          decision: normalizeDecision(raw, paging.language, notices, mep_id),
-        },
-        filters,
+        { mode, sitting_id, decision_id, decision, ...field('breakdown', breakdown) },
+        input.breakdown ? { ...filters, breakdown: true } : filters,
         notices,
       );
+    }
     const position = input.position;
     if (position === undefined) invalidMode('position is required for voters mode.');
     const ids = decisionVoters(raw, position);

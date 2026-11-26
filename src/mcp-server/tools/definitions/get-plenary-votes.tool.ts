@@ -1,6 +1,6 @@
 /**
- * @fileoverview Sitting discovery, sitting vote items, compact decisions, rich decision and
- * independent voter paging.
+ * @fileoverview Sitting discovery, sitting agenda and vote items, compact decisions, rich decision
+ * and independent voter paging.
  * @module mcp-server/tools/definitions/get-plenary-votes.tool
  */
 import { tool, z } from '@cyanheads/mcp-ts-core';
@@ -21,33 +21,61 @@ import { labelCitation } from '@/services/eu-parliament/eu-parliament-reference.
 import { getEuParliamentService } from '@/services/eu-parliament/eu-parliament-service.js';
 
 const modeSchema = z
-  .enum(['sittings', 'vote_items', 'decisions', 'decision', 'voters'])
-  .describe(
-    'Sitting discovery, sitting vote-item page, compact decision page, one rich decision, or one voter-position page.',
-  );
-const documentIdsSchema = z.array(
-  z.string().describe('Canonical document identifier accepted by document get.'),
-);
+  .enum(['sittings', 'agenda_items', 'vote_items', 'decisions', 'decision', 'voters'])
+  .describe('Selected mode.');
+const documentIdsSchema = z.array(z.string().describe('Document ID for euparl_search_documents.'));
+const procedureIdsSchema = z.array(z.string().describe('Procedure ID for euparl_get_procedure.'));
+const agendaItemSchema = z
+  .object({
+    agenda_item_id: z
+      .string()
+      .describe(
+        'Agenda item ID, such as MTG-PL-2026-11-24-OJ-ITM-V-69; changes when the item moves to another sitting; not a vote_item_id.',
+      ),
+    activity_type: z
+      .string()
+      .optional()
+      .describe(
+        'Published activity type: def/ep-activities/PLENARY_DEBATE, PLENARY_VOTE or REQUEST_VOTE_URGENCY (vote on a Rule 170 urgency request).',
+      ),
+    label: localizedTextSchema.optional().describe('Published agenda item title.'),
+    heading: localizedTextSchema
+      .optional()
+      .describe(
+        'Published group heading, only on grouped items such as Rule 150 human-rights debates and Rule 170 urgency votes.',
+      ),
+    order: z
+      .string()
+      .optional()
+      .describe(
+        'Published agenda position as a string such as 9.0; rows sort by its numeric value.',
+      ),
+    start_time: z
+      .string()
+      .optional()
+      .describe('Start of the agenda time slot listing the item; absent when no slot lists it.'),
+    procedure_ids: procedureIdsSchema.describe(
+      'Procedures the item is scheduled for, in published order; empty when unpublished, as on Explanations of votes.',
+    ),
+    document_ids: documentIdsSchema.describe(
+      'Documents the item is based on (proposal, report, motions), in published order; empty when unpublished.',
+    ),
+    source_url: z.string().describe('Public agenda item source URL.'),
+  })
+  .strict()
+  .describe('One agenda item: a debate, vote or urgency vote foreseen at the sitting.');
 const voteItemSchema = z
   .object({
-    vote_item_id: z
-      .string()
-      .describe('Canonical vote item identifier; pass it as vote_item_id in decisions mode.'),
-    label: localizedTextSchema
-      .optional()
-      .describe('Whole published vote item title in its actual selected language.'),
+    vote_item_id: z.string().describe('Vote item ID; pass it as vote_item_id in decisions mode.'),
+    label: localizedTextSchema.optional().describe('Published vote item title.'),
     document_ids: documentIdsSchema.describe(
-      'Documents the vote item is based on, such as the report or motions, in published order; absent relations are empty.',
+      'Documents the vote item is based on (report, motions), in published order; empty when unpublished.',
     ),
-    procedure_ids: z
-      .array(
-        z.string().describe('Canonical procedure identifier accepted by euparl_get_procedure.'),
-      )
-      .describe(
-        'Procedures the vote item belongs to, in published order; absent relations are empty.',
-      ),
+    procedure_ids: procedureIdsSchema.describe(
+      'Procedures of the vote item, in published order; empty when unpublished.',
+    ),
     recording_document_ids: documentIdsSchema.describe(
-      'Documents recording the vote item, such as its minutes item, in published order; absent relations are empty.',
+      'Documents recording the vote item (its minutes item), in published order; empty when unpublished.',
     ),
     decision_count: z
       .number()
@@ -55,67 +83,54 @@ const voteItemSchema = z
       .nonnegative()
       .optional()
       .describe(
-        'Number of decisions the vote item publishes links to; absent, never 0, where it publishes none, as on sittings before 2024.',
+        'Decisions the vote item links; absent, never 0, where it links none, as before 2024.',
       ),
     source_url: z.string().describe('Public vote item source URL.'),
   })
   .strict()
-  .describe('One published PLENARY_VOTE_RESULTS vote item: one agenda item voted at the sitting.');
+  .describe('One PLENARY_VOTE_RESULTS vote item: one agenda item voted at the sitting.');
 const positionSchema = z
   .enum(voterPositions)
-  .describe(
-    'Recorded or intended voter position; intended corrections remain separate from recorded votes.',
-  );
+  .describe('Recorded position, or intended (a correction kept separate from recorded votes).');
 const decisionFields = {
-  decision_id: z.string().describe('Canonical decision activity identifier.'),
-  label: localizedTextSchema
-    .optional()
-    .describe('Whole published decision label in its actual selected language.'),
-  document_ids: z
-    .array(z.string().describe('Canonical document identifier accepted by document get.'))
-    .describe('Explicit documents decided on, in published order; absent relations are empty.'),
-  recording_document_ids: z
-    .array(z.string().describe('Canonical recording document identifier accepted by document get.'))
-    .describe(
-      'Explicit documents recording this decision, in published order; absent relations are empty.',
-    ),
-  partial_document_ids: z
-    .array(z.string().describe('Canonical document identifier accepted by document get.'))
-    .describe(
-      'Explicit documents only part of which this decision decided on, such as one split vote on an amendment, in published order; absent relations are empty.',
-    ),
+  decision_id: z.string().describe('Decision ID for decision_id.'),
+  label: localizedTextSchema.optional().describe('Published decision label.'),
+  document_ids: documentIdsSchema.describe(
+    'Documents decided on, in published order; empty when unpublished.',
+  ),
+  recording_document_ids: documentIdsSchema.describe(
+    'Documents recording this decision, in published order; empty when unpublished.',
+  ),
+  partial_document_ids: documentIdsSchema.describe(
+    'Documents only part of which this decision decided on (one split vote on an amendment), in published order; empty when unpublished.',
+  ),
   vote_item_ids: z
-    .array(z.string().describe('Canonical vote item identifier accepted by vote_item_id.'))
-    .describe(
-      'Explicit vote items this decision belongs to, in published order; vote_item_id selects every decision of one. Absent relations are empty.',
-    ),
+    .array(z.string().describe('Vote item ID for vote_item_id.'))
+    .describe('Vote items this decision belongs to, in published order; empty when unpublished.'),
   date: z.string().optional().describe('Published decision date.'),
   start_time: z.string().optional().describe('Published activity start timestamp.'),
-  order: z.string().optional().describe('Published decision order, preserved as a string.'),
+  order: z.string().optional().describe('Published decision order, as a string.'),
   method: z
     .string()
     .optional()
-    .describe('Published decision method; no voter availability is inferred from it.'),
-  outcome: z
-    .string()
-    .optional()
-    .describe('Published decision outcome; never computed from tallies.'),
+    .describe('Published method; voter availability is not inferred from it.'),
+  outcome: z.string().optional().describe('Published outcome; never computed from tallies.'),
   attendees: z
     .number()
     .optional()
-    .describe('Published attendee tally; absent stays absent and published zero stays zero.'),
+    .describe('Published attendees; absent stays absent, zero stays zero.'),
   favor: z
     .number()
     .optional()
-    .describe('Published votes in favor; absent stays absent and published zero stays zero.'),
+    .describe('Published votes in favor; absent stays absent, zero stays zero.'),
   against: z
     .number()
     .optional()
-    .describe('Published votes against; absent stays absent and published zero stays zero.'),
+    .describe('Published votes against; absent stays absent, zero stays zero.'),
   abstention: z
     .number()
     .optional()
-    .describe('Published abstention tally; absent stays absent and published zero stays zero.'),
+    .describe('Published abstentions; absent stays absent, zero stays zero.'),
   voter_counts: z
     .array(
       z
@@ -126,14 +141,14 @@ const decisionFields = {
             .int()
             .nonnegative()
             .describe(
-              'Number of person IDs in this published voter array, leaving out entries that name no person; distinct from a published vote tally.',
+              'Person IDs in this voter array, without entries naming no person; not the published tally.',
             ),
         })
         .strict()
-        .describe('Count for an available recorded or intended voter array.'),
+        .describe('Count of one published voter array.'),
     )
     .describe(
-      'Counts only for published voter arrays; an absent entry means unavailable. A zero count means the array names no person: published empty, or holding only entries without an identifier, which a notice discloses.',
+      'Counts for published voter arrays only; a missing entry means unavailable. Zero means the array names no person (published empty, or only entries without an ID, which a notice discloses).',
     ),
   source_url: z.string().describe('Public decision source URL.'),
 };
@@ -143,29 +158,19 @@ const eventIdPattern =
 const memberPositionSchema = z
   .object({
     positions: z
-      .array(
-        z
-          .enum(['favor', 'against', 'abstention'])
-          .describe('Published position containing this member.'),
-      )
+      .array(z.enum(['favor', 'against', 'abstention']).describe('Position listing this member.'))
       .describe(
-        'All matching published positions, preserving conflicts; empty does not prove absence from the vote.',
+        'Positions listing the member, conflicts kept; empty does not prove absence from the vote.',
       ),
     unavailable_positions: z
-      .array(
-        z
-          .enum(['favor', 'against', 'abstention'])
-          .describe('Position whose voter array was omitted.'),
-      )
+      .array(z.enum(['favor', 'against', 'abstention']).describe('Unpublished position.'))
       .describe('Unpublished positions; published empty arrays remain available.'),
     availability: z
       .enum(['published', 'partial', 'unavailable'])
-      .describe(
-        'Published when all three arrays exist, unavailable when none exist, otherwise partial.',
-      ),
+      .describe('published: all three arrays exist; unavailable: none; otherwise partial.'),
   })
   .strict()
-  .describe('Membership in one independent recorded or intended set of voter arrays.');
+  .describe('Membership in one recorded or intended set of voter arrays.');
 const decisionSummarySchema = z
   .object({
     ...decisionFields,
@@ -177,36 +182,36 @@ const decisionSummarySchema = z
       .strict()
       .optional()
       .describe(
-        'Requested member lookup from the complete decision; intended corrections never replace recorded positions.',
+        'mep_id lookup over the whole decision; intended corrections never replace recorded positions.',
       ),
   })
   .strict()
-  .describe(
-    'Compact decision identity, label, relations, tallies, voter counts and optional member positions.',
-  );
+  .describe('Compact decision record.');
 const decisionSchema = decisionSummarySchema
   .extend({
-    reference_text: localizedTextSchema
-      .optional()
-      .describe('Whole published reference text in its actual selected language.'),
-    comment: localizedTextSchema
-      .optional()
-      .describe('Whole published commentary in its actual selected language.'),
+    reference_text: localizedTextSchema.optional().describe('Published reference text.'),
+    comment: localizedTextSchema.optional().describe('Published commentary.'),
   })
   .strict()
-  .describe('One rich decision with complete selected text and explicit document relationships.');
+  .describe('Rich decision with complete text and document relations.');
+/** Recorded positions counted in one breakdown row. */
+const tallyFields = {
+  favor: z.number().int().nonnegative().describe('Recorded in favor.'),
+  against: z.number().int().nonnegative().describe('Recorded against.'),
+  abstention: z.number().int().nonnegative().describe('Recorded abstentions.'),
+};
 
 /** Explore sittings and decisions without combining voter pages with rich decision pages. */
 export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
   title: 'Explore plenary sittings, decisions, and voters',
-  description: `Discover sittings with mode sittings and year. Mode vote_items lists what a sitting voted on: its PLENARY_VOTE_RESULTS vote items in published order, each with its title label, based-on documents, procedures, recording documents and decision_count, from one sitting-wide read; pass a vote_item_id to decisions mode for its decisions. Vote items on sittings before 2024 publish no decision links, so decision_count is absent there. Default decisions pages compact summaries with labels, separate decided-on, part-of and recording document relations, and vote items for sitting_id. Vote items, decisions and voters return the requested whole-item count or remaining rows without an output-size cap. Optional label_contains, in decisions or vote_items, selects a literal selected-language substring of decision labels (report citations, amendments) or vote item titles, ignoring case, repeated whitespace and dash style without altering published text or establishing a final vote; in a decision label ${labelCitation}. Optional document_id filters decisions before paging by exact document identity or hyphen-boundary descendant; optional vote_item_id, such as a procedure's PLENARY_VOTE_RESULTS event, selects every decision of that vote item. Mode decision requires decision_id and returns one rich record with reference text and commentary; it rejects nondefault paging and snapshot. Optional decisions or decision mep_id returns independent recorded and intended positions with publication availability, without a roster lookup; empty positions do not prove absence from the vote. Mode voters requires decision_id and one position, paging recorded and intended voters independently. Missing arrays succeed with available false; published empty arrays have available true. Optional resolve_names requires explicit roster_term and joins only published names from that complete term roster, never voting-date affiliations or current-roster substitutes. Some IDs may remain unresolved. Continue local vote items, decisions or voters with page.next_offset and snapshot; restart at offset 0 without snapshot after snapshot_changed. Missing sitting vote items or decisions succeed empty; absent selected decision fails decision_not_found.`,
+  description: `Plenary sittings, agendas, votes and voters. Mode sittings lists a year's sittings. Mode agenda_items lists a sitting's published agenda, from the 2024-12-16 sitting on (and the weeks of 2023-07-10 and 2024-04-22): debate, vote and urgency-vote items in agenda order with type, title, heading, time slot, procedures and documents; it changes until the sitting, and a moved item changes ID. Mode vote_items lists a sitting's PLENARY_VOTE_RESULTS vote items with title, documents, procedures and decision_count (absent before 2024, whose vote items link no decisions); pass a vote_item_id to decisions. Default mode decisions pages compact decision summaries of sitting_id, filtered before paging by document_id (exact ID or hyphen-boundary descendant), vote_item_id (a vote_items row or a procedure's PLENARY_VOTE_RESULTS event) or label_contains. label_contains, in decisions or vote_items, matches a literal substring of decision labels (report citations, amendments) or vote item titles, ignoring case, repeated whitespace and dash style without altering published text or establishing a final vote; in a decision label ${labelCitation}. Mode decision returns one rich record with reference text and commentary; breakdown adds its recorded voters by political group and country from the sitting-date roster, values that go back to euparl_search_meps with that mandate_date. mep_id in decisions or decision returns recorded and intended positions; empty positions do not prove absence from the vote. Mode voters pages one position of decision_id; a missing array returns available false, a published empty one available true. resolve_names needs roster_term and joins names from that term roster only, never voting-date affiliations; some IDs stay unresolved. Continue with page.next_offset and snapshot; after snapshot_changed, restart at offset 0 without it.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
       mode: modeSchema
         .default('decisions')
         .describe(
-          'Default decisions returns compact summaries; sittings discovers by year, vote_items lists the vote items of sitting_id, decision returns one rich record, voters pages one position.',
+          "decisions (default) pages compact summaries; sittings lists a year's; agenda_items and vote_items list those of sitting_id; decision returns one rich record; voters pages one position.",
         ),
       year: z
         .number()
@@ -214,18 +219,18 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
         .min(1000)
         .max(9999)
         .optional()
-        .describe('Four-digit year, required only for sittings and forbidden in other modes.'),
+        .describe('Sittings mode only (required): four-digit year.'),
       document_id: optionalString().describe(
-        'Decisions-only document filter: canonical ID, eli/dl/doc/ prefix or exact public URI, in any letter case, or a report, adopted-text, motion or agenda citation such as A9-0188/2023, P9_A(2023)0188, T9-0138/2024, B9-0163/2024 (the B- motion) or RC-B9-0163/2024. Matches decided-on, part-of or recording relations by exact ID or hyphen-boundary descendant before paging.',
+        'Decisions only: canonical ID, eli/dl/doc/ prefix or public URI in any case, or a citation such as A9-0188/2023, P9_A(2023)0188, T9-0138/2024, B9-0163/2024 or RC-B9-0163/2024. Matches decided-on, part-of or recording relations by exact ID or hyphen-boundary descendant, before paging.',
       ),
       vote_item_id: optionalString(z.string().min(1).regex(eventIdPattern)).describe(
-        "Decisions-only vote item filter: canonical MTG-PL-YYYY-MM-DD-VOT-ITM- ID, eli/dl/event/ prefix or exact public event URI, such as a procedure's PLENARY_VOTE_RESULTS event, a vote_items row or a returned vote_item_ids entry. Selects every decision of that vote item before paging; its date must match sitting_id.",
+        "Decisions only: MTG-PL-YYYY-MM-DD-VOT-ITM- ID, eli/dl/event/ prefix or public event URI, from a vote_items row, a vote_item_ids entry or a procedure's PLENARY_VOTE_RESULTS event. Selects every decision of that vote item; its date must match sitting_id.",
       ),
       mep_id: optionalString().describe(
-        'Decisions or decision member lookup: canonical numeric ID, person/ prefix or exact public person URI. Uses published arrays without a roster join; empty positions do not prove absence from the vote.',
+        'Decisions or decision: numeric person ID, person/ prefix or public person URI. Reads published arrays, no roster join; empty positions do not prove absence from the vote.',
       ),
       label_contains: optionalString().describe(
-        `Decisions or vote_items literal substring of the selected-language label, ignoring case, repeated whitespace and dash style, applied before paging. Decision labels carry report citations and amendment numbers and combine with document_id and vote_item_id; in a decision label ${labelCitation}. Vote item labels are titles such as Artificial Intelligence Act. Matching text does not establish a final vote.`,
+        `Decisions or vote_items: literal substring of the selected-language label, ignoring case, repeated whitespace and dash style, before paging. Decision labels carry report citations and amendment numbers and combine with document_id and vote_item_id; in a decision label ${labelCitation}. Vote item labels are titles. A match does not establish a final vote.`,
       ),
       sitting_id: optionalString(
         z
@@ -235,25 +240,21 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
             /^(?:https:\/\/data\.europarl\.europa\.eu\/eli\/dl\/event\/|eli\/dl\/event\/)?(?:MTG-PL-)?\d{4}-\d{2}-\d{2}$/,
           ),
       ).describe(
-        'Required outside sittings: real YYYY-MM-DD date, MTG-PL-YYYY-MM-DD, known event prefix, or exact public event URI.',
+        'Required outside sittings: YYYY-MM-DD, MTG-PL-YYYY-MM-DD, event prefix or public event URI.',
       ),
       decision_id: optionalString(z.string().min(1).regex(eventIdPattern)).describe(
-        'Required for decision and voters: exact returned canonical decision ID, known eli/dl/event/ prefix, or exact public event URI; forbidden for sittings, vote_items and decisions.',
+        'Decision and voters only (required): returned decision ID, eli/dl/event/ prefix or public event URI.',
       ),
       position: z
         .preprocess(
           (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
           positionSchema.optional(),
         )
-        .describe(
-          'Required only for voters: favor, against, abstention, intended_favor, intended_against, or intended_abstention.',
-        ),
+        .describe('Voters only (required).'),
       resolve_names: z
         .boolean()
         .default(false)
-        .describe(
-          'Default false retains IDs only; true is voters-only and requires roster_term for complete names-only roster resolution.',
-        ),
+        .describe('Voters only; default false. True joins names from the roster_term roster.'),
       roster_term: z
         .number()
         .int()
@@ -261,121 +262,151 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
         .max(10)
         .optional()
         .describe(
-          'Explicit parliamentary term 0–10 containing the sitting; required with resolve_names true, forbidden otherwise. No term is inferred from dates.',
+          'Term 0–10 holding the sitting; required with resolve_names, else forbidden. Never inferred from dates.',
         ),
-      ...pagingInputFields('sittings', 'vote_items', 'decisions', 'voters'),
+      breakdown: z
+        .boolean()
+        .default(false)
+        .describe(
+          'Decision mode only; default false. True adds breakdown: recorded favor, against and abstention voters tallied by the political group and country published for each on the sitting date (the euparl_search_meps roster for that mandate_date), one extra request. A decision that does not publish all three recorded voter arrays (a hand vote), whose arrays name no person, or an unreadable roster returns no breakdown, with a notice.',
+        ),
+      ...pagingInputFields('sittings', 'agenda_items', 'vote_items', 'decisions', 'voters'),
       snapshot: optionalString().describe(
-        'Returned vote-item, decisions or voter-position snapshot; required for local offset above 0, optional at offset 0; forbidden for sittings and decision.',
+        'Snapshot returned by an agenda-item, vote-item, decisions or voters page; required above offset 0.',
       ),
     })
     .strict(),
   output: z
     .object({
       mode: modeSchema,
-      sitting_id: z
-        .string()
-        .optional()
-        .describe('Normalized selected sitting identifier; absent in sitting discovery.'),
+      sitting_id: z.string().optional().describe('Normalized sitting ID; absent in sittings mode.'),
       decision_id: z
         .string()
         .optional()
-        .describe('Normalized selected decision identifier; present in decision and voters modes.'),
-      position: positionSchema
-        .optional()
-        .describe('Selected recorded or intended position in voters mode.'),
+        .describe('Normalized decision ID in decision and voters modes.'),
+      position: positionSchema.optional().describe('Selected position in voters mode.'),
       sittings: z
         .array(
           z
             .object({
-              sitting_id: z.string().describe('Published sitting activity identifier.'),
+              sitting_id: z.string().describe('Sitting ID for sitting_id.'),
               date: z.string().optional().describe('Published sitting date.'),
-              label: localizedTextSchema
-                .optional()
-                .describe('Published sitting label in its actual selected language.'),
+              label: localizedTextSchema.optional().describe('Published sitting label.'),
               source_url: z.string().describe('Public sitting source URL.'),
             })
             .strict()
-            .describe('Published sitting discovery record.'),
+            .describe('One sitting.'),
         )
         .optional()
-        .describe('Sitting discovery page, present only in sittings mode.'),
+        .describe('Sittings mode page.'),
+      agenda_items: z
+        .array(agendaItemSchema)
+        .optional()
+        .describe('agenda_items mode page, in numeric agenda order; time slots are not rows.'),
       vote_items: z
         .array(voteItemSchema)
         .optional()
         .describe(
-          'Whole vote-item page of the sitting in published order, present only in vote_items mode; roll-call, split and separate-vote requests are left out.',
+          'vote_items mode page, in published order; roll-call, split and separate-vote requests are left out.',
         ),
-      decisions: z
-        .array(decisionSummarySchema)
-        .optional()
-        .describe(
-          'Compact whole-decision page with selected-language labels, separate decided-on, part-of and recording document relations, and vote items.',
-        ),
-      decision: decisionSchema
-        .optional()
-        .describe('Complete selected rich decision, present only in decision mode.'),
+      decisions: z.array(decisionSummarySchema).optional().describe('Decisions mode page.'),
+      decision: decisionSchema.optional().describe('Decision mode record.'),
       voters: z
         .array(
           z
             .object({
-              mep_id: z
-                .string()
-                .describe('Canonical published voter person ID; retained even when unresolved.'),
+              mep_id: z.string().describe('Voter person ID, kept when unresolved.'),
               name: z
                 .string()
                 .optional()
                 .describe(
-                  'Published identity from the explicitly selected term roster; absence means unresolved, not absent voter.',
+                  'Name from the roster_term roster; absent means unresolved, not an absent voter.',
                 ),
             })
             .strict()
-            .describe('Published voter identity with optional names-only roster join.'),
+            .describe('One voter.'),
         )
         .optional()
-        .describe(
-          'Independent page for one recorded or intended position, preserving published ID order.',
-        ),
+        .describe('Voters mode page for one position, in published ID order.'),
       page: pageSchema
         .optional()
-        .describe(
-          'Selected sitting, vote-item, compact decision, or voter-position page; absent for a rich decision. Local pages retain the requested count or remaining rows without a character budget; next_offset resumes at the first item left out.',
-        ),
+        .describe('Page of the selected collection; absent in decision mode.'),
       voter_resolution: z
         .object({
           scope: z
             .string()
-            .describe(
-              'Name resolution scope, parliamentary_term; no historical affiliation is joined.',
-            ),
-          term: z
-            .number()
-            .int()
-            .min(0)
-            .max(10)
-            .describe('Explicitly selected term whose complete published roster supplied names.'),
-          sitting_date: z
-            .string()
-            .optional()
-            .describe('Published decision date, when available; no date is inferred.'),
+            .describe('Always parliamentary_term; no historical affiliation is joined.'),
+          term: z.number().int().min(0).max(10).describe('Term whose roster supplied names.'),
+          sitting_date: z.string().optional().describe('Published decision date; never inferred.'),
           resolved: z
             .number()
             .int()
             .nonnegative()
-            .describe(
-              'Number of voters resolved across the complete selected position before paging.',
-            ),
+            .describe('Voters resolved across the whole position, before paging.'),
           unresolved: z
             .number()
             .int()
             .nonnegative()
+            .describe('Voters without a roster name across the whole position, before paging.'),
+        })
+        .strict()
+        .optional()
+        .describe(
+          'Name-resolution provenance and counts; names do not prove spelling or affiliation on the voting date.',
+        ),
+      breakdown: z
+        .object({
+          mandate_date: z
+            .string()
             .describe(
-              'Number of voters without a published roster name across the complete selected position before paging.',
+              'Sitting date whose roster supplied groups and countries; pass it as euparl_search_meps mandate_date.',
+            ),
+          political_groups: z
+            .array(
+              z
+                .object({
+                  political_group: z
+                    .string()
+                    .optional()
+                    .describe(
+                      "Group label as that day's roster publishes it, such as S&D, Verts/ALE, GUE/NGL or The Left; pass it to euparl_search_meps as political_group with mandate_date for its members. Absent on the row of voters listed without a group.",
+                    ),
+                  ...tallyFields,
+                })
+                .strict()
+                .describe('Recorded voters of one group.'),
+            )
+            .describe(
+              'One row per group, by voters descending then label; the row without political_group last.',
+            ),
+          countries: z
+            .array(
+              z
+                .object({
+                  country: z
+                    .string()
+                    .optional()
+                    .describe(
+                      "ISO alpha-2 country as that day's roster publishes it (GB for United Kingdom members); pass it to euparl_search_meps as country with mandate_date. Absent on the row of voters listed without a country.",
+                    ),
+                  ...tallyFields,
+                })
+                .strict()
+                .describe('Recorded voters of one country.'),
+            )
+            .describe(
+              'One row per country, by voters descending then code; the row without country last.',
+            ),
+          unmatched_mep_ids: z
+            .array(z.string().describe('Recorded voter person ID.'))
+            .describe(
+              'Recorded voters missing from that roster, once each in first-recorded order, in no row; euparl_get_mep reads them.',
             ),
         })
         .strict()
         .optional()
         .describe(
-          'Names-only provenance and complete-position resolution counts; names do not prove spelling or affiliation on the voting date.',
+          "With breakdown true, once the roster is read: recorded voters tallied by group and country on the mandate_date roster, never current affiliations. Per position, each table plus that position's unmatched voters equals voter_counts; intended corrections are left out.",
         ),
     })
     .strict(),
@@ -385,7 +416,7 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Identifier, calendar date, year, term, or language is unsupported, or vote_item_id belongs to a different sitting date than sitting_id.',
+      when: 'An identifier, date, year, term or language is unsupported, or vote_item_id is from another sitting date.',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
       thrownBy: 'service',
@@ -393,7 +424,7 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
     {
       reason: 'invalid_mode_fields',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Required mode fields are missing, incompatible fields are supplied, or local continuation lacks a snapshot.',
+      when: 'Mode fields are missing or incompatible, or local continuation lacks a snapshot.',
       recovery:
         'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.',
       thrownBy: 'service',
@@ -401,7 +432,7 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
     {
       reason: 'snapshot_changed',
       code: JsonRpcErrorCode.Conflict,
-      when: 'Complete selected vote items, decisions, voters, resolved names, or normalized retrieval scope changed.',
+      when: 'The selected collection changed since the supplied snapshot.',
       recovery:
         'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.',
       thrownBy: 'service',
@@ -409,7 +440,7 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
     {
       reason: 'decision_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The selected decision is absent from the complete sitting collection.',
+      when: 'The decision is absent from the sitting.',
       recovery:
         'Call euparl_get_plenary_votes with mode decisions and the same sitting_id, then use an exact returned decision_id.',
       thrownBy: 'service',
@@ -417,7 +448,7 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
     {
       reason: 'upstream_paging_stalled',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'Complete name-resolution roster acquisition repeats a page before exhaustion, or the vote-results read omits a vote item its sitting lists.',
+      when: 'A roster, vote-results or agenda read came back incomplete.',
       recovery:
         'Retry the same euparl tool call later; do not treat an incomplete lookup as a complete result.',
       thrownBy: 'service',
@@ -425,7 +456,7 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
     {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Parliament rejects validated request parameters.',
+      when: 'Parliament rejects the validated request.',
       recovery:
         'Call euparl_list_reference for supported filters and identifiers, then retry with a narrower supported request.',
       thrownBy: 'service',
@@ -433,7 +464,7 @@ export const getPlenaryVotesTool = tool('euparl_get_plenary_votes', {
     {
       reason: 'upstream_rate_limited',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'Parliament rate limits persist after bounded retries.',
+      when: 'Parliament rate limiting outlasts the retries.',
       retryable: true,
       recovery: 'Wait for the reported retry interval, then repeat the same euparl tool call.',
       thrownBy: 'service',

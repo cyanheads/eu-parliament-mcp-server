@@ -46,6 +46,22 @@ const allowlists = new Map<string, readonly string[]>([
   ['committee-documents', [...lists, 'work-type', 'parliamentary-term']],
   ['plenary-documents', [...lists, 'work-type', 'year']],
   [
+    'meps-declarations',
+    [
+      ...lists,
+      'person-id',
+      'related-process-id',
+      'year',
+      'parliamentary-term',
+      'filter-output',
+      'title',
+      'search-language',
+      // Rows then carry their title in that language only; expressions filed in another are bare IDs.
+      'language',
+      'work-type',
+    ],
+  ],
+  [
     'speeches',
     [
       ...lists,
@@ -73,11 +89,12 @@ const allowlists = new Map<string, readonly string[]>([
   ['parliamentary-questions', [...lists, 'year', 'work-type']],
 ]);
 /**
- * Single-record, sitting-decision and sitting vote-result routes accept no query parameters:
- * `vote-results` paging truncates its items at 50 and reorders them, and `language` reorders them.
+ * Single-record, sitting-decision, sitting vote-result and sitting agenda routes accept no query
+ * parameters: `vote-results` paging truncates its items at 50 and reorders them, and `language`
+ * reorders them; `foreseen-activities` embeds every language whatever `language` says.
  */
 const detailRoute =
-  /^(?:procedures|documents|meps|parliamentary-questions|corporate-bodies)\/[^/]+$|^meetings\/[^/]+\/(?:decisions|vote-results)$/;
+  /^(?:procedures|documents|meps|parliamentary-questions|corporate-bodies|meps-declarations)\/[^/]+$|^meetings\/[^/]+\/(?:decisions|vote-results|foreseen-activities)$/;
 /** Document family records accept only `language`, which selects the expressions they embed. */
 const familyDetailRoute = /^(?:adopted-texts|committee-documents|plenary-documents)\/[^/]+$/;
 /** A speech record accepts only the text options of the speech list. */

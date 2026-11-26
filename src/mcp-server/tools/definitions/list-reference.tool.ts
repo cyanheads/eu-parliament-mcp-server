@@ -24,38 +24,28 @@ const entrySchema = z
     label: localizedTextSchema
       .optional()
       .describe(
-        'Published label and its actual language: a corporate body label, or the label of a political group code in mep_filters (mul).',
+        'Published label: a corporate body label, or the label of a political group code in mep_filters (mul).',
       ),
-    id: z.string().optional().describe('Published corporate-body identity, including org/ prefix.'),
+    id: z.string().optional().describe('Corporate-body ID, with org/ prefix.'),
     description: z
       .string()
       .optional()
       .describe('Accepted spelling, source family or coverage explanation.'),
     classification: z.string().optional().describe('Published corporate-body classification.'),
-    name: localizedTextSchema
-      .optional()
-      .describe('Published full organization name from prefLabel in its actual selected language.'),
-    start_date: z.string().optional().describe('Published organization interval start date.'),
+    name: localizedTextSchema.optional().describe('Published full organization name (prefLabel).'),
+    start_date: z.string().optional().describe('Published interval start date.'),
     end_date: z
       .string()
       .optional()
-      .describe(
-        'Published organization interval end date; absence does not establish current status.',
-      ),
-    found: z
-      .boolean()
-      .optional()
-      .describe('Organization lookup result; false only for HTTP 204 or 404.'),
+      .describe('Published interval end date; absence does not establish current status.'),
+    found: z.boolean().optional().describe('Lookup result; false only for HTTP 204 or 404.'),
     organization_id: z
       .string()
       .optional()
       .describe(
-        'Supplied organization ID or code on lookup results, trimmed, without org/ or the URI origin, case unchanged.',
+        'Supplied ID or code on lookup results, trimmed, without org/ or the URI origin, case unchanged.',
       ),
-    source_url: z
-      .string()
-      .optional()
-      .describe('Public organization identity URL on lookup results.'),
+    source_url: z.string().optional().describe('Public organization URL on lookup results.'),
   })
   .strict()
   .describe('Reference entry; organization identities are not inferred query codes.');
@@ -63,7 +53,8 @@ const entrySchema = z
 /** Discover supported filters, identifier syntax and coverage limitations. */
 export const listReferenceTool = tool('euparl_list_reference', {
   title: 'List parliamentary reference data',
-  description: `List parliamentary codes, identifier formats, historical committees and political groups, or coverage limitations. Choose organizations with organization_ids to resolve the organization IDs other tools return, decimal (org/5154) or code (org/IMCO, org/S-D, org/ep-9), into published names and dates; a question's addressee_ids do not resolve here (COM is the Communist and Allies Group). Ordered per-item found false means no detail was published, as for a code in the wrong case. Organization lookups page the supplied IDs with an effective maximum of ${pageCaps.organizations.maximum} per call; repeat the same ID list with page.next_offset. Live committees and political groups retain historical coverage and an acquisition bound of ${pageCaps.reference.maximum} per page; static reference topics return the requested count or remaining entries without an output-size cap. These lists do not require snapshots; missing end dates do not establish current status.`,
+  description:
+    "List parliamentary codes, identifier formats, historical committees and political groups, or coverage limitations. Topic organizations with organization_ids resolves the organization IDs other tools return, decimal (org/5154) or code (org/IMCO, org/S-D, org/ep-9), into published names and dates; a question's addressee_ids do not resolve here (COM is the Communist and Allies Group). Per-item found false means no detail was published, as for a code in the wrong case. Lookups page the supplied IDs; repeat the same ID list with page.next_offset. Committees and political groups keep historical coverage. No snapshots; missing end dates do not establish current status.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -77,20 +68,20 @@ export const listReferenceTool = tool('euparl_list_reference', {
           z
             .string()
             .describe(
-              'Decimal ID or case-sensitive code (IMCO, S-D, ep-9), bare, after org/, or in the exact https://data.europarl.europa.eu/org/ URI; labels such as S&D are rejected.',
+              'Decimal ID or case-sensitive code (IMCO, S-D, ep-9), bare, after org/, or in the https://data.europarl.europa.eu/org/ URI; labels such as S&D are rejected.',
             ),
         )
         .optional()
         .describe(
-          `Required nonempty list only for organizations; order and duplicates retained, with at most ${pageCaps.organizations.maximum} looked up per page.`,
+          `Organizations only (required, nonempty); order and duplicates kept, at most ${pageCaps.organizations.maximum} looked up per page.`,
         ),
       ...pagingInputFields('reference', 'static_reference', 'organizations'),
     })
     .strict(),
   output: z
     .object({
-      topic: z.enum(referenceTopics).describe('Requested reference topic.'),
-      items: z.array(entrySchema).describe('Whole reference entries on this page.'),
+      topic: z.enum(referenceTopics).describe('Selected topic.'),
+      items: z.array(entrySchema).describe('Entries on this page.'),
       page: pageSchema,
     })
     .strict(),
@@ -116,7 +107,7 @@ export const listReferenceTool = tool('euparl_list_reference', {
     {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Parliament rejects validated request parameters.',
+      when: 'Parliament rejects the validated request.',
       recovery:
         'Call euparl_list_reference for supported filters and identifiers, then retry with a narrower supported request.',
       thrownBy: 'service',
@@ -124,7 +115,7 @@ export const listReferenceTool = tool('euparl_list_reference', {
     {
       reason: 'upstream_rate_limited',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'Parliament rate limits persist after bounded retries.',
+      when: 'Parliament rate limiting outlasts the retries.',
       retryable: true,
       recovery: 'Wait for the reported retry interval, then repeat the same euparl tool call.',
       thrownBy: 'service',

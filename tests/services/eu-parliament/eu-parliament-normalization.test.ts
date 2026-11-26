@@ -4,38 +4,56 @@ import { describe, expect, it } from 'vitest';
 import {
   canonicalId,
   decisionVoters,
+  declarationRelations,
   documentInputIds,
   documentLinks,
   fragmentText,
   localized,
+  localizedTitle,
   localPage,
   normalizeAdoptedTextRow,
+  normalizeAgendaItem,
   normalizeDecision,
   normalizeDecisionSummary,
+  normalizeDeclarationRow,
   normalizeDocument,
   normalizeName,
   normalizeProcedure,
   normalizeQuestion,
   normalizeSpeech,
+  normalizeVoteItem,
   originalLanguages,
   pageWindow,
   procedureIds,
+  titleInLanguage,
   upstreamPage,
 } from '../../../src/services/eu-parliament/eu-parliament-normalization.js';
 import {
   adoptedTextRowSchema,
+  agendaRecordSchema,
   decisionSchema,
+  declarationFamilySchema,
+  declarationRowSchema,
   documentSchema,
   procedureSchema,
   questionSchema,
   speechSchema,
+  voteItemSchema,
 } from '../../../src/services/eu-parliament/eu-parliament-schemas.js';
 import { expectLinearCpu } from '../../helpers/cpu-growth.js';
 import {
+  awareDeclarationFamilyRecord,
+  awareDeclarationRecord,
   decisionRecord,
+  declarationRow,
   documentRecord,
+  malformedProcedureDeclaration,
+  malformedProcedureDeclarationRecord,
+  multiValuedFilesRecord,
+  multiValuedTitleRecord,
   questionRecord,
   speechFragments,
+  supersededDeclarationRows,
 } from '../../helpers/eu-parliament-fixtures.js';
 
 describe('Parliament normalization', () => {
@@ -167,17 +185,23 @@ describe('Parliament normalization', () => {
     expect(document).not.toHaveProperty('public_register_ref');
   });
   it('takes only procedure entries of a relation, canonical and in published order', () => {
+    const notices: string[] = [];
     expect(
-      procedureIds([
-        'eli/dl/event/MTG-PL-2024-03-13-PVCRE-ITM-8-2',
-        { id: 'eli/dl/proc/2021-0106' },
-        'https://data.europarl.europa.eu/eli/dl/proc/2016-0224B',
-        'org/IMCO',
-        'eli/dl/doc/A-9-2023-0188',
-      ]),
+      procedureIds(
+        [
+          'eli/dl/event/MTG-PL-2024-03-13-PVCRE-ITM-8-2',
+          { id: 'eli/dl/proc/2021-0106' },
+          'https://data.europarl.europa.eu/eli/dl/proc/2016-0224B',
+          'org/IMCO',
+          'eli/dl/doc/A-9-2023-0188',
+        ],
+        'TA-1',
+        notices,
+      ),
     ).toEqual(['2021-0106', '2016-0224B']);
-    expect(procedureIds('eli/dl/proc/2024-2716')).toEqual(['2024-2716']);
-    expect(procedureIds(undefined)).toEqual([]);
+    expect(procedureIds('eli/dl/proc/2024-2716', 'TA-1', notices)).toEqual(['2024-2716']);
+    expect(procedureIds(undefined, 'TA-1', notices)).toEqual([]);
+    expect(notices).toEqual([]);
   });
   it('lists family procedure relations after generic ones without repeating any', () => {
     const document = normalizeDocument(
@@ -188,7 +212,7 @@ describe('Parliament normalization', () => {
       }),
       'en',
       [],
-      ['2020-0003', '2020-0001', '2019-0005', '2020-0003'],
+      { procedure_ids: ['2020-0003', '2020-0001', '2019-0005', '2020-0003'] },
     );
     expect(document.procedure_ids).toEqual(['2020-0001', '2020-0002', '2020-0003', '2019-0005']);
   });
@@ -286,13 +310,6 @@ describe('Parliament normalization', () => {
       expect(error.data).toEqual({ retryable: false });
     },
   );
-  it('classifies a malformed relation procedure entry from Parliament as a serialization failure', () => {
-    const error = thrown(() => procedureIds(['eli/dl/proc/2021-0106', 'eli/dl/proc/2024-27']));
-    expect(error.code).toBe(JsonRpcErrorCode.SerializationError);
-    expect(error.message).toBe(
-      'Parliament returned a record with a malformed procedure identifier "eli/dl/proc/2024-27".',
-    );
-  });
   /** Live shape of MTG-PL-2019-01-14-DEC-100087 (2026-11-13): voter arrays hold only "person/". */
   const placeholderDecision = decisionSchema.parse({
     id: 'eli/dl/event/MTG-PL-2019-01-14-DEC-100087',
@@ -389,6 +406,241 @@ describe('Parliament normalization', () => {
     const result = normalizeDocument(raw, 'fr', []);
     expect(result.title).toEqual({ value: 'Avis exemple', language: 'fr' });
     expect(result).not.toHaveProperty('text');
+  });
+  it('keeps the one published issue date and size of a file as scalars', () => {
+    const raw = documentSchema.parse({
+      id: 'eli/dl/doc/TA-9-2023-0276',
+      is_realized_by: [
+        {
+          id: 'eli/dl/doc/TA-9-2023-0276/lt',
+          is_embodied_by: [
+            {
+              id: 'eli/dl/doc/TA-9-2023-0276/lt/pdf',
+              is_exemplified_by:
+                'distribution/reds_iPlTa_Itm/TA-9-2023-0276/TA-9-2023-0276-FNL_lt.pdf',
+              media_type: 'https://www.iana.org/assignments/media-types/application/pdf',
+              issued: '2023-11-15T13:05:52+01:00',
+              byteSize: '44793',
+            },
+          ],
+        },
+      ],
+    });
+    expect(documentLinks(raw, 'lt', [])).toEqual([
+      {
+        url: 'https://data.europarl.europa.eu/distribution/reds_iPlTa_Itm/TA-9-2023-0276/TA-9-2023-0276-FNL_lt.pdf',
+        language: 'lt',
+        media_type: 'https://www.iana.org/assignments/media-types/application/pdf',
+        issued: '2023-11-15T13:05:52+01:00',
+        size_bytes: '44793',
+      },
+    ]);
+  });
+  it('carries several published issue dates or sizes verbatim on every file of the manifestation, pairing none with a file', () => {
+    const raw = documentSchema.parse(multiValuedFilesRecord);
+    const reds = 'https://data.europarl.europa.eu/distribution/reds_iPlTa_Itm/TA-9-2023-0276/';
+    const doc = 'https://data.europarl.europa.eu/distribution/doc/';
+    const docxIssued = ['2024-04-16T12:53:46.063+02:00', '2023-11-15T13:05:52+01:00'];
+    const pdf = 'https://www.iana.org/assignments/media-types/application/pdf';
+    expect(documentLinks(raw, 'lt', [])).toEqual([
+      {
+        url: `${reds}TA-9-2023-0276-FNL_lt.pdf`,
+        language: 'lt',
+        media_type: pdf,
+        issued: '2023-11-15T13:05:52+01:00',
+        size_bytes: '44793',
+      },
+      {
+        url: `${reds}TA-9-2023-0276-FNL_lt.docx`,
+        language: 'lt',
+        issued_values: docxIssued,
+        size_bytes_values: ['44793', '44848'],
+      },
+      {
+        url: `${doc}TA-9-2023-0276_lt.docx`,
+        language: 'lt',
+        issued_values: docxIssued,
+        size_bytes_values: ['44793', '44848'],
+      },
+      {
+        url: `${reds}TA-9-2023-0276-FNL_lt.xml`,
+        language: 'lt',
+        issued: '2023-12-20T15:53:41+01:00',
+        size_bytes: '3230',
+      },
+    ]);
+    // Equal sizes collapse to one published value, which stays a scalar beside the two dates.
+    const xml = 'https://www.iana.org/assignments/media-types/application/xml';
+    const xmlIssued = ['2024-05-14T17:12:06+02:00', '2023-12-20T15:52:28+01:00'];
+    expect(documentLinks(raw, 'en', [])).toEqual([
+      {
+        url: `${reds}TA-9-2023-0276-FNL_en.xml`,
+        language: 'en',
+        media_type: xml,
+        issued_values: xmlIssued,
+        size_bytes: '3225',
+      },
+      {
+        url: `${doc}TA-9-2023-0276_en.xml`,
+        language: 'en',
+        media_type: xml,
+        issued_values: xmlIssued,
+        size_bytes: '3225',
+      },
+    ]);
+    // One file reissued (CRE-10-2024-07-17 mul/xml), and a one-element array read as one value.
+    const single = documentSchema.parse({
+      id: 'eli/dl/doc/CRE-10-2024-07-17',
+      is_realized_by: [
+        {
+          id: 'eli/dl/doc/CRE-10-2024-07-17/mul',
+          is_embodied_by: [
+            {
+              id: 'eli/dl/doc/CRE-10-2024-07-17/mul/xml',
+              is_exemplified_by: 'distribution/doc/CRE-10-2024-07-17_mul.xml',
+              issued: ['2026-07-20T09:53:33+02:00', '2025-03-06T15:27:13+01:00'],
+              byteSize: ['161354'],
+            },
+          ],
+        },
+      ],
+    });
+    expect(documentLinks(single, 'mul', [])).toEqual([
+      {
+        url: `${doc}CRE-10-2024-07-17_mul.xml`,
+        language: 'mul',
+        issued_values: ['2026-07-20T09:53:33+02:00', '2025-03-06T15:27:13+01:00'],
+        size_bytes: '161354',
+      },
+    ]);
+  });
+  it('keeps the first published title of a language as its value and every one only when there are several', () => {
+    const map = {
+      de: ['Bericht', 'BERICHT'] as [string, ...string[]],
+      en: 'Report',
+      fr: ['Rapport'] as [string, ...string[]],
+    };
+    expect(titleInLanguage(map, 'de')).toEqual({
+      value: 'Bericht',
+      language: 'de',
+      values: ['Bericht', 'BERICHT'],
+    });
+    expect(titleInLanguage(map, 'en')).toEqual({ value: 'Report', language: 'en' });
+    expect(titleInLanguage(map, 'fr')).toEqual({ value: 'Rapport', language: 'fr' });
+    // Rows read one language only: no fallback and no notice.
+    expect(titleInLanguage(map, 'pl')).toBeUndefined();
+    expect(titleInLanguage(undefined, 'de')).toBeUndefined();
+
+    const notices: string[] = [];
+    expect(localizedTitle(map, 'de', notices)).toEqual({
+      value: 'Bericht',
+      language: 'de',
+      values: ['Bericht', 'BERICHT'],
+    });
+    expect(localizedTitle(map, 'pl', notices)).toEqual({ value: 'Report', language: 'en' });
+    expect(localizedTitle({ fr: ['Rapport', 'RAPPORT'], de: 'Bericht' }, 'pl', notices)).toEqual({
+      value: 'Bericht',
+      language: 'de',
+    });
+    expect(localizedTitle({ fr: ['Rapport', 'RAPPORT'] }, 'pl', notices)).toEqual({
+      value: 'Rapport',
+      language: 'fr',
+      values: ['Rapport', 'RAPPORT'],
+    });
+    expect(localizedTitle(undefined, 'en', notices)).toBeUndefined();
+    // The fallback notice is the one `localized` gives.
+    const shared: string[] = [];
+    localized({ en: 'Report' }, 'pl', shared);
+    expect(notices).toEqual([
+      'Requested language pl unavailable; returned published en text.',
+      'Requested language pl unavailable; returned published de text.',
+      'Requested language pl unavailable; returned published fr text.',
+    ]);
+    expect(shared).toEqual([notices[0]]);
+  });
+  it('reads document, question and answer titles and files that publish several values', () => {
+    const notices: string[] = [];
+    const document = normalizeDocument(documentSchema.parse(multiValuedTitleRecord), 'de', notices);
+    // The work title map wins over expression titles, which publish the same pair in another order.
+    expect(document.title).toEqual({
+      value: 'Bericht über den Antrag auf Aufhebung der Immunität von Elena Yoncheva',
+      language: 'de',
+      values: [
+        'Bericht über den Antrag auf Aufhebung der Immunität von Elena Yoncheva',
+        'BERICHT über den Antrag auf Aufhebung der Immunität von Elena Yoncheva',
+      ],
+    });
+    expect(normalizeDocument(documentSchema.parse(multiValuedTitleRecord), 'en', []).title).toEqual(
+      {
+        value: 'REPORT on the request for waiver of the immunity of Elena Yoncheva',
+        language: 'en',
+      },
+    );
+    const { title_dcterms: _work, ...expressionOnly } = multiValuedTitleRecord;
+    expect(normalizeDocument(documentSchema.parse(expressionOnly), 'de', []).title).toEqual({
+      value: 'BERICHT über den Antrag auf Aufhebung der Immunität von Elena Yoncheva',
+      language: 'de',
+      values: [
+        'BERICHT über den Antrag auf Aufhebung der Immunität von Elena Yoncheva',
+        'Bericht über den Antrag auf Aufhebung der Immunität von Elena Yoncheva',
+      ],
+    });
+
+    const question = normalizeQuestion(
+      questionSchema.parse({
+        id: 'eli/dl/doc/E-9-2023-900001',
+        title_dcterms: { en: ['Question title', 'QUESTION TITLE'] },
+        is_realized_by: [
+          {
+            id: 'eli/dl/doc/E-9-2023-900001/en',
+            title_alternative: { en: ['Question E-900001/2023', 'Question E-900001/2023 rev.'] },
+          },
+        ],
+        inverse_answers_to: [
+          {
+            id: 'eli/dl/doc/E-9-2023-900001-ASW',
+            is_realized_by: [
+              {
+                id: 'eli/dl/doc/E-9-2023-900001-ASW/en',
+                is_embodied_by: [
+                  {
+                    id: 'eli/dl/doc/E-9-2023-900001-ASW/en/pdf',
+                    is_exemplified_by: ['distribution/a_en.pdf', 'distribution/b_en.pdf'],
+                    issued: ['2023-12-01', '2023-11-01'],
+                    byteSize: ['10', '20'],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+      'en',
+      [],
+    );
+    expect(question).toMatchObject({
+      title: {
+        value: 'Question title',
+        language: 'en',
+        values: ['Question title', 'QUESTION TITLE'],
+      },
+      alternative_title: {
+        value: 'Question E-900001/2023',
+        language: 'en',
+        values: ['Question E-900001/2023', 'Question E-900001/2023 rev.'],
+      },
+    });
+    expect(question.answers).toEqual([
+      {
+        document_id: 'E-9-2023-900001-ASW',
+        links: ['a', 'b'].map((file) => ({
+          url: `https://data.europarl.europa.eu/distribution/${file}_en.pdf`,
+          language: 'en',
+          issued_values: ['2023-12-01', '2023-11-01'],
+          size_bytes_values: ['10', '20'],
+        })),
+      },
+    ]);
   });
   it('retains nested answer metadata and all selected-language answer links', () => {
     const result = normalizeQuestion(questionSchema.parse(questionRecord), 'fr', []);
@@ -584,7 +836,9 @@ describe('Parliament normalization', () => {
     ['procedures', 1000],
     ['questions', 1000],
     ['documents', 1000],
-    ['speeches', 5000],
+    ['speeches', 400],
+    ['keyword_speeches', 1000],
+    ['text_speeches', 100],
     ['meps', 5000],
     ['memberships', 5000],
     ['procedure_sections', 5000],
@@ -743,6 +997,7 @@ describe('adopted-text search rows', () => {
           ],
         }),
         'hr',
+        [],
       ),
     ).toEqual({
       document_id: 'TA-10-2025-0257',
@@ -754,12 +1009,621 @@ describe('adopted-text search rows', () => {
       procedure_ids: ['2025-0900', '2025-2195'],
     });
     // No fallback: the list publishes only the requested language, so an English-only row has none.
-    expect(normalizeAdoptedTextRow(row({ title_dcterms: { en: 'Title' } }), 'hr')).toEqual({
+    expect(normalizeAdoptedTextRow(row({ title_dcterms: { en: 'Title' } }), 'hr', [])).toEqual({
       document_id: 'TA-10-2025-0257',
       source_url: 'https://data.europarl.europa.eu/eli/dl/doc/TA-10-2025-0257',
       procedure_ids: [],
     });
   });
+  it('keeps every title a row publishes in the requested language, the first as its value', () => {
+    // Live TA-9-2023-0261 under language=hu (2026-11-25), the trailing space as published.
+    const hu = [
+      'Az alternatív üzemanyagok infrastruktúrájának kiépítése ',
+      'Az alternatív üzemanyagok infrastruktúrájának kiépítése',
+    ];
+    expect(
+      normalizeAdoptedTextRow(
+        adoptedTextRowSchema.parse({
+          id: 'eli/dl/doc/TA-9-2023-0261',
+          identifier: 'TA-9-2023-0261',
+          title_dcterms: { hu },
+        }),
+        'hu',
+        [],
+      ),
+    ).toEqual({
+      document_id: 'TA-9-2023-0261',
+      identifier: 'TA-9-2023-0261',
+      source_url: 'https://data.europarl.europa.eu/eli/dl/doc/TA-9-2023-0261',
+      title: { value: hu[0], language: 'hu', values: hu },
+      procedure_ids: [],
+    });
+  });
+});
+
+describe('MEP declaration rows and relations', () => {
+  const row = (extra: Record<string, unknown> = {}) =>
+    declarationRowSchema.parse({ ...declarationRow, ...extra });
+  const participation = (person: unknown, capacity?: Record<string, unknown>) => ({
+    id: 'eli/dl/participation/P',
+    had_participant_person: person,
+    ...(capacity && { inCapacityOf: { id: 'eli/dl/capacity/C', ...capacity } }),
+  });
+  it('caps a declaration page at 100 whole items inside the search window', () => {
+    expect(pageWindow({ limit: 1000 }, 'declarations')).toEqual({ offset: 0, limit: 100 });
+    expect(pageWindow({ offset: 9950, limit: 1000 }, 'declarations', 10_000)).toEqual({
+      offset: 9950,
+      limit: 50,
+    });
+  });
+  it('keeps the requested-language title, date, procedures, the declaration and its capacity', () => {
+    expect(normalizeDeclarationRow(row(), 'en', [])).toEqual({
+      document_id: 'DCI-124884-2023-11-17-324583',
+      identifier: 'DCI-124884-2023-11-17-324583',
+      label: 'DCI-124884-2023-11-17-324583',
+      work_type: 'def/ep-document-types/MEMBER_DECLARATION_INTEREST_CONFLICT',
+      source_url: 'https://data.europarl.europa.eu/eli/dl/doc/DCI-124884-2023-11-17-324583',
+      title: { value: declarationRow.title_dcterms.en, language: 'en' },
+      date: '2023-11-17',
+      procedure_ids: ['2021-0106'],
+      awareness_of_conflict: false,
+      capacities: [
+        {
+          person_ids: ['124884'],
+          role: 'def/ep-roles/RAPPORTEUR_SHADOW_REPORT',
+          organization_id: 'org/IMCO',
+          procedure_id: '2021-0106',
+          activity_label: '2021/0106(COD)  Artificial Intelligence Act',
+          political_group_id: 'org/ECR',
+        },
+      ],
+    });
+    // No fallback: the list returns only the requested language.
+    expect(normalizeDeclarationRow(row(), 'fr', [])).not.toHaveProperty('title');
+  });
+  it('links superseded and superseding versions and leaves unpublished relations absent', () => {
+    const [replaced, replacing] = supersededDeclarationRows.map((raw) =>
+      normalizeDeclarationRow(declarationRowSchema.parse(raw), 'en', []),
+    );
+    expect(replaced).toMatchObject({
+      procedure_ids: [],
+      superseded_by_ids: ['DCI-124867-2026-03-12-540997'],
+      capacities: [
+        {
+          person_ids: ['124867'],
+          role: 'def/ep-roles/MEMBER_DELEGATION_OFFICIAL',
+          organization_id: 'org/JURI',
+          political_group_id: 'org/S-D',
+        },
+      ],
+    });
+    expect(replaced).not.toHaveProperty('previous_version_ids');
+    expect(replaced?.capacities?.[0]).not.toHaveProperty('procedure_id');
+    expect(replaced?.capacities?.[0]).not.toHaveProperty('activity_label');
+    expect(replacing).toMatchObject({ previous_version_ids: ['DCI-124867-2026-02-27-538194'] });
+    expect(replacing).not.toHaveProperty('superseded_by_ids');
+    const sparse = normalizeDeclarationRow(
+      declarationRowSchema.parse({ id: 'eli/dl/doc/DCI-1-2025-01-01-1' }),
+      'en',
+      [],
+    );
+    expect(sparse).toEqual({
+      document_id: 'DCI-1-2025-01-01-1',
+      source_url: 'https://data.europarl.europa.eu/eli/dl/doc/DCI-1-2025-01-01-1',
+      procedure_ids: [],
+    });
+  });
+  it('reads every participation and person in published order, a capacity of another noun naming no procedure', () => {
+    const relations = declarationRelations(
+      declarationFamilySchema.parse({
+        id: 'eli/dl/doc/DCI-1-2025-01-01-1',
+        workHadParticipation: [
+          participation(['person/2', 'https://data.europarl.europa.eu/person/1'], {
+            capacityRole: 'def/ep-roles/RAPPORTEUR',
+            capacityActivity: 'eli/dl/event/MTG-1',
+          }),
+          participation({ id: 'person/3' }),
+        ],
+        previousVersion: [{ id: 'eli/dl/doc/DCI-1-2024-01-01-1' }, 'eli/dl/doc/DCI-1-2023-01-01-1'],
+      }),
+      'DCI-1-2025-01-01-1',
+      [],
+    );
+    expect(relations).toEqual({
+      capacities: [
+        { person_ids: ['2', '1'], role: 'def/ep-roles/RAPPORTEUR' },
+        { person_ids: ['3'] },
+      ],
+      previous_version_ids: ['DCI-1-2024-01-01-1', 'DCI-1-2023-01-01-1'],
+    });
+    expect(
+      declarationRelations(
+        declarationFamilySchema.parse({
+          id: 'eli/dl/doc/DCI-1-2025-01-01-1',
+          workHadParticipation: participation('person/4'),
+        }),
+        'DCI-1-2025-01-01-1',
+        [],
+      ),
+    ).toEqual({ capacities: [{ person_ids: ['4'] }] });
+  });
+  it('fails a declaration whose participation carries a malformed person as a serialization failure', () => {
+    expect(() =>
+      declarationRelations(
+        declarationFamilySchema.parse({
+          id: 'eli/dl/doc/DCI-1',
+          workHadParticipation: [participation(['person/12x'])],
+        }),
+        'DCI-1',
+        [],
+      ),
+    ).toThrow(
+      expect.objectContaining({
+        code: JsonRpcErrorCode.SerializationError,
+        message: expect.stringContaining('malformed person identifier'),
+      }),
+    );
+  });
+  it('adds what a declaration declares and its family relations to document detail, and nothing to other works', () => {
+    const generic = documentSchema.parse(awareDeclarationRecord);
+    const family = declarationRelations(
+      declarationFamilySchema.parse(awareDeclarationFamilyRecord),
+      'DCI-124760-2024-12-17-425114',
+      [],
+    );
+    expect(normalizeDocument(generic, 'en', [], family)).toMatchObject({
+      document_id: 'DCI-124760-2024-12-17-425114',
+      procedure_ids: ['2021-0387'],
+      awareness_of_conflict: true,
+      conflict_description: awareDeclarationRecord.conflictDescription,
+      capacities: [
+        {
+          person_ids: ['124760'],
+          role: 'def/ep-roles/RAPPORTEUR',
+          organization_id: 'org/LIBE',
+          procedure_id: '2021-0387',
+          political_group_id: 'org/ECR',
+        },
+      ],
+    });
+    const other = normalizeDocument(documentSchema.parse(documentRecord), 'en', [], {
+      procedure_ids: ['2020-0001'],
+    });
+    for (const key of [
+      'awareness_of_conflict',
+      'conflict_description',
+      'capacities',
+      'previous_version_ids',
+      'superseded_by_ids',
+    ])
+      expect(other).not.toHaveProperty(key);
+  });
+});
+
+describe('procedure cross-references', () => {
+  const procedure = 'eli/dl/proc/2021-0106';
+  /** A Parliament-side serialization failure naming the malformed value and no parameter. */
+  const malformed = (noun: string, value: string) =>
+    expect.objectContaining({
+      code: JsonRpcErrorCode.SerializationError,
+      message: `Parliament returned a record with a malformed ${noun} identifier ${JSON.stringify(value)}.`,
+      data: { retryable: false },
+    });
+  const capacityRow = (person: string) =>
+    declarationRowSchema.parse({
+      ...declarationRow,
+      workHadParticipation: [
+        { ...declarationRow.workHadParticipation[0], had_participant_person: [person] },
+      ],
+    });
+  it.each([
+    [
+      'an adopted-text row identifier',
+      () =>
+        normalizeAdoptedTextRow(
+          adoptedTextRowSchema.parse({
+            id: 'eli/dl/doc/TA-1',
+            identifier: 'TA 1',
+            inverse_created_a_realization_of: procedure,
+          }),
+          'en',
+          [],
+        ),
+      'document',
+      'TA 1',
+    ],
+    [
+      'a declaration row identifier',
+      () =>
+        normalizeDeclarationRow(
+          declarationRowSchema.parse({ ...declarationRow, identifier: 'DCI 1' }),
+          'en',
+          [],
+        ),
+      'document',
+      'DCI 1',
+    ],
+    [
+      'a declaration capacity person',
+      () => normalizeDeclarationRow(capacityRow('person/12x'), 'en', []),
+      'person',
+      'person/12x',
+    ],
+    [
+      'a declaration version link',
+      () =>
+        declarationRelations(
+          declarationFamilySchema.parse({
+            id: 'eli/dl/doc/DCI-1',
+            workHadParticipation: {
+              had_participant_person: 'person/1',
+              inCapacityOf: { capacityActivity: procedure },
+            },
+            previousVersion: 'eli/dl/doc/DCI 0',
+          }),
+          'DCI-1',
+          [],
+        ),
+      'document',
+      'eli/dl/doc/DCI 0',
+    ],
+    [
+      'a document detail identity',
+      () =>
+        normalizeDocument(
+          documentSchema.parse({ id: 'eli/dl/doc/TA 1', refers_to: procedure }),
+          'en',
+          [],
+        ),
+      'document',
+      'eli/dl/doc/TA 1',
+    ],
+    [
+      'a document detail parent',
+      () =>
+        normalizeDocument(
+          documentSchema.parse({
+            id: 'eli/dl/doc/TA-1',
+            is_about: procedure,
+            is_part_of: 'eli/dl/doc/TA 0',
+          }),
+          'en',
+          [],
+        ),
+      'document',
+      'eli/dl/doc/TA 0',
+    ],
+    [
+      'a vote item identity',
+      () =>
+        normalizeVoteItem(
+          voteItemSchema.parse({ id: 'eli/dl/event/VOT 1', inverse_consists_of: procedure }),
+          'en',
+          [],
+        ),
+      'activity',
+      'eli/dl/event/VOT 1',
+    ],
+    [
+      'a vote item report',
+      () =>
+        normalizeVoteItem(
+          voteItemSchema.parse({
+            id: 'eli/dl/event/VOT-1',
+            inverse_consists_of: { id: procedure, consists_of: 'eli/dl/event/VOT-1' },
+            based_on_a_realization_of: 'eli/dl/doc/A 1',
+          }),
+          'en',
+          [],
+        ),
+      'document',
+      'eli/dl/doc/A 1',
+    ],
+    [
+      'an agenda item identity',
+      () =>
+        normalizeAgendaItem(
+          agendaRecordSchema.parse({
+            id: 'eli/dl/event/OJ 1',
+            inverse_was_scheduled_in: procedure,
+          }),
+          undefined,
+          'en',
+          [],
+        ),
+      'activity',
+      'eli/dl/event/OJ 1',
+    ],
+    [
+      'an agenda item document',
+      () =>
+        normalizeAgendaItem(
+          agendaRecordSchema.parse({
+            id: 'eli/dl/event/OJ-1',
+            inverse_was_scheduled_in: procedure,
+            based_on_a_realization_of: ['eli/dl/doc/A-1', 'eli/dl/doc/A 2'],
+          }),
+          undefined,
+          'en',
+          [],
+        ),
+      'document',
+      'eli/dl/doc/A 2',
+    ],
+    [
+      'a procedure record identity',
+      () => normalizeProcedure(procedureSchema.parse({ id: 'eli/dl/proc/2023-02735' }), 'en', []),
+      'procedure',
+      'eli/dl/proc/2023-02735',
+    ],
+  ] as const)(
+    'fails %s as a Parliament serialization failure on a path that reads procedures',
+    (_label, run, noun, value) => {
+      expect(run).toThrow(malformed(noun, value));
+    },
+  );
+
+  /** The one notice a call carries for its skipped references, entries in first-seen order. */
+  const skipped = (...entries: string[]) =>
+    `Parliament publishes procedure references that are not procedure identifiers (YYYY-NNNN), so no procedure ID is returned for them: ${entries.join('; ')}.`;
+  it.each<[string, Parameters<typeof procedureIds>[0], string, string[], string]>([
+    [
+      'a number padded to five digits',
+      ['eli/dl/proc/2021-0106', 'eli/dl/proc/2023-02735'],
+      'DCI-197467-2024-03-21-357272',
+      ['2021-0106'],
+      '"eli/dl/proc/2023-02735" on DCI-197467-2024-03-21-357272',
+    ],
+    [
+      'a number cut to two digits',
+      'eli/dl/proc/2024-52',
+      'DCI-197773-2024-10-02-402958',
+      [],
+      '"eli/dl/proc/2024-52" on DCI-197773-2024-10-02-402958',
+    ],
+    [
+      'two identifiers run together',
+      [{ id: 'eli/dl/proc/2024-00712024-0086' }, 'eli/dl/proc/2024-0086'],
+      'DCI-124691-2025-01-10-428906',
+      ['2024-0086'],
+      '"eli/dl/proc/2024-00712024-0086" on DCI-124691-2025-01-10-428906',
+    ],
+    [
+      'a padded number beside another noun',
+      ['eli/dl/proc/2023-02019', 'eli/dl/event/MTG-PL-2024-02-19'],
+      'DCI-28288-2024-02-19-348429',
+      [],
+      '"eli/dl/proc/2023-02019" on DCI-28288-2024-02-19-348429',
+    ],
+    [
+      'the public URI form',
+      [
+        'https://data.europarl.europa.eu/eli/dl/proc/2023-02735',
+        'https://data.europarl.europa.eu/eli/dl/proc/2016-0224B',
+      ],
+      'TA-9-2024-0138',
+      ['2016-0224B'],
+      '"https://data.europarl.europa.eu/eli/dl/proc/2023-02735" on TA-9-2024-0138',
+    ],
+    [
+      'a lowercase procedure type',
+      'eli/dl/proc/2021-0106(cod)',
+      'MTG-PL-2024-03-13-VOT-ITM-941757',
+      [],
+      '"eli/dl/proc/2021-0106(cod)" on MTG-PL-2024-03-13-VOT-ITM-941757',
+    ],
+    [
+      'the prefix alone',
+      ['eli/dl/proc/', 'eli/dl/proc/2026-2946'],
+      'MTG-PL-2026-11-24-OJ-ITM-D-76',
+      ['2026-2946'],
+      '"eli/dl/proc/" on MTG-PL-2026-11-24-OJ-ITM-D-76',
+    ],
+  ])(
+    'leaves out %s, keeps the other procedures in published order, and names it in one notice',
+    (_label, relation, record, ids, entry) => {
+      const notices: string[] = [];
+      expect(procedureIds(relation, record, notices)).toEqual(ids);
+      expect(notices).toEqual([skipped(entry)]);
+    },
+  );
+  it('carries no notice when every procedure entry parses or the relation has none', () => {
+    const notices: string[] = [];
+    for (const relation of [undefined, [], 'eli/dl/event/MTG-1', ['eli/dl/proc/2023-2735']])
+      procedureIds(relation, 'DCI-1', notices);
+    expect(notices).toEqual([]);
+  });
+  it('keeps one notice per call, naming each record and value once, after the notices before it', () => {
+    const notices = ['Requested language hr unavailable; returned published en text.'];
+    const run = 'eli/dl/proc/2024-00712024-0086';
+    const short = 'eli/dl/proc/2024-52';
+    // A value holding the delimiters is still one entry, and a later pair it quotes is not hidden.
+    const quoting = `eli/dl/proc/x; "${short}" on DCI-124691-2025-01-10-428906`;
+    procedureIds([run, short], 'DCI-124691-2025-01-10-428906', notices);
+    procedureIds(short, 'DCI-124691-2025-01-10-428906', notices);
+    procedureIds(short, 'DCI-197773-2024-10-02-402958', notices);
+    procedureIds([quoting, short], 'DCI-197773-2024-10-02-402958', notices);
+    procedureIds(quoting, 'DCI-197773-2024-10-02-402958', notices);
+    expect(notices).toEqual([
+      'Requested language hr unavailable; returned published en text.',
+      'Parliament publishes procedure references that are not procedure identifiers (YYYY-NNNN), so no procedure ID is returned for them: "eli/dl/proc/2024-00712024-0086" on DCI-124691-2025-01-10-428906; "eli/dl/proc/2024-52" on DCI-124691-2025-01-10-428906; "eli/dl/proc/2024-52" on DCI-197773-2024-10-02-402958; "eli/dl/proc/x; \\"eli/dl/proc/2024-52\\" on DCI-124691-2025-01-10-428906" on DCI-197773-2024-10-02-402958.',
+    ]);
+    // A record ID that an earlier record ID extends (D-1 after D-12) still gets its own entry.
+    procedureIds(short, 'MTG-PL-2026-11-24-OJ-ITM-D-12', notices);
+    procedureIds(short, 'MTG-PL-2026-11-24-OJ-ITM-D-1', notices);
+    expect(notices).toEqual([
+      'Requested language hr unavailable; returned published en text.',
+      'Parliament publishes procedure references that are not procedure identifiers (YYYY-NNNN), so no procedure ID is returned for them: "eli/dl/proc/2024-00712024-0086" on DCI-124691-2025-01-10-428906; "eli/dl/proc/2024-52" on DCI-124691-2025-01-10-428906; "eli/dl/proc/2024-52" on DCI-197773-2024-10-02-402958; "eli/dl/proc/x; \\"eli/dl/proc/2024-52\\" on DCI-124691-2025-01-10-428906" on DCI-197773-2024-10-02-402958; "eli/dl/proc/2024-52" on MTG-PL-2026-11-24-OJ-ITM-D-12; "eli/dl/proc/2024-52" on MTG-PL-2026-11-24-OJ-ITM-D-1.',
+    ]);
+  });
+
+  const dci = 'DCI-197467-2024-03-21-357272';
+  const dciEntry = `"eli/dl/proc/2023-02735" on ${dci}`;
+  const dciCapacity = {
+    person_ids: ['197467'],
+    role: 'def/ep-roles/RAPPORTEUR_SHADOW_REPORT',
+    organization_id: 'org/INTA',
+    activity_label:
+      'Terugtrekking van de Unie uit het Verdrag inzake het energiehandvest 2023/02735(NLE)',
+    political_group_id: 'org/ECR',
+  };
+  it('leaves the reference out of a declaration row and its capacity with one notice for both', () => {
+    const notices: string[] = [];
+    expect(
+      normalizeDeclarationRow(
+        declarationRowSchema.parse(malformedProcedureDeclaration),
+        'en',
+        notices,
+      ),
+    ).toEqual({
+      document_id: dci,
+      identifier: dci,
+      label: dci,
+      work_type: 'def/ep-document-types/MEMBER_DECLARATION_INTEREST_CONFLICT',
+      source_url: `https://data.europarl.europa.eu/eli/dl/doc/${dci}`,
+      title: { value: malformedProcedureDeclaration.title_dcterms.en, language: 'en' },
+      date: '2024-03-21',
+      procedure_ids: [],
+      awareness_of_conflict: false,
+      capacities: [dciCapacity],
+    });
+    expect(notices).toEqual([skipped(dciEntry)]);
+  });
+  it('names both values of a record whose participations publish two malformed references', () => {
+    const [participation] = malformedProcedureDeclaration.workHadParticipation;
+    const notices: string[] = [];
+    const row = normalizeDeclarationRow(
+      declarationRowSchema.parse({
+        ...malformedProcedureDeclaration,
+        workHadParticipation: [
+          participation,
+          {
+            ...participation,
+            inCapacityOf: {
+              ...participation?.inCapacityOf,
+              capacityActivity: 'eli/dl/proc/2024-52',
+            },
+          },
+          {
+            ...participation,
+            inCapacityOf: {
+              ...participation?.inCapacityOf,
+              capacityActivity: 'eli/dl/proc/2024-0086',
+            },
+          },
+        ],
+      }),
+      'en',
+      notices,
+    );
+    expect(row.capacities?.map((capacity) => capacity.procedure_id)).toEqual([
+      undefined,
+      undefined,
+      '2024-0086',
+    ]);
+    expect(notices).toEqual([skipped(dciEntry, `"eli/dl/proc/2024-52" on ${dci}`)]);
+  });
+  it('leaves the reference out of a declaration get read from its generic and family records', () => {
+    const notices: string[] = [];
+    const family = declarationRelations(
+      declarationFamilySchema.parse(malformedProcedureDeclaration),
+      dci,
+      notices,
+    );
+    expect(family).toEqual({ capacities: [dciCapacity] });
+    expect(
+      normalizeDocument(
+        documentSchema.parse(malformedProcedureDeclarationRecord),
+        'en',
+        notices,
+        family,
+      ),
+    ).toMatchObject({ document_id: dci, procedure_ids: [], capacities: [dciCapacity] });
+    expect(notices).toEqual([
+      skipped(dciEntry),
+      'Requested file language en unavailable; returned published nl files.',
+    ]);
+  });
+  it.each([
+    [
+      'an adopted-text row',
+      (notices: string[]) =>
+        normalizeAdoptedTextRow(
+          adoptedTextRowSchema.parse({
+            id: 'eli/dl/doc/TA-9-2024-0138',
+            identifier: 'TA-9-2024-0138',
+            inverse_created_a_realization_of: [
+              'eli/dl/event/MTG-PL-2024-03-13-PVCRE-ITM-8-2',
+              'eli/dl/proc/2024-27',
+              { id: 'eli/dl/proc/2021-0106' },
+            ],
+          }),
+          'en',
+          notices,
+        ).procedure_ids,
+      ['2021-0106'],
+      '"eli/dl/proc/2024-27" on TA-9-2024-0138',
+    ],
+    [
+      'document detail refers_to and is_about',
+      (notices: string[]) =>
+        normalizeDocument(
+          documentSchema.parse({
+            id: 'eli/dl/doc/A-9-2023-0188',
+            refers_to: ['eli/dl/proc/2023-02019', 'eli/dl/proc/2021-0106'],
+            is_about: { id: 'eli/dl/proc/2024-52' },
+          }),
+          'en',
+          notices,
+          { procedure_ids: ['2020-0001'] },
+        ).procedure_ids,
+      ['2021-0106', '2020-0001'],
+      '"eli/dl/proc/2023-02019" on A-9-2023-0188; "eli/dl/proc/2024-52" on A-9-2023-0188',
+    ],
+    [
+      'a vote item',
+      (notices: string[]) =>
+        normalizeVoteItem(
+          voteItemSchema.parse({
+            id: 'eli/dl/event/MTG-PL-2024-03-13-VOT-ITM-941757',
+            activity_id: 'MTG-PL-2024-03-13-VOT-ITM-941757',
+            inverse_consists_of: [
+              'eli/dl/event/MTG-PL-2024-03-13',
+              {
+                id: 'eli/dl/proc/2024-00712024-0086',
+                consists_of: 'eli/dl/event/MTG-PL-2024-03-13-VOT-ITM-941757',
+              },
+            ],
+          }),
+          'en',
+          notices,
+        ).procedure_ids,
+      [],
+      '"eli/dl/proc/2024-00712024-0086" on MTG-PL-2024-03-13-VOT-ITM-941757',
+    ],
+    [
+      'an agenda item',
+      (notices: string[]) =>
+        normalizeAgendaItem(
+          agendaRecordSchema.parse({
+            id: 'eli/dl/event/MTG-PL-2026-11-24-OJ-ITM-D-76',
+            inverse_was_scheduled_in: ['eli/dl/proc/2026-2946', 'eli/dl/proc/2026-294'],
+          }),
+          undefined,
+          'en',
+          notices,
+        ).procedure_ids,
+      ['2026-2946'],
+      '"eli/dl/proc/2026-294" on MTG-PL-2026-11-24-OJ-ITM-D-76',
+    ],
+  ] as const)(
+    'leaves a malformed reference out of %s with the call notice',
+    (_label, run, ids, entries) => {
+      const notices: string[] = [];
+      expect(run(notices)).toEqual(ids);
+      expect(notices).toEqual([skipped(entries)]);
+    },
+  );
 });
 
 /** Live speech fragments (2026-11), long paragraphs trimmed; element and attribute shapes kept. */

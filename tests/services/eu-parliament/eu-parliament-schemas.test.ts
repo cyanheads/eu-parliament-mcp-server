@@ -2,8 +2,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   adoptedTextRowSchema,
+  agendaRecordSchema,
   bodySchema,
   decisionSchema,
+  declarationFamilySchema,
+  declarationRowSchema,
   documentSchema,
   mepSchema,
   procedureSchema,
@@ -12,11 +15,18 @@ import {
   speechSchema,
 } from '../../../src/services/eu-parliament/eu-parliament-schemas.js';
 import {
+  awareDeclarationFamilyRecord,
+  awareDeclarationRecord,
   decisionRecord,
+  declarationRow,
   documentRecord,
   mepRecord,
+  multiValuedFilesRecord,
+  multiValuedTitleRecord,
+  nullGroupOn20200129,
   questionRecord,
   rosterRecords,
+  supersededDeclarationRows,
 } from '../../helpers/eu-parliament-fixtures.js';
 
 describe('Parliament noun schemas', () => {
@@ -77,9 +87,135 @@ describe('Parliament noun schemas', () => {
         },
       ],
     };
-    expect(documentSchema.safeParse(titled).success).toBe(false);
+    expect(documentSchema.safeParse(titled).success).toBe(true);
     const { is_realized_by: _expressions, ...kept } = titled;
     expect(adoptedTextRowSchema.parse(titled)).toEqual(kept);
+  });
+  it('accepts several published values for a file date or size and for a same-language document title, verbatim', () => {
+    expect(
+      documentSchema.parse(multiValuedFilesRecord).is_realized_by?.[0]?.is_embodied_by,
+    ).toEqual(
+      multiValuedFilesRecord.is_realized_by[0]?.is_embodied_by.map(
+        ({ id, is_exemplified_by, media_type, issued, byteSize }) => ({
+          id,
+          is_exemplified_by,
+          ...(media_type && { media_type }),
+          issued,
+          byteSize,
+        }),
+      ),
+    );
+    const titles = documentSchema.parse(multiValuedTitleRecord);
+    expect(titles.title_dcterms).toEqual(multiValuedTitleRecord.title_dcterms);
+    expect(titles.is_realized_by?.[0]?.title).toEqual(
+      multiValuedTitleRecord.is_realized_by[0]?.title,
+    );
+    const alternative = ['Question E-900001/2023', 'Question E-900001/2023 rev.'];
+    const question = questionSchema.parse({
+      id: 'eli/dl/doc/E-9-2023-900001',
+      is_realized_by: [{ id: 'e', title_alternative: { en: alternative } }],
+      inverse_answers_to: [
+        {
+          id: 'eli/dl/doc/E-9-2023-900001-ASW',
+          is_realized_by: [
+            { id: 'a', is_embodied_by: [{ id: 'm', issued: ['2023-12-01', '2023-11-01'] }] },
+          ],
+        },
+      ],
+    });
+    expect(question.is_realized_by?.[0]?.title_alternative).toEqual({ en: alternative });
+    expect(question.inverse_answers_to?.[0]).toMatchObject({
+      is_realized_by: [{ is_embodied_by: [{ issued: ['2023-12-01', '2023-11-01'] }] }],
+    });
+    const hu = ['Kiépítése ', 'Kiépítése'];
+    expect(
+      adoptedTextRowSchema.parse({ id: 'eli/dl/doc/TA-9-2023-0261', title_dcterms: { hu } }),
+    ).toEqual({ id: 'eli/dl/doc/TA-9-2023-0261', title_dcterms: { hu } });
+  });
+  it.each([
+    [
+      'an empty issue-date array',
+      { is_realized_by: [{ id: 'e', is_embodied_by: [{ id: 'm', issued: [] }] }] },
+    ],
+    [
+      'a non-string size',
+      { is_realized_by: [{ id: 'e', is_embodied_by: [{ id: 'm', byteSize: [1, 2] }] }] },
+    ],
+    ['an empty title array', { title_dcterms: { en: [] } }],
+    ['a nested title array', { is_realized_by: [{ id: 'e', title: { en: [['a', 'b']] } }] }],
+  ])('rejects %s on a document record', (_, extra) => {
+    expect(documentSchema.safeParse({ id: 'eli/dl/doc/X', ...extra }).success).toBe(false);
+  });
+  describe('MEP declaration records', () => {
+    it('reads a declaration list row for what was declared and its relations, never its expressions', () => {
+      expect(documentSchema.safeParse(declarationRow).success).toBe(false);
+      expect(declarationRowSchema.parse(declarationRow)).toEqual({
+        id: declarationRow.id,
+        identifier: declarationRow.identifier,
+        label: declarationRow.label,
+        work_type: declarationRow.work_type,
+        title_dcterms: declarationRow.title_dcterms,
+        document_date: '2023-11-17',
+        refers_to: ['eli/dl/proc/2021-0106'],
+        awarenessOfConflict: false,
+        workHadParticipation: [
+          {
+            had_participant_person: ['person/124884'],
+            inCapacityOf: {
+              capacityRole: 'def/ep-roles/RAPPORTEUR_SHADOW_REPORT',
+              capacityOrganization: 'org/IMCO',
+              capacityActivity: 'eli/dl/proc/2021-0106',
+              capacityActivityLabel: '2021/0106(COD)  Artificial Intelligence Act',
+              politicalGroup: 'org/ECR',
+            },
+          },
+        ],
+      });
+      const [replaced, replacing] = supersededDeclarationRows.map((row) =>
+        declarationRowSchema.parse(row),
+      );
+      expect(replaced?.inverse_previousVersion).toEqual([
+        'eli/dl/doc/DCI-124867-2026-03-12-540997',
+      ]);
+      expect(replacing?.previousVersion).toEqual(['eli/dl/doc/DCI-124867-2026-02-27-538194']);
+    });
+    it('keeps the declaration on the generic record and the participation on the declaration record', () => {
+      const generic = documentSchema.parse(awareDeclarationRecord);
+      expect(generic).toMatchObject({
+        awarenessOfConflict: true,
+        conflictDescription: awareDeclarationRecord.conflictDescription,
+      });
+      expect(generic).not.toHaveProperty('workHadParticipation');
+      expect(declarationFamilySchema.parse(awareDeclarationFamilyRecord)).toEqual({
+        id: awareDeclarationRecord.id,
+        workHadParticipation: [
+          {
+            had_participant_person: ['person/124760'],
+            inCapacityOf: {
+              capacityRole: 'def/ep-roles/RAPPORTEUR',
+              capacityOrganization: 'org/LIBE',
+              capacityActivity: 'eli/dl/proc/2021-0387',
+              capacityActivityLabel:
+                awareDeclarationFamilyRecord.workHadParticipation[0]?.inCapacityOf
+                  .capacityActivityLabel,
+              politicalGroup: 'org/ECR',
+            },
+          },
+        ],
+      });
+      // The generic record's bare participation ID is not a declaration participation.
+      expect(declarationFamilySchema.safeParse(awareDeclarationRecord).success).toBe(false);
+    });
+  });
+  it('keeps one value per language on records outside documents', () => {
+    expect(
+      procedureSchema.safeParse({ id: 'eli/dl/proc/2021-0106', process_title: { en: ['a', 'b'] } })
+        .success,
+    ).toBe(false);
+    expect(
+      decisionSchema.safeParse({ id: decisionRecord.id, activity_label: { en: ['a', 'b'] } })
+        .success,
+    ).toBe(false);
   });
   it('preserves sparse historical roster identities without inventing context', () => {
     expect(mepSchema.parse(rosterRecords[1])).toEqual({
@@ -90,6 +226,14 @@ describe('Parliament noun schemas', () => {
       familyName: 'Demo',
     });
   });
+  it.each(['api:political-group', 'api:country-of-representation'] as const)(
+    'reads a roster %s published as null as absent',
+    (key) => {
+      const parsed = mepSchema.parse({ ...nullGroupOn20200129, [key]: null });
+      expect(parsed[key]).toBeUndefined();
+      expect(parsed).toMatchObject({ identifier: '185974', label: 'Jordi SOLÉ' });
+    },
+  );
 
   it('preserves camelCase membership intervals', () => {
     expect(mepSchema.parse(mepRecord).hasMembership).toEqual([
@@ -205,6 +349,30 @@ describe('Parliament noun schemas', () => {
         'eli-dl:activity_date': { '@value': 'Monday, 14 January 2019', type: 'xsd:dateTime' },
       }).success,
     ).toBe(false);
+  });
+
+  it('parses an agenda time slot whose activity_end_date is an array, reading no end time', () => {
+    /** Live shape of MTG-PL-2026-11-24-TF-0900 (2026-11-25), trimmed. */
+    const slot = {
+      id: 'eli/dl/event/MTG-PL-2026-11-24-TF-0900',
+      activity_id: 'MTG-PL-2026-11-24-TF-0900',
+      activity_start_date: '2026-11-24T09:00:00+01:00',
+      activity_end_date: ['2026-11-24T10:30:00+01:00', '2026-11-24T11:50:00+01:00'],
+      agendaLabel: { en: 'Debate' },
+      consists_of: ['eli/dl/event/MTG-PL-2026-11-24-OJ-ITM-D-76'],
+      had_activity_type: 'def/ep-activities/MEETING_PART',
+      inverse_was_scheduled_in: ['eli/dl/event/MTG-PL-2026-11-24'],
+    };
+    // The shared activity fields read activity_end_date as one string.
+    expect(sittingSchema.safeParse(slot).success).toBe(false);
+    expect(agendaRecordSchema.parse(slot)).toEqual({
+      id: slot.id,
+      activity_id: slot.activity_id,
+      activity_start_date: slot.activity_start_date,
+      consists_of: slot.consists_of,
+      had_activity_type: slot.had_activity_type,
+      inverse_was_scheduled_in: slot.inverse_was_scheduled_in,
+    });
   });
 
   it('accepts singleton speech participation and sparse source references', () => {

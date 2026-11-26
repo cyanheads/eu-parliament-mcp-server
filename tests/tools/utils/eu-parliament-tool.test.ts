@@ -23,8 +23,8 @@ import { envelopeResponse } from '../../helpers/eu-parliament-fixtures.js';
 
 /**
  * Each tool beside the maximum it advertises with EUPARL_CLAMP_LIMITS=false: the largest page cap
- * among the collections it serves, or a larger strict bound (adopted texts accept their 10000-result
- * search window and answer with their 100-row page).
+ * among the collections it serves, or a larger strict bound (adopted texts and non-keyword speeches
+ * accept their 10000-result search window and answer with the selected mode's acquisition limit).
  */
 const tools = [
   [listProceduresTool, undefined],
@@ -87,7 +87,7 @@ describe('shared limit input', () => {
         minimum: 1,
         multipleOf: 1,
         default: 20,
-        description: expect.stringContaining('Whole items requested; default 20.'),
+        description: expect.stringContaining('Items per page; default 20.'),
       });
     },
   );
@@ -110,18 +110,23 @@ describe('shared limit input', () => {
   it('states what a strict-mode limit returns when a strict bound passes every page cap', () => {
     strictMode();
     expect(advertisedLimit(searchDocumentsTool).description).toBe(
-      "Whole items requested; default 20. Bounded-mode acquisition limits: 1000 documents, 100 adopted texts, or 100 keyword adopted texts. Limits above 10000 are rejected; a smaller limit above the selected mode's acquisition limit normalizes to that limit with a notice. Values above the safe-integer range normalize to 9007199254740991; search windows and bounded modes may narrow further.",
+      "Items per page; default 20. Caps: 1000 documents, 100 adopted texts, 100 keyword adopted texts, or 100 MEP declarations; above 10000 is rejected, and a smaller limit above the mode's cap narrows to it with a notice.",
     );
-    expect(advertisedLimit(searchSpeechesTool).description).toContain(
-      'Limits above 10000 are rejected; smaller mode limits normalize with a notice.',
+    expect(advertisedLimit(searchSpeechesTool).description).toBe(
+      "Items per page; default 20. Caps: 400 speeches, 1000 keyword speeches, or 100 speeches with text; above 10000 is rejected, and a smaller limit above the mode's cap narrows to it with a notice.",
+    );
+    expect(advertisedLimit(listQuestionsTool).description).toBe(
+      'Items per page; default 20. Caps: 1000 questions; above 1000 is rejected.',
     );
   });
   it('distinguishes local modes from verified upstream bounds without Infinity in schemas', () => {
     expect(advertisedLimit(listProceduresTool).description).toContain('1000 procedures');
-    expect(advertisedLimit(listProceduresTool).description).toContain('without an output-size cap');
+    expect(advertisedLimit(listProceduresTool).description).toContain('with no output-size cap');
     expect(advertisedLimit(listReferenceTool).description).toContain('20 organization lookups');
     expect(advertisedLimit(getPlenaryVotesTool).description).toContain('1000 sittings');
-    expect(advertisedLimit(searchSpeechesTool).description).toContain('1000 keyword speeches');
+    expect(advertisedLimit(searchSpeechesTool).description).toContain(
+      'Caps: 400 speeches, 1000 keyword speeches, or 100 speeches with text; a larger limit narrows to the cap with a notice.',
+    );
     for (const { definition } of toolRows)
       expect(JSON.stringify(advertisedLimit(definition))).not.toContain('Infinity');
   });

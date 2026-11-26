@@ -952,6 +952,73 @@ describe('euparl_list_questions addressees, alternative titles and original lang
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
+  it('returns every published title, alternative title, issue date and size of a question and its answer on both surfaces', async () => {
+    const titles = ['Funds for Poland', 'FUNDS FOR POLAND'];
+    const alternatives = [
+      'Question for written answer E-000001/2025 - to the Commission',
+      'Question for written answer E-000001/2025/rev.1 - to the Commission',
+    ];
+    const files = (id: string, issued: string[], byteSize: string | string[]) => ({
+      id: `eli/dl/doc/${id}/en`,
+      title_alternative: id.endsWith('ASW') ? undefined : { en: alternatives },
+      is_embodied_by: [
+        {
+          id: `eli/dl/doc/${id}/en/pdf`,
+          is_exemplified_by: [`distribution/a/${id}_en.pdf`, `distribution/b/${id}_en.pdf`],
+          issued,
+          byteSize,
+        },
+      ],
+    });
+    installToolHttp(() =>
+      envelopeResponse([
+        {
+          ...row('E-10-2025-900001'),
+          title_dcterms: { en: titles },
+          is_realized_by: [files('E-10-2025-900001', ['2025-01-02', '2025-01-01'], '100')],
+          inverse_answers_to: [
+            {
+              ...row('E-10-2025-900001-ASW'),
+              is_realized_by: [
+                files('E-10-2025-900001-ASW', ['2025-03-02', '2025-03-01'], ['200', '300']),
+              ],
+            },
+          ],
+        },
+      ]),
+    );
+    const result = await runToolContract(listQuestionsTool, {
+      mode: 'get',
+      question_id: 'E-10-2025-900001',
+    });
+    const link = (id: string, folder: string, extra: object) => ({
+      url: `https://data.europarl.europa.eu/distribution/${folder}/${id}_en.pdf`,
+      language: 'en',
+      ...extra,
+    });
+    const question = { issued_values: ['2025-01-02', '2025-01-01'], size_bytes: '100' };
+    const answer = {
+      issued_values: ['2025-03-02', '2025-03-01'],
+      size_bytes_values: ['200', '300'],
+    };
+    expect(expectSuccessTwin(result).question).toMatchObject({
+      title: { value: titles[0], language: 'en', values: titles },
+      alternative_title: { value: alternatives[0], language: 'en', values: alternatives },
+      links: ['a', 'b'].map((folder) => link('E-10-2025-900001', folder, question)),
+      answers: [
+        {
+          document_id: 'E-10-2025-900001-ASW',
+          links: ['a', 'b'].map((folder) => link('E-10-2025-900001-ASW', folder, answer)),
+        },
+      ],
+    });
+    const text = contractText(result);
+    expect(text).toContain(
+      `result.question.alternative_title.values[1]: \` ${JSON.stringify(alternatives[1])} \``,
+    );
+    expect(text).toContain('result.question.answers[0].links[1].size_bytes_values[1]: ` "300" `');
+  });
+
   it('keeps list rows to their sparse identity when a row carries roles, languages and alternative titles', async () => {
     installToolHttp(() => envelopeResponse([liveQuestions['E-10-2025-000001']]));
     expect(

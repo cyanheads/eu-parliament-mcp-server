@@ -18,34 +18,34 @@ import { getEuParliamentService } from '@/services/eu-parliament/eu-parliament-s
 
 const procedureSchema = z
   .object({
-    procedure_id: z.string().describe('Canonical procedure identifier for euparl_get_procedure.'),
+    procedure_id: z.string().describe('Procedure ID for euparl_get_procedure.'),
     reference: z.string().optional().describe('Exact published procedure reference, not a title.'),
     process_type: z.string().optional().describe('Published procedure type code or URI.'),
     source_url: z.string().describe('Public procedure source URL.'),
   })
   .strict()
-  .describe('Sparse published procedure catalogue row.');
+  .describe('Procedure catalogue row.');
 
 /** List sparse procedure references without fetching every detail. */
 export const listProceduresTool = tool('euparl_list_procedures', {
   title: 'List parliamentary procedures',
   description:
-    'List procedure references by procedure type. Titles, stages, and participants require euparl_get_procedure with a returned procedure_id. Use euparl_list_reference topic procedure_types for supported process_type codes. No keyword, year, committee, or stage filter is available. With process_type, every procedure of that type is listed in procedure_id order: continue with page.next_offset, passing the returned page.snapshot to detect a changed set. Without process_type, at most 10000 results are reachable and Parliament serves pages from two orderings, so pages can repeat or omit procedures; continue with page.next_offset when present, and set process_type for a complete walk.',
+    'List procedure references by procedure type; euparl_get_procedure reads a returned procedure_id for title, stage and participants. euparl_list_reference topic procedure_types lists process_type codes. There is no keyword, year, committee or stage filter. With process_type, every procedure of that type is listed in procedure_id order; continue with page.next_offset, passing page.snapshot to detect a changed set. Without it, only the first 10000 results are reachable and Parliament serves pages from two orderings, so pages can repeat or omit procedures; set process_type for a complete walk.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
       process_type: optionalString().describe(
-        'Optional procedure-type code from euparl_list_reference topic procedure_types; case-insensitive and whitespace-trimmed.',
+        'Procedure-type code from euparl_list_reference topic procedure_types, any case.',
       ),
       ...pagingInputFields('procedures', 'local_procedures'),
       snapshot: optionalString().describe(
-        'Returned page.snapshot of a process_type listing; optional at every offset, and a set that changed since fails snapshot_changed. Rejected without process_type.',
+        'page.snapshot of a process_type listing; optional at every offset, fails snapshot_changed if the set changed; rejected without process_type.',
       ),
     })
     .strict(),
   output: z
     .object({
-      items: z.array(procedureSchema).describe('Whole sparse procedure records on this page.'),
+      items: z.array(procedureSchema).describe('Procedures on this page.'),
       page: pageSchema,
     })
     .strict(),
@@ -55,7 +55,7 @@ export const listProceduresTool = tool('euparl_list_procedures', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A nonblank procedure type or language is unsupported, or offset is 10000 or more without process_type, past the 10000-result search window.',
+      when: 'A procedure type or language is unsupported, or an offset without process_type reaches the 10000-result search window.',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
       thrownBy: 'service',
@@ -71,7 +71,7 @@ export const listProceduresTool = tool('euparl_list_procedures', {
     {
       reason: 'snapshot_changed',
       code: JsonRpcErrorCode.Conflict,
-      when: 'The complete process_type set changed since the supplied snapshot.',
+      when: 'The process_type set changed since the supplied snapshot.',
       recovery:
         'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.',
       thrownBy: 'service',
@@ -79,7 +79,7 @@ export const listProceduresTool = tool('euparl_list_procedures', {
     {
       reason: 'upstream_paging_stalled',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'A process_type response holds fewer distinct procedures than its reported total, repeats a procedure, or reaches the 10000-result window.',
+      when: 'A process_type read came back incomplete or reached the 10000-result window.',
       recovery:
         'Retry the same euparl tool call later; do not treat an incomplete lookup as a complete result.',
       thrownBy: 'service',
@@ -87,7 +87,7 @@ export const listProceduresTool = tool('euparl_list_procedures', {
     {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Parliament rejects validated request parameters.',
+      when: 'Parliament rejects the validated request.',
       recovery:
         'Call euparl_list_reference for supported filters and identifiers, then retry with a narrower supported request.',
       thrownBy: 'service',
@@ -95,7 +95,7 @@ export const listProceduresTool = tool('euparl_list_procedures', {
     {
       reason: 'upstream_rate_limited',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'Parliament rate limits persist after bounded retries.',
+      when: 'Parliament rate limiting outlasts the retries.',
       retryable: true,
       recovery: 'Wait for the reported retry interval, then repeat the same euparl tool call.',
       thrownBy: 'service',

@@ -193,6 +193,7 @@ eu-parliament-mcp-server/
 │   ├── smoke/
 │   └── tools/
 │       ├── utils/
+│       │   ├── description-budget.test.ts
 │       │   └── eu-parliament-tool.test.ts
 │       ├── get-mep.tool.test.ts
 │       ├── get-plenary-votes.tool.test.ts

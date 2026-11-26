@@ -60,12 +60,12 @@ The upstream API is keyless, with no base-URL override. `src/config/server-confi
 
 ### Domain invariants
 
-- Only adopted texts and speeches accept keyword search. Speech search accepts terms 9 and 10, defaulting to 10; document and question detail returns metadata and file references, not extracted bodies. Speech text comes only from `include_text`, in the requested language with no fallback.
+- Only adopted texts and speeches accept keyword search, and MEP declarations a title search. Speech search accepts terms 9 and 10, defaulting to 10; document and question detail returns metadata and file references, not extracted bodies. Speech text comes only from `include_text`, in the requested language with no fallback.
 - Page whole items with `page.next_offset`; local collections require the returned `snapshot` above offset zero, except `process_type` procedure listings, where it is optional. Restart at zero without a snapshot after `snapshot_changed`.
 - Parliament serves each `/procedures` list request from one of two orderings, so upstream offsets repeat and skip rows; a `process_type` set is acquired whole in one request and sorted by `procedure_id`.
 - Current, explicit-term, and `mandate_date` rosters are acquired completely before filtering names. Voter name resolution needs `roster_term` and never supplies historical affiliations.
 - Preserve missing fields, language provenance, recorded versus intended voters, and absent versus published-empty voter arrays. Voter entries that name no person (`person/` with no identifier, on some 2019 decisions) are left out of `voters`, `voter_counts` and `mep_position` with a notice; the published tallies stay.
-- Classify by where a value came from: a malformed identifier the caller supplied is `invalid_filter`, one inside a Parliament record is a serialization error. Every `invalid_filter` names the parameter, quotes the value, lists the accepted codes or forms, and carries its own hint.
+- Classify by where a value came from: a malformed identifier the caller supplied is `invalid_filter`, one inside a Parliament record is a serialization error, except a procedure cross-reference, which is left out of `procedure_ids` with a notice naming it and its record. Every `invalid_filter` names the parameter, quotes the value, lists the accepted codes or forms, and carries its own hint.
 - Keep source attribution to European Parliament Open Data, CC BY 4.0, and disclose identifier/structure normalization.
 
 ---

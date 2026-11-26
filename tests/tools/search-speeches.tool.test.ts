@@ -1,7 +1,8 @@
 /** @fileoverview Speech metadata and text contracts and followable source-document chains. */
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { describe, expect, it, onTestFinished, vi } from 'vitest';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { initServerConfig } from '../../src/config/server-config.js';
 import { searchDocumentsTool } from '../../src/mcp-server/tools/definitions/search-documents.tool.js';
 import { searchSpeechesTool } from '../../src/mcp-server/tools/definitions/search-speeches.tool.js';
 import {
@@ -981,5 +982,129 @@ describe('euparl_search_speeches include_text', () => {
     expect(past.notice).toBe(
       'The page at offset 300 returned no speeches. Restart at offset 0 or return to the previous page.',
     );
+  });
+});
+
+describe('euparl_search_speeches acquisition bound', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    initServerConfig();
+  });
+  function strictMode(): void {
+    vi.stubEnv('EUPARL_CLAMP_LIMITS', 'false');
+    initServerConfig();
+  }
+  /** A term of `size` speeches sliced by the requested offset and limit, as Parliament serves it. */
+  function installTerm(size = 3000) {
+    const ids = Array.from({ length: size }, (_, i) => `S-${i}`);
+    const fetcher = installToolHttp((url) => {
+      const offset = Number(url.searchParams.get('offset'));
+      return Response.json({
+        data: ids
+          .slice(offset, offset + Number(url.searchParams.get('limit')))
+          .map((id) => ({ id: `eli/dl/event/${id}` })),
+        meta: { total: size },
+      });
+    });
+    const sent = () =>
+      fetcher.mock.calls.map(([url]) => {
+        const query = new URL(String(url)).searchParams;
+        return [query.get('offset'), query.get('limit'), query.get('parliamentary-term')];
+      });
+    return { ids, sent };
+  }
+
+  it.each([
+    { mode: 'default', limit: 3000 },
+    { mode: 'default', limit: 10001 },
+    { mode: 'strict', limit: 3000 },
+    { mode: 'strict', limit: 10000 },
+  ])(
+    'answers limit $limit ($mode) with 400 rows, the notice and next_offset on both surfaces from four requests',
+    async ({ mode, limit }) => {
+      if (mode === 'strict') strictMode();
+      const { sent } = installTerm();
+      const result = await runToolContract(searchSpeechesTool, { term: 10, limit });
+      const data = expectSuccessTwin(result);
+      const notice =
+        'Requested limit normalized to the effective maximum of 400 speeches. Continue with offset 400.';
+      expect(data.items).toHaveLength(400);
+      expect(data.page).toEqual({
+        offset: 0,
+        limit: 400,
+        returned: 400,
+        has_more: true,
+        next_offset: 400,
+      });
+      expect(data).toMatchObject({
+        truncated: true,
+        shown: 400,
+        cap: 400,
+        totalCount: 3000,
+        notice,
+      });
+      const text = contractText(result);
+      expect(text).toContain(notice);
+      expect(text).toContain('result.page.next_offset: 400');
+      expect(text).toContain('result.items[399].speech_id: ` "S-399" `');
+      expect(text).not.toContain('result.items[400].');
+      expect(sent()).toEqual([
+        ['0', '100', '10'],
+        ['100', '100', '10'],
+        ['200', '100', '10'],
+        ['300', '100', '10'],
+      ]);
+    },
+  );
+  it('reads five aligned pages for an unaligned offset and returns 400 rows from the 151st', async () => {
+    const { ids, sent } = installTerm();
+    const data = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, { term: 9, offset: 150, limit: 5000 }),
+    );
+    expect((data.items as { speech_id: string }[]).map((row) => row.speech_id)).toEqual(
+      ids.slice(150, 550),
+    );
+    expect(data.page).toEqual({
+      offset: 150,
+      limit: 400,
+      returned: 400,
+      has_more: true,
+      next_offset: 550,
+    });
+    expect(sent()).toEqual([100, 200, 300, 400, 500].map((offset) => [String(offset), '100', '9']));
+  });
+  it('stops at a known total that ends on an aligned page: 200 speeches from two requests', async () => {
+    const { ids, sent } = installTerm(200);
+    const data = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, { term: 10, limit: 400 }),
+    );
+    expect((data.items as { speech_id: string }[]).map((row) => row.speech_id)).toEqual(ids);
+    expect(data.page).toEqual({ offset: 0, limit: 400, returned: 200, has_more: false });
+    expect(sent()).toEqual([0, 100].map((offset) => [String(offset), '100', '10']));
+  });
+  it('narrows a limit reaching past the window to the 300 rows left, with the window notice', async () => {
+    const { ids, sent } = installTerm(10_000);
+    const data = expectSuccessTwin(
+      await runToolContract(searchSpeechesTool, { offset: 9700, limit: 1000 }),
+    );
+    expect((data.items as { speech_id: string }[]).map((row) => row.speech_id)).toEqual(
+      ids.slice(9700),
+    );
+    expect(data.page).toEqual({ offset: 9700, limit: 300, returned: 300, has_more: true });
+    expect(data.notice).toContain(
+      'Requested limit normalized to 300: offset plus limit cannot pass the 10000-result search window.',
+    );
+    expect(sent()).toEqual([9700, 9800, 9900].map((offset) => [String(offset), '100', '10']));
+  });
+  it('rejects limit 10001 with EUPARL_CLAMP_LIMITS=false before HTTP', async () => {
+    strictMode();
+    const { sent } = installTerm();
+    const rejected = await runToolContract(searchSpeechesTool, { term: 10, limit: 10001 });
+    expect(rejected).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: JsonRpcErrorCode.InvalidParams } },
+    });
+    expect(contractText(rejected)).toContain('Too big: expected number to be <=10000');
+    expect(sent()).toEqual([]);
   });
 });

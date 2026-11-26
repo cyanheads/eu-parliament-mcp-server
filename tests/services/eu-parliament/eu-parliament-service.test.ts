@@ -2,18 +2,25 @@
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { describe, expect, it, onTestFinished, vi } from 'vitest';
+import { z } from 'zod';
 import {
   type DocumentsInput,
   EuParliamentService,
 } from '../../../src/services/eu-parliament/eu-parliament-service.js';
 import {
+  awareDeclarationFamilyRecord,
+  awareDeclarationRecord,
   decisionRecord,
+  declarationRow,
   documentRecord,
   envelopeResponse,
+  malformedProcedureDeclaration,
+  malformedProcedureDeclarationRecord,
   maltaOn20240313,
   mepRecord,
   questionRecord,
   rosterRecords,
+  supersededDeclarationRows,
 } from '../../helpers/eu-parliament-fixtures.js';
 
 /** Records limit-clamp counter increments; the rest of the framework utils module is real. */
@@ -72,6 +79,8 @@ describe('Parliament domain workflows', () => {
       const expected = Array.from({ length: 500 }, (_, i) => `ID-${String(i).padStart(3, '0')}`);
       expect(await walk([100])).toEqual(expected);
       expect(await walk([37, 63, 201, 19, 180])).toEqual(expected);
+      expect(await walk([400])).toEqual(expected);
+      expect(await walk([3000, 150])).toEqual(expected);
       expect(queries.length).toBeGreaterThan(10);
       for (const query of queries) {
         expect(query.get('limit')).toBe('100');
@@ -94,6 +103,96 @@ describe('Parliament domain workflows', () => {
       makeService(fetcher, () => now).searchSpeeches({ limit: 1000 }, context()),
     ).rejects.toMatchObject({ code: JsonRpcErrorCode.Timeout });
     expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+  describe('speech search acquisition bound', () => {
+    /** A whole term: every aligned page is full and the upstream total sits at the window. */
+    const fullTerm = () => {
+      const queries: URLSearchParams[] = [];
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+        const query = new URL(String(url)).searchParams;
+        queries.push(query);
+        const offset = Number(query.get('offset'));
+        return Response.json({
+          data: Array.from(
+            { length: Math.max(0, Math.min(Number(query.get('limit')), 10_000 - offset)) },
+            (_, i) => ({ id: `eli/dl/event/S-${offset + i}` }),
+          ),
+          meta: { total: 10_000 },
+        });
+      });
+      return { service: makeService(fetcher), queries };
+    };
+    it.each([
+      { input: { term: 10, limit: 3000 }, offsets: [0, 100, 200, 300], first: 0 },
+      {
+        input: { term: 9, offset: 150, limit: 5000 },
+        offsets: [100, 200, 300, 400, 500],
+        first: 150,
+      },
+    ] as const)(
+      'answers $input with 400 rows from aligned requests at offsets $offsets',
+      async ({ input, offsets, first }) => {
+        const { service, queries } = fullTerm();
+        const result = await service.searchSpeeches(input, context());
+        if (result.data.mode !== 'search') throw new Error('Expected search');
+        expect(result.data.items.map((row) => row.speech_id)).toEqual(
+          Array.from({ length: 400 }, (_, i) => `S-${first + i}`),
+        );
+        expect(result.data.page).toEqual({
+          offset: first,
+          limit: 400,
+          returned: 400,
+          has_more: true,
+          next_offset: first + 400,
+        });
+        expect(result.enrichment.notice).toContain(
+          'Requested limit normalized to the effective maximum of 400 speeches.',
+        );
+        expect(
+          queries.map((query) => [
+            query.get('offset'),
+            query.get('limit'),
+            query.get('parliamentary-term'),
+            query.get('sort-by'),
+          ]),
+        ).toEqual(
+          offsets.map((offset) => [
+            String(offset),
+            '100',
+            String(input.term),
+            'sitting-date:asc,numbering:asc',
+          ]),
+        );
+      },
+    );
+    it('sends at most five aligned requests for any offset and limit, four from an aligned offset', async () => {
+      const offsets = [0, 1, 50, 99, 100, 101, 150, 199, 4321, 9599, 9600, 9601, 9650, 9700, 9999];
+      const limits = [1, 20, 99, 100, 101, 399, 400, 401, 1000, 9999, 10_000, 9007199254740991];
+      let most = 0;
+      for (const offset of offsets)
+        for (const limit of limits) {
+          const { service, queries } = fullTerm();
+          await service.searchSpeeches({ offset, limit }, context());
+          expect(queries.length, `offset ${offset}, limit ${limit}`).toBeLessThanOrEqual(
+            offset % 100 === 0 ? 4 : 5,
+          );
+          most = Math.max(most, queries.length);
+        }
+      expect(most).toBe(5);
+    });
+    it('keeps a keyword search to one unsorted request at its 1000-row bound', async () => {
+      const { service, queries } = fullTerm();
+      const result = await service.searchSpeeches({ text: 'budget', limit: 3000 }, context());
+      expect(result.data).toMatchObject({
+        page: { offset: 0, limit: 1000, returned: 1000, next_offset: 1000 },
+      });
+      expect(result.enrichment.notice).toContain(
+        'Requested limit normalized to the effective maximum of 1000 keyword speeches.',
+      );
+      expect(queries.map((query) => [query.get('limit'), query.has('sort-by')])).toEqual([
+        ['1000', false],
+      ]);
+    });
   });
   describe('adopted-text search rows', () => {
     const pool = Array.from(
@@ -222,6 +321,38 @@ describe('Parliament domain workflows', () => {
         "2 rows on this page have no title in hr, the only language the adopted-text list returns; mode get with a row's document_id reads its title in another published language.",
       );
       expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('language')).toBe('hr');
+    });
+    it('keeps a page whose rows publish several titles in the requested language, still reading no expressions', async () => {
+      const hu = [
+        'Az alternatív üzemanyagok infrastruktúrájának kiépítése ',
+        'Az alternatív üzemanyagok infrastruktúrájának kiépítése',
+      ];
+      const { fetcher } = upstream((id) =>
+        id === 'TA-9-2024-0002'
+          ? {
+              title_dcterms: { hu },
+              is_realized_by: [
+                'eli/dl/doc/TA-9-2024-0002/es',
+                { id: 'e', is_embodied_by: [{ id: 'm', issued: ['2024-01-18', '2024-01-19'] }] },
+              ],
+            }
+          : { title_dcterms: { hu: id } },
+      );
+      const page = await search(makeService(fetcher), { language: 'hu', limit: 3 });
+      const row = (id: string, title: object) => ({
+        document_id: id,
+        identifier: id,
+        source_url: `https://data.europarl.europa.eu/eli/dl/doc/${id}`,
+        title,
+        procedure_ids: [],
+      });
+      expect(page.items).toEqual([
+        row('TA-9-2024-0001', { value: 'TA-9-2024-0001', language: 'hu' }),
+        row('TA-9-2024-0002', { value: hu[0], language: 'hu', values: hu }),
+        row('TA-9-2024-0003', { value: 'TA-9-2024-0003', language: 'hu' }),
+      ]);
+      expect(page.page).toMatchObject({ returned: 3, has_more: true });
+      expect(page.enrichment.notice).toBeUndefined();
     });
     it('sends one keyword request in the requested language, keeps relevance order and caps it at 100 rows', async () => {
       const { fetcher, queries } = upstream((id) => ({ title_dcterms: { en: id } }));
@@ -533,6 +664,7 @@ describe('Parliament domain workflows', () => {
   );
   it.each([
     ['speeches', 9990, 20, 10],
+    ['speeches', 9700, 1000, 300],
     ['procedures', 9990, 20, 10],
     ['adopted_texts', 9990, 20, 10],
     ['procedures', 9900, 1000, 100],
@@ -863,6 +995,40 @@ describe('Parliament domain workflows', () => {
       expect('page' in result.data && result.data.page).not.toHaveProperty('next_offset');
       expect(result.enrichment).not.toHaveProperty('totalCount');
       expect(result.enrichment.notice).toContain('Narrow');
+    },
+  );
+  it.each([
+    [
+      'adopted-text',
+      'eli/dl/doc/TA-9-2024-',
+      (service: EuParliamentService) =>
+        service.searchDocuments({ offset: 9999, limit: 1 }, context()),
+      'Narrow text, title, year, term, work_type, sitting dates or related_process_id.',
+    ],
+    [
+      'speech',
+      'eli/dl/event/MTG-PL-2024-01-15-SPEECH-',
+      (service: EuParliamentService) =>
+        service.searchSpeeches({ offset: 9999, limit: 1 }, context()),
+      'Narrow text, title, person_id, activity_type or sitting dates.',
+    ],
+  ] as const)(
+    'names the %s narrowing filters in the notice at the window edge',
+    async (_label, prefix, search, narrowing) => {
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async () =>
+        Response.json({
+          data: Array.from({ length: 100 }, (_, i) => ({
+            id: `${prefix}${String(i).padStart(4, '0')}`,
+            title_dcterms: { en: 'Title' },
+            activity_label: { en: 'Title' },
+          })),
+          meta: { total: 10_000 },
+        }),
+      );
+      const result = await search(makeService(fetcher));
+      expect(result.enrichment.notice).toBe(
+        `The upstream total is capped: at least 10000 results match; the exact total is unknown. The 10000-result search window is exhausted; further matches cannot be ruled out. ${narrowing}`,
+      );
     },
   );
   it.each(['committee', 'plenary'] as const)(
@@ -1367,19 +1533,6 @@ describe('Parliament domain workflows', () => {
         () => envelopeResponse([{ id: 'eli/dl/doc/TA-9-2024-0139' }]),
       ],
       [
-        'a malformed procedure entry',
-        () =>
-          envelopeResponse([
-            {
-              id: 'eli/dl/doc/TA-9-2024-0138',
-              inverse_created_a_realization_of: [
-                'eli/dl/proc/2021-0106',
-                'eli/dl/proc/not-a-procedure',
-              ],
-            },
-          ]),
-      ],
-      [
         'a network failure',
         () => {
           throw new TypeError('fetch failed');
@@ -1406,6 +1559,35 @@ describe('Parliament domain workflows', () => {
         expect(fetcher).toHaveBeenCalledTimes(2);
       },
     );
+
+    it('keeps the family procedures beside a malformed family and generic entry, naming each once', async () => {
+      const fetcher = familyFetch(
+        generic('TA-9-2024-0138', 'TEXT_ADOPTED', {
+          refers_to: ['eli/dl/proc/2020-0001', 'eli/dl/proc/not-a-procedure'],
+        }),
+        () =>
+          envelopeResponse([
+            {
+              id: 'eli/dl/doc/TA-9-2024-0138',
+              inverse_created_a_realization_of: [
+                'eli/dl/event/MTG-PL-2024-03-13-PVCRE-ITM-8-2',
+                'eli/dl/proc/2021-0106',
+                'eli/dl/proc/not-a-procedure',
+                'eli/dl/proc/2024-52',
+              ],
+            },
+          ]),
+      );
+      const result = await makeService(fetcher).searchDocuments(
+        { mode: 'get', document_id: 'TA-9-2024-0138' },
+        context(),
+      );
+      expect(detail(result).procedure_ids).toEqual(['2020-0001', '2021-0106']);
+      expect(result.enrichment.notice).toBe(
+        'Parliament publishes procedure references that are not procedure identifiers (YYYY-NNNN), so no procedure ID is returned for them: "eli/dl/proc/not-a-procedure" on TA-9-2024-0138; "eli/dl/proc/2024-52" on TA-9-2024-0138.',
+      );
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    });
 
     it.each([
       ['the shared deadline after an immediate generic response', 0, 700, 40_000],
@@ -1524,6 +1706,605 @@ describe('Parliament domain workflows', () => {
         ),
       ).rejects.toMatchObject({ name: 'AbortError', message: 'Caller stopped' });
       expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+      [
+        'ENVI-AD-699056',
+        'OPINION_PARLIAMENTARY_COMMITTEE',
+        'The procedure relation could not be read from the committee family record of this document, so procedure_ids may be incomplete; repeat the same get to retry.',
+      ],
+      [
+        'A-9-2024-0164',
+        'REPORT_PLENARY',
+        'The procedure relation could not be read from the plenary family record of this document, so procedure_ids may be incomplete; repeat the same get to retry.',
+      ],
+    ])(
+      'answers %s (%s) from the generic record with its family notice after a failed family read',
+      async (id, workType, notice) => {
+        const fetcher = familyFetch(
+          generic(id, workType, { refers_to: 'eli/dl/proc/2020-0001' }),
+          () => new Response('upstream trace', { status: 500 }),
+        );
+        const result = await makeService(fetcher).searchDocuments(
+          { mode: 'get', document_id: id },
+          context(),
+        );
+        expect(detail(result).procedure_ids).toEqual(['2020-0001']);
+        expect(result.enrichment.notice).toBe(notice);
+        expect(fetcher).toHaveBeenCalledTimes(2);
+      },
+    );
+  });
+
+  describe('MEP declaration search and get', () => {
+    const pool = Array.from(
+      { length: 250 },
+      (_, i) => `DCI-124867-2024-01-15-${String(i + 1).padStart(6, '0')}`,
+    );
+    /**
+     * Answers each aligned list page in reverse document_id order, as Parliament's declaration
+     * pages can, with `meta.total` unless `total` is null; an empty page is a 204.
+     */
+    const declarations = (ids: readonly string[], total: number | null = ids.length) => {
+      const queries: URLSearchParams[] = [];
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+        const query = new URL(String(url)).searchParams;
+        queries.push(query);
+        const offset = Number(query.get('offset'));
+        const data = ids
+          .slice(offset, offset + Number(query.get('limit')))
+          .toReversed()
+          .map((id) => ({ id: `eli/dl/doc/${id}`, identifier: id, title_dcterms: { en: id } }));
+        return data.length
+          ? Response.json({ data, ...(total !== null && { meta: { total } }) })
+          : new Response(null, { status: 204 });
+      });
+      return { fetcher, queries };
+    };
+    const search = async (fetcher: typeof fetch, input: DocumentsInput) => {
+      const result = await makeService(fetcher).searchDocuments(
+        { source: 'mep_declarations', ...input },
+        context(),
+      );
+      if (result.data.mode !== 'search') throw new Error('Expected search');
+      return { ...result.data, enrichment: result.enrichment };
+    };
+    const repeatOmit =
+      'More than 100 MEP declarations match, and Parliament keeps no single order for such a set across its 100-row pages, so pages can repeat some declarations and omit others. Narrow person_id, related_process_id, title, year, term, awareness_of_conflict or work_type to 100 or fewer, which arrive whole in one request.';
+
+    it.each([
+      ['no filter', {}, {}, {}],
+      [
+        'awareness_of_conflict false',
+        { awareness_of_conflict: false },
+        { 'filter-output': 'no-awareness-of-conflict' },
+        { awareness_of_conflict: false },
+      ],
+      [
+        'awareness_of_conflict true',
+        { awareness_of_conflict: true },
+        { 'filter-output': 'awareness-of-conflict' },
+        { awareness_of_conflict: true },
+      ],
+      [
+        'a person/ person_id',
+        { person_id: 'person/124867' },
+        { 'person-id': '124867' },
+        { person_id: '124867' },
+      ],
+      [
+        'a citation related_process_id',
+        { related_process_id: '2021/0106(COD)' },
+        { 'related-process-id': '2021-0106' },
+        { related_process_id: '2021-0106' },
+      ],
+      [
+        'title',
+        { title: 'LOISEAU' },
+        { title: 'LOISEAU', 'search-language': 'en' },
+        { title: 'LOISEAU' },
+      ],
+      [
+        'title under another language',
+        { title: 'LOISEAU', language: ' FR ' },
+        { title: 'LOISEAU', 'search-language': 'fr', language: 'fr' },
+        { title: 'LOISEAU', language: 'fr' },
+      ],
+      [
+        'year, term and work_type',
+        { year: 2024, term: 9, work_type: ' member_declaration_interest_conflict ' },
+        {
+          year: '2024',
+          'parliamentary-term': '9',
+          'work-type': 'MEMBER_DECLARATION_INTEREST_CONFLICT',
+        },
+        { year: 2024, term: 9, work_type: 'MEMBER_DECLARATION_INTEREST_CONFLICT' },
+      ],
+    ] as const)(
+      'sends %s as its own parameter and never sort-by or text',
+      async (_label, input, sent, echoed) => {
+        const { fetcher, queries } = declarations(pool.slice(0, 3));
+        const page = await search(fetcher, input);
+        expect(page.items).toHaveLength(3);
+        expect(queries).toHaveLength(1);
+        expect(new URL(String(fetcher.mock.calls[0]?.[0])).pathname).toBe(
+          '/api/v2/meps-declarations',
+        );
+        expect(Object.fromEntries(queries[0]!)).toEqual({
+          offset: '0',
+          limit: '100',
+          language: 'en',
+          format: 'application/ld+json',
+          ...sent,
+        });
+        expect(page.enrichment.appliedFilters).toEqual({
+          source: 'mep_declarations',
+          language: 'en',
+          ...echoed,
+        });
+      },
+    );
+
+    it('reorders every aligned 100-row page by document_id, so a walk at any caller limit reads the set once in order', async () => {
+      const { fetcher, queries } = declarations(pool);
+      const walk = async (limits: number[]) => {
+        const seen: string[] = [];
+        for (let index = 0, offset = 0; ; index++) {
+          const page = await search(fetcher, { offset, limit: limits[index % limits.length]! });
+          seen.push(...page.items.map((row) => row.document_id));
+          if (!page.page.has_more) return seen;
+          offset = page.page.next_offset!;
+        }
+      };
+      expect(await walk([100])).toEqual(pool);
+      expect(await walk([37, 63, 100, 19])).toEqual(pool);
+      for (const query of queries) {
+        expect(query.get('limit')).toBe('100');
+        expect(Number(query.get('offset')) % 100).toBe(0);
+        expect(query.has('sort-by')).toBe(false);
+      }
+    });
+
+    it('narrows a call to 100 rows read from at most two aligned requests', async () => {
+      const { fetcher, queries } = declarations(pool);
+      const first = await search(fetcher, { limit: 1000 });
+      expect(first.items.map((row) => row.document_id)).toEqual(pool.slice(0, 100));
+      expect(first.page).toMatchObject({ offset: 0, limit: 100, returned: 100, next_offset: 100 });
+      expect(first.enrichment.notice).toBe(
+        `Requested limit normalized to the effective maximum of 100 MEP declarations. ${repeatOmit}`,
+      );
+      expect(queries.map((query) => query.get('offset'))).toEqual(['0']);
+      const spanning = await search(fetcher, { offset: 150, limit: 100 });
+      expect(spanning.items.map((row) => row.document_id)).toEqual(pool.slice(150, 250));
+      expect(spanning.page).toMatchObject({ offset: 150, limit: 100, returned: 100 });
+      expect(queries.map((query) => query.get('offset'))).toEqual(['0', '100', '200']);
+    });
+
+    it.each([
+      ['a total of 101', 101, 101, repeatOmit, 101],
+      ['no total over a full aligned page', 150, null, repeatOmit, undefined],
+      ['a total of 100', 100, 100, undefined, 100],
+      ['no total over a short aligned page', 40, null, undefined, 40],
+    ])(
+      'discloses repeat-and-omit paging for %s only when more than 100 can match',
+      async (_label, size, total, notice, totalCount) => {
+        const { fetcher } = declarations(pool.slice(0, size), total);
+        const page = await search(fetcher, { limit: 20 });
+        expect(page.items.map((row) => row.document_id)).toEqual(pool.slice(0, 20));
+        expect(page.enrichment.notice).toBe(notice);
+        expect(page.enrichment.totalCount).toBe(totalCount);
+      },
+    );
+
+    it('names the malformed procedures of the returned rows of both aligned pages in one notice', async () => {
+      const [participation] = malformedProcedureDeclaration.workHadParticipation;
+      /** Row index → what it publishes beyond its identity; 120 lies before the caller's window. */
+      const published = new Map<number, Record<string, unknown>>([
+        [120, { refers_to: 'eli/dl/proc/2023-02019' }],
+        [160, { refers_to: ['eli/dl/proc/2021-0106', 'eli/dl/proc/2024-52'] }],
+        [210, { refers_to: 'eli/dl/proc/2024-52' }],
+        [
+          220,
+          {
+            refers_to: 'eli/dl/proc/2024-00712024-0086',
+            workHadParticipation: participation,
+          },
+        ],
+      ]);
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+        const query = new URL(String(url)).searchParams;
+        const offset = Number(query.get('offset'));
+        const data = pool
+          .map((id, index) => ({
+            id: `eli/dl/doc/${id}`,
+            identifier: id,
+            title_dcterms: { en: id },
+            ...published.get(index),
+          }))
+          .slice(offset, offset + Number(query.get('limit')))
+          .toReversed();
+        return Response.json({ data, meta: { total: pool.length } });
+      });
+      const page = await search(fetcher, { offset: 150, limit: 100 });
+      expect(page.items.map((row) => row.document_id)).toEqual(pool.slice(150, 250));
+      const rows = z
+        .array(
+          z.object({
+            procedure_ids: z.array(z.string()),
+            capacities: z.array(z.unknown()).optional(),
+          }),
+        )
+        .parse(page.items);
+      expect(rows.map((row) => row.procedure_ids).filter((ids) => ids.length)).toEqual([
+        ['2021-0106'],
+      ]);
+      expect(rows[70]?.capacities).toEqual([
+        expect.not.objectContaining({ procedure_id: expect.anything() }),
+      ]);
+      expect(page.enrichment.notice).toBe(
+        `Parliament publishes procedure references that are not procedure identifiers (YYYY-NNNN), so no procedure ID is returned for them: "eli/dl/proc/2024-52" on ${pool[160]}; "eli/dl/proc/2024-52" on ${pool[210]}; "eli/dl/proc/2024-00712024-0086" on ${pool[220]}; "eli/dl/proc/2023-02735" on ${pool[220]}. ${repeatOmit}`,
+      );
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    it('reports a capped 10000 total without totalCount, with the capped and repeat-and-omit notices', async () => {
+      const { fetcher } = declarations(pool, 10_000);
+      const page = await search(fetcher, {});
+      expect(page.items).toHaveLength(20);
+      expect(page.page).toMatchObject({ has_more: true, next_offset: 20 });
+      expect(page.enrichment).not.toHaveProperty('totalCount');
+      expect(page.enrichment.notice).toBe(
+        `${repeatOmit} The upstream total is capped: at least 10000 results match; the exact total is unknown.`,
+      );
+    });
+
+    it('narrows the limit inside the 10000-result window and rejects offset 10000 before HTTP', async () => {
+      const queries: URLSearchParams[] = [];
+      const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+        const query = new URL(String(url)).searchParams;
+        queries.push(query);
+        const offset = Number(query.get('offset'));
+        return Response.json({
+          data: Array.from({ length: 100 }, (_, i) => ({
+            id: `eli/dl/doc/DCI-1-2024-01-01-${offset + i}`,
+          })),
+          meta: { total: 10_000 },
+        });
+      });
+      const last = await search(fetcher, { offset: 9990, limit: 50 });
+      expect(last.page).toMatchObject({ offset: 9990, limit: 10, returned: 10 });
+      expect(last.page).not.toHaveProperty('next_offset');
+      // The repeat-and-omit notice names the narrowing filters; the window notice does not repeat them.
+      expect(last.enrichment.notice).toBe(
+        `Requested limit normalized to 10: offset plus limit cannot pass the 10000-result search window. 10 rows on this page have no title in en, the only language the declaration list returns; mode get with a row's document_id reads its title in another published language. ${repeatOmit} The upstream total is capped: at least 10000 results match; the exact total is unknown. The 10000-result search window is exhausted; further matches cannot be ruled out.`,
+      );
+      expect(queries.map((query) => query.get('offset'))).toEqual(['9900']);
+      fetcher.mockClear();
+      await expect(search(fetcher, { offset: 10_000 })).rejects.toMatchObject({
+        message: 'This search exposes at most 10000 results; offset 10000 is past the window.',
+        data: {
+          reason: 'invalid_filter',
+          recovery: {
+            hint: 'Narrow person_id, related_process_id, title, year, term, awareness_of_conflict or work_type. Restart paging at offset 0 after narrowing.',
+          },
+        },
+      });
+      expect(fetcher).not.toHaveBeenCalled();
+    });
+
+    it('says nothing matched at offset 0, and only names the position of an empty page past it', async () => {
+      const none = await search(declarations([]).fetcher, { person_id: '124867' });
+      expect(none.items).toEqual([]);
+      expect(none.enrichment.totalCount).toBe(0);
+      expect(none.enrichment.notice).toBe(
+        'No MEP declarations matched. Remove a named filter, or select by person_id or related_process_id; title matches the member name, capacity, committee and procedure a declaration title carries.',
+      );
+      // Parliament answers a page past a member's 46 declarations with a 204 and no total.
+      const past = await search(declarations(pool.slice(0, 46)).fetcher, { offset: 100 });
+      expect(past.items).toEqual([]);
+      expect(past.enrichment.notice).toBe(
+        'The page at offset 100 returned no MEP declarations. Restart at offset 0 or return to the previous page.',
+      );
+    });
+
+    it('returns rows in the requested language and counts rows without a title in it', async () => {
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+        Response.json({
+          data: [...supersededDeclarationRows, declarationRow],
+          meta: { total: 3 },
+        }),
+      );
+      const page = await search(fetcher, { language: 'IT' });
+      expect(page.items.map((row) => [row.document_id, 'title' in row])).toEqual([
+        ['DCI-124867-2026-02-27-538194', false],
+        ['DCI-124867-2026-03-12-540997', false],
+        ['DCI-124884-2023-11-17-324583', false],
+      ]);
+      expect(page.enrichment.notice).toBe(
+        "3 rows on this page have no title in it, the only language the declaration list returns; mode get with a row's document_id reads its title in another published language.",
+      );
+      expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('language')).toBe('it');
+      const english = await search(
+        vi.fn<typeof fetch>().mockResolvedValue(Response.json({ data: [declarationRow] })),
+        { related_process_id: '2021/0106(COD)' },
+      );
+      expect(english.items).toEqual([
+        {
+          document_id: 'DCI-124884-2023-11-17-324583',
+          identifier: 'DCI-124884-2023-11-17-324583',
+          label: 'DCI-124884-2023-11-17-324583',
+          work_type: 'def/ep-document-types/MEMBER_DECLARATION_INTEREST_CONFLICT',
+          source_url: 'https://data.europarl.europa.eu/eli/dl/doc/DCI-124884-2023-11-17-324583',
+          title: { value: declarationRow.title_dcterms.en, language: 'en' },
+          date: '2023-11-17',
+          procedure_ids: ['2021-0106'],
+          awareness_of_conflict: false,
+          capacities: [
+            {
+              person_ids: ['124884'],
+              role: 'def/ep-roles/RAPPORTEUR_SHADOW_REPORT',
+              organization_id: 'org/IMCO',
+              procedure_id: '2021-0106',
+              activity_label: '2021/0106(COD)  Artificial Intelligence Act',
+              political_group_id: 'org/ECR',
+            },
+          ],
+        },
+      ]);
+      expect(english.enrichment.totalCount).toBe(1);
+      expect(english.enrichment).not.toHaveProperty('notice');
+    });
+
+    describe('document get', () => {
+      const id = 'DCI-124760-2024-12-17-425114';
+      const genericUrl = `https://data.europarl.europa.eu/api/v2/documents/${id}?format=application%2Fld%2Bjson`;
+      const familyUrl = `https://data.europarl.europa.eu/api/v2/meps-declarations/${id}?format=application%2Fld%2Bjson`;
+      /** Generic reads answer `record`; the declaration record answers through `family`. */
+      const declarationFetch = (
+        family: (init: RequestInit | undefined) => Response | Promise<Response>,
+        record: Record<string, unknown> = awareDeclarationRecord,
+      ) =>
+        vi
+          .fn<typeof fetch>()
+          .mockImplementation(async (input, init) =>
+            new URL(String(input)).pathname.startsWith('/api/v2/documents/')
+              ? envelopeResponse([record])
+              : family(init),
+          );
+      const get = (
+        fetcher: typeof fetch,
+        signal = new AbortController().signal,
+        now?: () => number,
+      ) => makeService(fetcher, now).searchDocuments({ mode: 'get', document_id: id }, { signal });
+      const detail = ({ data }: Awaited<ReturnType<EuParliamentService['searchDocuments']>>) => {
+        if (!('document' in data) || !data.document) throw new Error('Expected document detail');
+        return data.document;
+      };
+      const generic = {
+        document_id: id,
+        procedure_ids: ['2021-0387'],
+        awareness_of_conflict: true,
+        conflict_description: awareDeclarationRecord.conflictDescription,
+      };
+      // The declaration was filed in French only.
+      const files = 'Requested file language en unavailable; returned published fr files.';
+      const degraded = `The declarant's capacities and version links could not be read from the mep_declarations family record of this document, so capacities, previous_version_ids and superseded_by_ids are absent; repeat the same get to retry. ${files}`;
+
+      it('adds the capacities from the declaration record in exactly two requests', async () => {
+        const fetcher = declarationFetch(() => envelopeResponse([awareDeclarationFamilyRecord]));
+        const result = await get(fetcher);
+        const document = detail(result);
+        expect(document).toMatchObject({
+          ...generic,
+          capacities: [
+            {
+              person_ids: ['124760'],
+              role: 'def/ep-roles/RAPPORTEUR',
+              organization_id: 'org/LIBE',
+              procedure_id: '2021-0387',
+              activity_label:
+                awareDeclarationFamilyRecord.workHadParticipation[0]!.inCapacityOf
+                  .capacityActivityLabel,
+              political_group_id: 'org/ECR',
+            },
+          ],
+        });
+        expect(document.conflict_description).toMatch(
+          /^J'ai été désigné par le Conseil régional de Normandie/,
+        );
+        expect(document).not.toHaveProperty('previous_version_ids');
+        expect(document).not.toHaveProperty('superseded_by_ids');
+        expect(result.enrichment.notice).toBe(files);
+        expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([genericUrl, familyUrl]);
+      });
+
+      it('adds the version links the declaration record publishes', async () => {
+        const [superseded] = supersededDeclarationRows;
+        const supersededId = 'DCI-124867-2026-02-27-538194';
+        const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input) =>
+          new URL(String(input)).pathname.startsWith('/api/v2/documents/')
+            ? envelopeResponse([
+                {
+                  ...superseded,
+                  // The generic record embeds expressions as objects and publishes no version links.
+                  is_realized_by: undefined,
+                  inverse_previousVersion: undefined,
+                  workHadParticipation: [`eli/dl/participation/${supersededId}-AUTHOR`],
+                },
+              ])
+            : envelopeResponse([superseded]),
+        );
+        const document = detail(
+          await makeService(fetcher).searchDocuments(
+            { mode: 'get', document_id: supersededId },
+            context(),
+          ),
+        );
+        expect(document).toMatchObject({
+          document_id: supersededId,
+          awareness_of_conflict: false,
+          superseded_by_ids: ['DCI-124867-2026-03-12-540997'],
+          capacities: [{ person_ids: ['124867'], role: 'def/ep-roles/MEMBER_DELEGATION_OFFICIAL' }],
+        });
+        expect(document).not.toHaveProperty('previous_version_ids');
+        expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
+          `/api/v2/documents/${supersededId}`,
+          `/api/v2/meps-declarations/${supersededId}`,
+        ]);
+      });
+
+      it('answers DCI-197467-2024-03-21-357272 with its capacity and one notice for the malformed procedure both records publish', async () => {
+        const dci = 'DCI-197467-2024-03-21-357272';
+        const fetcher = vi
+          .fn<typeof fetch>()
+          .mockImplementation(async (input) =>
+            envelopeResponse([
+              new URL(String(input)).pathname.startsWith('/api/v2/documents/')
+                ? malformedProcedureDeclarationRecord
+                : malformedProcedureDeclaration,
+            ]),
+          );
+        const result = await makeService(fetcher).searchDocuments(
+          { mode: 'get', document_id: dci },
+          context(),
+        );
+        const document = detail(result);
+        expect(document).toMatchObject({
+          document_id: dci,
+          procedure_ids: [],
+          awareness_of_conflict: false,
+          capacities: [
+            {
+              person_ids: ['197467'],
+              role: 'def/ep-roles/RAPPORTEUR_SHADOW_REPORT',
+              organization_id: 'org/INTA',
+              activity_label:
+                'Terugtrekking van de Unie uit het Verdrag inzake het energiehandvest 2023/02735(NLE)',
+              political_group_id: 'org/ECR',
+            },
+          ],
+        });
+        expect(document.capacities?.[0]).not.toHaveProperty('procedure_id');
+        expect(result.enrichment.notice).toBe(
+          'Parliament publishes procedure references that are not procedure identifiers (YYYY-NNNN), so no procedure ID is returned for them: "eli/dl/proc/2023-02735" on DCI-197467-2024-03-21-357272. Requested file language en unavailable; returned published nl files.',
+        );
+        expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
+          `/api/v2/documents/${dci}`,
+          `/api/v2/meps-declarations/${dci}`,
+        ]);
+      });
+
+      // Every declaration publishes its family record, so an empty answer is a failed read too.
+      const failures: [string, () => Response][] = [
+        ...[204, 404].map((status): [string, () => Response] => [
+          `HTTP ${status}`,
+          () => new Response(null, { status }),
+        ]),
+        ...[400, 500, 503].map((status): [string, () => Response] => [
+          `HTTP ${status}`,
+          () => new Response('upstream trace', { status }),
+        ]),
+        ['a non-JSON body', () => new Response('<html>not json</html>')],
+        ['the generic bare participation ID', () => envelopeResponse([awareDeclarationRecord])],
+        ['no record', () => envelopeResponse([])],
+        [
+          'a record of another declaration',
+          () =>
+            envelopeResponse([
+              { ...awareDeclarationFamilyRecord, id: 'eli/dl/doc/DCI-124760-2024-12-17-425115' },
+            ]),
+        ],
+        [
+          'a malformed capacity person',
+          () =>
+            envelopeResponse([
+              {
+                ...awareDeclarationFamilyRecord,
+                workHadParticipation: [
+                  {
+                    ...awareDeclarationFamilyRecord.workHadParticipation[0],
+                    had_participant_person: ['person/not-a-member'],
+                  },
+                ],
+              },
+            ]),
+        ],
+        [
+          'a network failure',
+          () => {
+            throw new TypeError('fetch failed');
+          },
+        ],
+      ];
+      it.each(failures)(
+        'answers the generic declaration fields with a notice after one declaration attempt on %s',
+        async (_label, family) => {
+          const fetcher = declarationFetch(family);
+          const result = await get(fetcher);
+          const document = detail(result);
+          expect(document).toMatchObject(generic);
+          expect(document).not.toHaveProperty('capacities');
+          expect(result.enrichment.notice).toBe(degraded);
+          expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([genericUrl, familyUrl]);
+        },
+      );
+
+      it('answers the generic declaration fields when the deadline passes during the declaration read', async () => {
+        let now = 0;
+        const fetcher = declarationFetch(() => {
+          now = 40_000;
+          return envelopeResponse([awareDeclarationFamilyRecord]);
+        });
+        const result = await get(fetcher, undefined, () => now);
+        expect(detail(result)).toMatchObject(generic);
+        expect(detail(result)).not.toHaveProperty('capacities');
+        expect(result.enrichment.notice).toBe(degraded);
+        expect(fetcher).toHaveBeenCalledTimes(2);
+      });
+
+      it('cuts the declaration read at the deadline the generic read started', async () => {
+        let now = 0;
+        // The declaration read starts with 1 ms of the get's 40-second budget left.
+        const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+          if (new URL(String(input)).pathname.startsWith('/api/v2/documents/')) {
+            now = 39_999;
+            return envelopeResponse([awareDeclarationRecord]);
+          }
+          now = 40_000;
+          return envelopeResponse([awareDeclarationFamilyRecord]);
+        });
+        const result = await get(fetcher, undefined, () => now);
+        expect(detail(result)).toMatchObject(generic);
+        expect(detail(result)).not.toHaveProperty('capacities');
+        expect(result.enrichment.notice).toBe(degraded);
+        expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([genericUrl, familyUrl]);
+      });
+
+      it('surfaces an unclassified declaration-read failure instead of degrading it', async () => {
+        const fetcher = declarationFetch(() => {
+          throw new RangeError('unclassified defect');
+        });
+        await expect(get(fetcher)).rejects.toMatchObject({
+          name: 'RangeError',
+          message: 'unclassified defect',
+        });
+        expect(fetcher).toHaveBeenCalledTimes(2);
+      });
+
+      it('propagates caller cancellation during the declaration read instead of degrading', async () => {
+        const controller = new AbortController();
+        const fetcher = declarationFetch((init) => {
+          controller.abort(new DOMException('Caller stopped', 'AbortError'));
+          init?.signal?.throwIfAborted();
+          return envelopeResponse([awareDeclarationFamilyRecord]);
+        });
+        await expect(get(fetcher, controller.signal)).rejects.toMatchObject({
+          name: 'AbortError',
+          message: 'Caller stopped',
+        });
+        expect(fetcher).toHaveBeenCalledTimes(2);
+      });
     });
   });
 

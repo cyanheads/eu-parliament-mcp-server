@@ -1,6 +1,7 @@
 /** @fileoverview Input code aliases and discoverable coverage constraints. */
 import { describe, expect, it } from 'vitest';
 import {
+  documentFamily,
   normalizeCode,
   politicalGroupNotice,
   referenceEntries,
@@ -218,6 +219,12 @@ describe('Parliament reference codes', () => {
       'Call euparl_list_reference with topic document_types for every accepted code, then retry work_type with one of them.',
     ],
     [
+      'mep_declarations',
+      'UNKNOWN',
+      'Unsupported work_type filter "UNKNOWN" for source mep_declarations. Accepted codes: MEMBER_DECLARATION_INTEREST_CONFLICT.',
+      'Call euparl_list_reference with topic document_types for every accepted code, then retry work_type with one of them.',
+    ],
+    [
       'question',
       'UNKNOWN',
       'Unsupported work_type filter "UNKNOWN". Accepted codes: QUESTION_WRITTEN_PRIORITY, QUESTION_WRITTEN, QUESTION_ORAL, INTERPELLATION_MAJOR, INTERPELLATION_MINOR, QUESTION_TIME.',
@@ -274,6 +281,24 @@ describe('Parliament reference codes', () => {
       'Unsupported work_type filter "REPORT_PLENARY". Accepted codes: QUESTION_WRITTEN_PRIORITY, QUESTION_WRITTEN, QUESTION_ORAL, INTERPELLATION_MAJOR, INTERPELLATION_MINOR, QUESTION_TIME. REPORT_PLENARY is a document work type accepted by euparl_search_documents with source "plenary".',
       'Call euparl_search_documents with source "plenary" and work_type REPORT_PLENARY, or call euparl_list_reference with topic question_types for each question work type.',
     ],
+    [
+      'adopted_texts',
+      ' member_declaration_interest_conflict ',
+      'Unsupported work_type filter "member_declaration_interest_conflict" for source adopted_texts. Accepted codes: TEXT_ADOPTED, AMENDMENT_BUDGET_EU_DRAFT, BUDGET_EP_DRAFT. MEMBER_DECLARATION_INTEREST_CONFLICT is a document work type accepted with source "mep_declarations".',
+      'Retry with source "mep_declarations" and work_type MEMBER_DECLARATION_INTEREST_CONFLICT, or call euparl_list_reference with topic document_types for each work type and its source.',
+    ],
+    [
+      'mep_declarations',
+      'TEXT_ADOPTED',
+      'Unsupported work_type filter "TEXT_ADOPTED" for source mep_declarations. Accepted codes: MEMBER_DECLARATION_INTEREST_CONFLICT. TEXT_ADOPTED is a document work type accepted with source "adopted_texts".',
+      'Retry with source "adopted_texts" and work_type TEXT_ADOPTED, or call euparl_list_reference with topic document_types for each work type and its source.',
+    ],
+    [
+      'question',
+      'MEMBER_DECLARATION_INTEREST_CONFLICT',
+      'Unsupported work_type filter "MEMBER_DECLARATION_INTEREST_CONFLICT". Accepted codes: QUESTION_WRITTEN_PRIORITY, QUESTION_WRITTEN, QUESTION_ORAL, INTERPELLATION_MAJOR, INTERPELLATION_MINOR, QUESTION_TIME. MEMBER_DECLARATION_INTEREST_CONFLICT is a document work type accepted by euparl_search_documents with source "mep_declarations".',
+      'Call euparl_search_documents with source "mep_declarations" and work_type MEMBER_DECLARATION_INTEREST_CONFLICT, or call euparl_list_reference with topic question_types for each question work type.',
+    ],
   ] as const)(
     'rejects %s work type %j naming the source or tool that takes it',
     (family, value, message, hint) => {
@@ -286,9 +311,14 @@ describe('Parliament reference codes', () => {
     expect(
       referenceEntries('identifiers').find((item) => item.code === 'question')?.description,
     ).toContain('Omitted term verifies canonical candidates for all overlapping terms');
-    expect(
-      referenceEntries('coverage').find((item) => item.code === 'speeches')?.description,
-    ).toContain('not transcripts');
+    const speeches = referenceEntries('coverage').find(
+      (item) => item.code === 'speeches',
+    )?.description;
+    expect(speeches).toContain('not transcripts');
+    expect(speeches).toContain(
+      'Search returns at most 400 rows per call, 1000 with text or title keywords',
+    );
+    expect(speeches).toContain('at most 100 search rows per call');
     expect(
       referenceEntries('coverage').find((item) => item.code === 'questions')?.description,
     ).toContain('Missing answer links do not prove unanswered');
@@ -307,12 +337,15 @@ describe('Parliament reference codes', () => {
       '1000 procedures',
       '1000 questions',
       '1000 documents',
+      '400 speeches',
+      '1000 keyword speeches',
+      '100 speeches with text',
       '1000 sittings',
       '1000 reference entries',
       '20 organization lookups',
       'without an output-size cap',
       'EUPARL_CLAMP_LIMITS=false',
-      'adopted texts counting their 10000-result search window as that bound while still returning 100-row pages',
+      'adopted texts, speeches and MEP declarations counting their 10000-result search window as that bound while still returning pages within their acquisition bounds',
       'aligned 100-row pages',
       'relevance order',
       'offsets of 10000 or more fail',
@@ -321,5 +354,38 @@ describe('Parliament reference codes', () => {
     ])
       expect(paging).toContain(expected);
     expect(paging).not.toContain('92000');
+  });
+  it('lists the MEP declaration work type in document_types with its source family', () => {
+    expect(referenceEntries('document_types').at(-1)).toEqual({
+      code: 'MEMBER_DECLARATION_INTEREST_CONFLICT',
+      description: 'mep_declarations family; case-insensitive input.',
+    });
+    expect(normalizeCode(' member_declaration_interest_conflict ', 'mep_declarations')).toBe(
+      'MEMBER_DECLARATION_INTEREST_CONFLICT',
+    );
+  });
+  it.each([
+    ['def/ep-document-types/MEMBER_DECLARATION_INTEREST_CONFLICT', 'mep_declarations'],
+    ['def/ep-document-types/TEXT_ADOPTED', 'adopted_texts'],
+    ['def/ep-document-types/OPINION_PARLIAMENTARY_COMMITTEE', 'committee'],
+    ['def/ep-document-types/REPORT_PLENARY', 'plenary'],
+    ['def/ep-document-types/QUESTION_WRITTEN', undefined],
+    [undefined, undefined],
+  ])('routes a document of work type %s to its %s family record', (workType, family) => {
+    expect(documentFamily(workType)).toBe(family);
+  });
+  it('states the declaration filters, their term rule and declaration paging in coverage', () => {
+    const coverage = (code: string) =>
+      referenceEntries('coverage').find((item) => item.code === code)?.description;
+    expect(coverage('documents')).toContain(
+      'MEP declarations on awareness of conflicts of interest filter by person_id, related_process_id, title, year, term and awareness_of_conflict; Parliament matches no declaration for a member within a term, so term and person_id are not combined.',
+    );
+    const paging = coverage('paging');
+    for (const expected of [
+      '100 MEP declarations',
+      'MEP declarations ignore sort-by: each call reads aligned 100-row pages sorted by document_id and returns at most 100 rows inside the same 10000-result window',
+      'when more than 100 match, pages can repeat and omit declarations',
+    ])
+      expect(paging).toContain(expected);
   });
 });

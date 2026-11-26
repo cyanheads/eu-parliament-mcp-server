@@ -6,6 +6,13 @@ import { z } from 'zod';
 
 /** Published language maps are source text, never translated. */
 const localizedSchema = z.record(z.string(), z.string());
+/**
+ * A literal Parliament publishes as a string or, for a document's file date and size and its
+ * same-language titles, as an array of several values (an RDF set whose order names no file).
+ */
+const multiValuedLiteralSchema = z.union([z.string(), z.tuple([z.string()], z.string())]);
+/** A document title map whose languages may each publish several titles. */
+export const multiValuedLocalizedSchema = z.record(z.string(), multiValuedLiteralSchema);
 const referenceSchema = z.union([z.string(), z.object({ id: z.string() })]);
 const referencesSchema = z.union([referenceSchema, z.array(referenceSchema)]).optional();
 /**
@@ -43,20 +50,23 @@ const participationSchema = z
 const participationsSchema = z
   .union([participationSchema, z.array(participationSchema)])
   .optional();
-/** Source files are linked rather than fetched. */
+/**
+ * Source files are linked rather than fetched. A manifestation exemplified by two files, or one
+ * file reissued, publishes several issue dates and sizes that name no file.
+ */
 const manifestationSchema = z.object({
   id: z.string(),
   is_exemplified_by: referencesSchema,
   media_type: z.string().optional(),
-  issued: z.string().optional(),
-  byteSize: z.string().optional(),
+  issued: multiValuedLiteralSchema.optional(),
+  byteSize: multiValuedLiteralSchema.optional(),
 });
 /** Every manifestation in the selected published language is preserved. */
 const expressionSchema = z.object({
   id: z.string(),
   language: z.string().optional(),
-  title: localizedSchema.optional(),
-  title_alternative: localizedSchema.optional(),
+  title: multiValuedLocalizedSchema.optional(),
+  title_alternative: multiValuedLocalizedSchema.optional(),
   is_embodied_by: z.array(manifestationSchema).optional(),
 });
 const documentFields = {
@@ -64,7 +74,7 @@ const documentFields = {
   identifier: z.string().optional(),
   label: z.string().optional(),
   work_type: z.string().optional(),
-  title_dcterms: localizedSchema.optional(),
+  title_dcterms: multiValuedLocalizedSchema.optional(),
   document_date: z.string().optional(),
   parliamentary_term: z.string().optional(),
   creator: referencesSchema,
@@ -76,8 +86,13 @@ const documentFields = {
   based_on: referencesSchema,
   notation_publicRegister: z.string().optional(),
 };
+/** What an MEP declaration on awareness of conflicts of interest declares, on every route that serves it. */
+const declarationFields = {
+  awarenessOfConflict: z.boolean().optional(),
+  conflictDescription: z.string().optional(),
+};
 /** Generic works include sparse speech subdivisions and embedded answers. */
-export const documentSchema = z.object(documentFields);
+export const documentSchema = z.object({ ...documentFields, ...declarationFields });
 /**
  * Family record (`/adopted-texts|committee-documents|plenary-documents/{id}`) read only for the
  * relation the generic record lacks, which mixes procedures with sitting events.
@@ -88,19 +103,64 @@ export const documentFamilySchema = z.object({
 });
 /**
  * Adopted-text list row under `language={code}`: the summary identity plus title, date and the
- * family relation that view adds. Its expressions are never parsed: list rows embed them in shapes
- * detail does not accept (bare expression IDs, several issue dates on one file), and one such row
- * would fail the whole page.
+ * family relation that view adds. Its expressions are never parsed: list rows can embed them as bare
+ * expression IDs, a shape detail does not accept, and one such row would fail the whole page.
  */
 export const adoptedTextRowSchema = z.object({
   id: z.string(),
   identifier: z.string().optional(),
   label: z.string().optional(),
   work_type: z.string().optional(),
-  title_dcterms: localizedSchema.optional(),
+  title_dcterms: multiValuedLocalizedSchema.optional(),
   document_date: z.string().optional(),
   inverse_created_a_realization_of: referencesSchema,
 });
+/**
+ * The capacity a member declared in (`ForeseenCapacity`): a role, and the committee, procedure and
+ * political group it was held in, each published only when it applies.
+ */
+const capacitySchema = z.object({
+  capacityRole: z.string().optional(),
+  capacityOrganization: z.string().optional(),
+  capacityActivity: z.string().optional(),
+  capacityActivityLabel: z.string().optional(),
+  politicalGroup: z.string().optional(),
+});
+/** The declarant and the capacity of one participation, as the declaration routes publish it. */
+const declarationParticipationSchema = z.object({
+  had_participant_person: referencesSchema,
+  inCapacityOf: capacitySchema.optional(),
+});
+/**
+ * Participation, version links (`previousVersion` names the record a declaration replaces,
+ * `inverse_previousVersion` the one replacing it), which the generic record lacks or publishes as
+ * a bare participation ID.
+ */
+const declarationRelationFields = {
+  workHadParticipation: z
+    .union([declarationParticipationSchema, z.array(declarationParticipationSchema)])
+    .optional(),
+  previousVersion: referencesSchema,
+  inverse_previousVersion: referencesSchema,
+};
+/**
+ * `/meps-declarations` list row under `language={code}`: identity, the title in that language, the
+ * declaration and its relations. Expressions are never parsed: a member files in one language, so
+ * the row embeds that expression as a bare ID under any other.
+ */
+export const declarationRowSchema = z.object({
+  id: z.string(),
+  identifier: z.string().optional(),
+  label: z.string().optional(),
+  work_type: z.string().optional(),
+  title_dcterms: multiValuedLocalizedSchema.optional(),
+  document_date: z.string().optional(),
+  refers_to: referencesSchema,
+  ...declarationFields,
+  ...declarationRelationFields,
+});
+/** `/meps-declarations/{id}`, read on document get only for the relations the generic record lacks. */
+export const declarationFamilySchema = z.object({ id: z.string(), ...declarationRelationFields });
 /** Language authority URIs (`…/authority/language/ITA`), singleton or array. */
 const languagesSchema = z.union([z.string(), z.array(z.string())]).optional();
 /** Only organization participants are read; a role is a string or, on term-8 records, an array. */
@@ -155,6 +215,14 @@ const membershipSchema = z.object({
     .object({ startDate: z.string().optional(), endDate: z.string().optional() })
     .optional(),
 });
+/**
+ * Dated roster rows can publish their context as JSON null (no group on 2020-01-29 and
+ * 2020-02-12 for one member); null reads as absent, like an omitted field.
+ */
+const rosterContextSchema = z
+  .string()
+  .nullish()
+  .transform((value) => value ?? undefined);
 /** Roster context is optional on historical term records. */
 export const mepSchema = z.object({
   id: z.string(),
@@ -163,8 +231,8 @@ export const mepSchema = z.object({
   givenName: z.string().optional(),
   familyName: z.string().optional(),
   sortLabel: z.string().optional(),
-  'api:country-of-representation': z.string().optional(),
-  'api:political-group': z.string().optional(),
+  'api:country-of-representation': rosterContextSchema,
+  'api:political-group': rosterContextSchema,
   citizenship: z.string().optional(),
   placeOfBirth: z.string().optional(),
   hasMembership: z.array(membershipSchema).optional(),
@@ -246,6 +314,25 @@ export const voteItemSchema = z.object({
   consists_of: referencesSchema,
   inverse_consists_of: z.union([voteItemParentSchema, z.array(voteItemParentSchema)]).optional(),
 });
+/**
+ * One `/meetings/{id}/foreseen-activities` record: an agenda item (`PLENARY_DEBATE`,
+ * `PLENARY_VOTE`, `REQUEST_VOTE_URGENCY`) or a `MEETING_PART` time slot whose `consists_of` lists
+ * its items. Not built on `activityFields`: some slots publish `activity_end_date` as an array of
+ * times, which its string field would reject, failing the whole read; no end time is read.
+ */
+export const agendaRecordSchema = z.object({
+  id: z.string(),
+  activity_id: z.string().optional(),
+  had_activity_type: z.string().optional(),
+  activity_label: localizedSchema.optional(),
+  /** The heading of grouped items, such as Rule 150 debates and Rule 170 urgent-procedure votes. */
+  headingLabel: localizedSchema.optional(),
+  activity_order: z.string().optional(),
+  activity_start_date: z.string().optional(),
+  consists_of: referencesSchema,
+  inverse_was_scheduled_in: referencesSchema,
+  based_on_a_realization_of: referencesSchema,
+});
 /** Live reference bodies carry classification rather than filter-code guesses. */
 export const bodySchema = z.object({
   id: z.string(),
@@ -259,13 +346,18 @@ export const bodySchema = z.object({
 });
 
 /** Parsed upstream record types. */
+export type MultiValuedLocalized = z.infer<typeof multiValuedLocalizedSchema>;
 export type RawDocument = z.infer<typeof documentSchema>;
 export type RawAdoptedTextRow = z.infer<typeof adoptedTextRowSchema>;
+export type RawDeclarationRow = z.infer<typeof declarationRowSchema>;
+export type RawDeclarationFamily = z.infer<typeof declarationFamilySchema>;
+export type RawDeclarationParticipation = z.infer<typeof declarationParticipationSchema>;
 export type RawQuestion = z.infer<typeof questionSchema>;
 export type RawProcedure = z.infer<typeof procedureSchema>;
 export type RawMep = z.infer<typeof mepSchema>;
 export type RawSpeech = z.infer<typeof speechSchema>;
 export type RawDecision = z.infer<typeof decisionSchema>;
 export type RawVoteItem = z.infer<typeof voteItemSchema>;
+export type RawAgendaRecord = z.infer<typeof agendaRecordSchema>;
 export type RawParticipation = z.infer<typeof participationSchema>;
 export type RawBody = z.infer<typeof bodySchema>;

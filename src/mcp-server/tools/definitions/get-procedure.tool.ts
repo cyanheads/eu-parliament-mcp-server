@@ -26,32 +26,32 @@ const eventSchema = z
     id: z
       .string()
       .describe(
-        'Published canonical event identifier. A PLENARY_VOTE_RESULTS event id is a vote item: pass it as vote_item_id to euparl_get_plenary_votes, with the sitting on its date, for every decision of that vote.',
+        'Event ID. A PLENARY_VOTE_RESULTS event id is a vote item: pass it as vote_item_id to euparl_get_plenary_votes, with the sitting on its date, for every decision of that vote.',
       ),
     date: z.string().optional().describe('Published activity date.'),
     activity_type: z.string().optional().describe('Published activity type code or URI.'),
     stage: z.string().optional().describe('Published event stage.'),
     document_ids: z
-      .array(z.string().describe('Canonical related document identifier.'))
-      .describe('Explicit event document relations, deduplicated and sorted by identifier.'),
+      .array(z.string().describe('Document ID.'))
+      .describe('Event documents, deduplicated and sorted.'),
     sitting_ids: z
-      .array(z.string().describe('Canonical scheduled sitting identifier.'))
+      .array(z.string().describe('Sitting ID.'))
       .describe(
-        `Explicit scheduled sitting relations, sorted by identifier; when absent, a published vote-event date selects the sitting for euparl_get_plenary_votes decisions with vote_item_id or document_id. Older sittings publish vote items without decision links and decisions without report relations, so neither filter matches there; list the sitting's vote items with mode vote_items, or find the report citation in decision labels instead (${labelCitation}), else words of the vote item's title with language set to the title's language (decision records start with the ${firstDecisionSitting} sitting).`,
+        `Scheduled sitting relations, sorted. When absent, the vote-event date selects the sitting for euparl_get_plenary_votes decisions with vote_item_id or document_id. Older sittings publish vote items without decision links and decisions without report relations, so neither filter matches there: list the sitting's vote items with mode vote_items, or match label_contains to the report citation (${labelCitation}) or to words of the vote item's title in the title's language (decision records start with the ${firstDecisionSitting} sitting).`,
       ),
   })
   .strict()
-  .describe('Published procedure event.');
+  .describe('One procedure event.');
 const participantSchema = z
   .object({
-    id: z.string().describe('Published participation identity.'),
+    id: z.string().describe('Participation ID.'),
     person_ids: z
-      .array(z.string().describe('Canonical person identifier.'))
-      .describe('Explicit participating people, sorted by identifier.'),
+      .array(z.string().describe('Person ID for euparl_get_mep.'))
+      .describe('Participating people, sorted.'),
     organization_ids: z
-      .array(z.string().describe('Published organization identity.'))
+      .array(z.string().describe('Organization ID.'))
       .describe(
-        'Explicit participating organizations, sorted by identifier; resolve each with euparl_list_reference topic organizations.',
+        'Participating organizations, sorted; resolve with euparl_list_reference topic organizations.',
       ),
     role: z.string().optional().describe('Published historical participation role.'),
     date: z.string().optional().describe('Published participation date.'),
@@ -60,13 +60,13 @@ const participantSchema = z
       .string()
       .optional()
       .describe(
-        'Published historical political group code (org/S-D); never joined to a current group. Resolve with euparl_list_reference topic organizations.',
+        'Published historical group code (org/S-D), never joined to a current group; resolve with euparl_list_reference topic organizations.',
       ),
     represented_organization_id: z
       .string()
       .optional()
       .describe(
-        'Published organization represented by this participation, usually a committee code (org/IMCO); resolve with euparl_list_reference topic organizations.',
+        'Organization represented, usually a committee (org/IMCO); resolve with euparl_list_reference topic organizations.',
       ),
     term_id: z.string().optional().describe('Published parliamentary-term identity.'),
   })
@@ -74,22 +74,20 @@ const participantSchema = z
   .describe('Historical procedure participation.');
 const documentSchema = z
   .object({
-    document_id: z
-      .string()
-      .describe('Canonical document identifier for euparl_search_documents mode get.'),
+    document_id: z.string().describe('Document ID for euparl_search_documents mode get.'),
     source_url: z.string().describe('Public document source URL.'),
   })
   .strict()
-  .describe('Explicit linked parliamentary document; no inferred title or legal identifier.');
+  .describe('Linked document; no inferred title or legal identifier.');
 const sectionSchema = z
   .enum(['overview', 'events', 'participants', 'documents'])
-  .describe('Procedure retrieval section.');
+  .describe('Selected section.');
 
 /** Read procedure identity and one complete evidence section at a time. */
 export const getProcedureTool = tool('euparl_get_procedure', {
   title: 'Read a parliamentary procedure',
   description:
-    'Read a procedure title, stage, events, participants, or linked parliamentary documents. Default section overview returns scalar fields and collection counts; events, participants, and documents page one selected collection. Continue with page.next_offset and the returned snapshot; restart at offset 0 without snapshot if the collection changes. Historical participation groups remain historical. Missing detail succeeds with found false; discover references with euparl_list_procedures. Linked documents can be read with euparl_search_documents mode get; files are linked, not parsed.',
+    'Read a procedure: title, stage, events, participants or linked documents. Default section overview returns scalar fields and section counts; events, participants and documents page one collection. Continue with page.next_offset and snapshot; after snapshot_changed, restart at offset 0 without it. Participation groups stay historical. Missing detail returns found false; euparl_list_procedures discovers references. euparl_search_documents mode get reads linked documents; files are linked, not parsed.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z
     .object({
@@ -100,27 +98,23 @@ export const getProcedureTool = tool('euparl_get_procedure', {
           /^(?:https:\/\/data\.europarl\.europa\.eu\/eli\/dl\/proc\/|eli\/dl\/proc\/)?\d{4}[-/]\d{4}[A-Z]?(?:\([A-Z]+\))?$/,
         )
         .describe(
-          'Procedure YYYY-NNNN or YYYY/NNNN, optional letter suffix and (TYPE), known eli/dl/proc/ prefix or exact public procedure URI.',
+          'Procedure YYYY-NNNN or YYYY/NNNN, optional letter suffix and (TYPE), eli/dl/proc/ prefix or public URI.',
         ),
       section: sectionSchema
         .default('overview')
         .describe(
-          'Default overview returns scalars and counts; choose a collection for complete paged items.',
+          'Default overview returns scalars and counts; a collection section pages its items.',
         ),
       ...pagingInputFields('procedure_sections'),
-      snapshot: optionalString().describe(
-        'Previous collection snapshot; required for local offset above 0, optional at offset 0.',
-      ),
+      snapshot: optionalString().describe('Returned collection snapshot; required above offset 0.'),
     })
     .strict(),
   output: z
     .object({
       found: z.boolean().describe('Whether Parliament published procedure detail.'),
-      procedure_id: z.string().describe('Normalized canonical procedure identifier.'),
+      procedure_id: z.string().describe('Normalized procedure ID.'),
       reference: z.string().optional().describe('Exact published procedure reference.'),
-      title: localizedTextSchema
-        .optional()
-        .describe('Published procedure title in the actual selected language.'),
+      title: localizedTextSchema.optional().describe('Published procedure title.'),
       process_type: z.string().optional().describe('Published procedure type.'),
       stage: z.string().optional().describe('Published current procedure stage.'),
       source_url: z.string().describe('Public procedure source URL.'),
@@ -129,41 +123,33 @@ export const getProcedureTool = tool('euparl_get_procedure', {
         .array(
           z
             .object({
-              name: z.string().describe('Collection section name.'),
+              name: z.string().describe('Section name.'),
               count: z
                 .number()
                 .int()
                 .nonnegative()
-                .describe(
-                  'Exact parsed collection size; absence of relations does not prove no activity.',
-                ),
+                .describe('Parsed item count; absent relations do not prove no activity.'),
             })
             .strict()
-            .describe('Available section and parsed item count.'),
+            .describe('One section and its count.'),
         )
         .optional()
         .describe('Section counts on a found overview only.'),
       events: z
         .array(eventSchema)
         .optional()
-        .describe(
-          'Selected event page in date order, undated events last and ties by id; present only for the events section.',
-        ),
+        .describe('Events section page in date order, undated last, ties by id.'),
       participants: z
         .array(participantSchema)
         .optional()
-        .describe(
-          'Selected historical participation page in date order, undated participations last and ties by id; present only for participants.',
-        ),
+        .describe('Participants section page in date order, undated last, ties by id.'),
       documents: z
         .array(documentSchema)
         .optional()
-        .describe(
-          'Selected deduplicated linked-document page sorted by document_id; present only for documents.',
-        ),
+        .describe('Documents section page, deduplicated, sorted by document_id.'),
       page: pageSchema
         .optional()
-        .describe('Selected collection continuation; absent on overview or missing detail.'),
+        .describe('Collection page position; absent on overview or missing detail.'),
     })
     .strict(),
   enrichment: enrichmentFields,
@@ -172,7 +158,7 @@ export const getProcedureTool = tool('euparl_get_procedure', {
     {
       reason: 'invalid_filter',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Identifier, citation type or language is unsupported or conflicts with the published procedure.',
+      when: 'An identifier, citation type or language is unsupported or conflicts with the published procedure.',
       recovery:
         'Call euparl_list_reference with topic identifiers or the relevant code topic, then retry with a supported value.',
       thrownBy: 'service',
@@ -180,7 +166,7 @@ export const getProcedureTool = tool('euparl_get_procedure', {
     {
       reason: 'invalid_mode_fields',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Overview has a nonzero offset, or collection continuation lacks its snapshot.',
+      when: 'Overview has a nonzero offset, or continuation lacks its snapshot.',
       recovery:
         'Call euparl_list_reference with topic coverage, then retry the selected mode with its required identifiers.',
       thrownBy: 'service',
@@ -188,7 +174,7 @@ export const getProcedureTool = tool('euparl_get_procedure', {
     {
       reason: 'snapshot_changed',
       code: JsonRpcErrorCode.Conflict,
-      when: 'The complete selected collection or its retrieval scope changed.',
+      when: 'The selected collection changed since the supplied snapshot.',
       recovery:
         'Repeat the same tool call with offset 0 and no snapshot, then use the returned snapshot for continuation.',
       thrownBy: 'service',
@@ -196,7 +182,7 @@ export const getProcedureTool = tool('euparl_get_procedure', {
     {
       reason: 'upstream_rejected',
       code: JsonRpcErrorCode.InvalidParams,
-      when: 'Parliament rejects validated request parameters.',
+      when: 'Parliament rejects the validated request.',
       recovery:
         'Call euparl_list_reference for supported filters and identifiers, then retry with a narrower supported request.',
       thrownBy: 'service',
@@ -204,7 +190,7 @@ export const getProcedureTool = tool('euparl_get_procedure', {
     {
       reason: 'upstream_rate_limited',
       code: JsonRpcErrorCode.RateLimited,
-      when: 'Parliament rate limits persist after bounded retries.',
+      when: 'Parliament rate limiting outlasts the retries.',
       retryable: true,
       recovery: 'Wait for the reported retry interval, then repeat the same euparl tool call.',
       thrownBy: 'service',
