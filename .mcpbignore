@@ -5,6 +5,7 @@
 /framework-skills/
 /docs/
 /.cache/
+/node_modules/.vitest-cache/
 /coverage/
 /tests/
 /src/
