@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-11-25
+
+Agenda items, vote breakdowns by group and country, and MEP conflict-of-interest declarations; non-keyword speech reads cap at 400 rows; reissued document files and multi-title records answer; shorter tool descriptions.
+
 ## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-11-13
 
 Plenary votes list vote items per sitting; speech search returns text; MEP search takes historical group codes and person IDs; memberships filter by classification and date; adopted-text rows carry title, date and procedures; questions name their addressee; document_id takes citations; rejections name the parameter, value and accepted forms.
